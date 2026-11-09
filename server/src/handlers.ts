@@ -221,30 +221,30 @@ async function notify(uids: string[], title: string, body: string, link = '/tag'
 
   let sent = 0;
   try {
-  for (let i = 0; i < tokens.length; i += 500) {
-    const chunk = tokens.slice(i, i + 500);
-    const res = await getMessaging().sendEachForMulticast({
-      tokens: chunk,
-      // Data-only message: the service worker shows it, so tapping opens /tag.
-      data: { title, body, link },
-      webpush: { headers: { Urgency: 'high', TTL: '900' } },
-    });
-    sent += res.successCount;
-    await Promise.all(
-      res.responses.map((r, idx) => {
-        const code = r.error?.code;
-        if (
-          code === 'messaging/registration-token-not-registered' ||
-          code === 'messaging/invalid-registration-token' ||
-          code === 'messaging/invalid-argument'
-        ) {
-          const t = chunk[idx];
-          return userRef(owner.get(t)!).update({ fcmTokens: FieldValue.arrayRemove(t) });
-        }
-        return null;
-      }),
-    );
-  }
+    for (let i = 0; i < tokens.length; i += 500) {
+      const chunk = tokens.slice(i, i + 500);
+      const res = await getMessaging().sendEachForMulticast({
+        tokens: chunk,
+        // Data-only message: the service worker shows it, so tapping opens /tag.
+        data: { title, body, link },
+        webpush: { headers: { Urgency: 'high', TTL: '900' } },
+      });
+      sent += res.successCount;
+      await Promise.all(
+        res.responses.map((r, idx) => {
+          const code = r.error?.code;
+          if (
+            code === 'messaging/registration-token-not-registered' ||
+            code === 'messaging/invalid-registration-token' ||
+            code === 'messaging/invalid-argument'
+          ) {
+            const t = chunk[idx];
+            return userRef(owner.get(t)!).update({ fcmTokens: FieldValue.arrayRemove(t) });
+          }
+          return null;
+        }),
+      );
+    }
   } catch (err) {
     // Notifications must never break check-in or batch calling.
     console.error('notify failed', err);
@@ -255,7 +255,7 @@ async function notify(uids: string[], title: string, body: string, link = '/tag'
 // ---------------------------------------------------------------- accounts
 
 /** New corps member joins a CDS group with the group's join code. Starts as "pending". */
-export const registerMember = onCall(async (req) => {
+export const registerMember = onCall(async (req: CallableRequest) => {
   const { uid } = signedIn(req);
   const p = await validateProfile(uid, req.data);
   const joinCode = String(req.data?.joinCode ?? '').trim().toUpperCase();
@@ -279,7 +279,7 @@ export const registerMember = onCall(async (req) => {
 });
 
 /** An exco creates a new CDS group and becomes its first exco. */
-export const createGroup = onCall(async (req) => {
+export const createGroup = onCall(async (req : CallableRequest) => {
   const { uid } = signedIn(req);
   const p = await validateProfile(uid, req.data);
   const name = text(req.data?.group?.name, 'CDS group name', 3, 60);
@@ -322,7 +322,7 @@ export const createGroup = onCall(async (req) => {
 });
 
 /** Exco approves (after checking the NYSC ID card) or rejects a pending member. */
-export const approveMember = onCall(async (req) => {
+export const approveMember = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const approve = req.data?.approve !== false;
@@ -340,7 +340,7 @@ export const approveMember = onCall(async (req) => {
 });
 
 /** Make someone an exco (or back to member). */
-export const setRole = onCall(async (req) => {
+export const setRole = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const role: Role = req.data?.role === 'exco' ? 'exco' : 'member';
@@ -353,7 +353,7 @@ export const setRole = onCall(async (req) => {
 });
 
 /** Exco resets a member's PIN after checking their NYSC ID card. */
-export const resetPin = onCall(async (req) => {
+export const resetPin = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const pin = String(req.data?.pin ?? '');
@@ -364,7 +364,7 @@ export const resetPin = onCall(async (req) => {
 });
 
 /** Batch size and venue location. */
-export const updateGroupSettings = onCall(async (req) => {
+export const updateGroupSettings = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const patch: Record<string, unknown> = {};
   if (req.data?.batchSize != null) {
@@ -389,7 +389,7 @@ export const updateGroupSettings = onCall(async (req) => {
 
 // ---------------------------------------------------------------- CDS day
 
-export const startSession = onCall(async (req) => {
+export const startSession = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const sid = lagosDate();
   const ref = sessionRef(e.gid, sid);
@@ -412,7 +412,7 @@ export const startSession = onCall(async (req) => {
   return { ok: true, sessionId: sid };
 });
 
-export const endSession = onCall(async (req) => {
+export const endSession = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const sid = lagosDate();
   await sessionRef(e.gid, sid).update({ status: 'closed', closedAt: FieldValue.serverTimestamp() });
@@ -421,7 +421,7 @@ export const endSession = onCall(async (req) => {
 });
 
 /** The exco's door screen asks for a fresh code every ~25 seconds. */
-export const getDoorCode = onCall(async (req) => {
+export const getDoorCode = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const sid = lagosDate();
   const s = await sessionRef(e.gid, sid).get();
@@ -438,7 +438,7 @@ export const getDoorCode = onCall(async (req) => {
  * A member scans the door QR (or types the 6-digit code).
  * `scannedAt` is set when the scan was saved offline and is being sent later.
  */
-export const checkIn = onCall(async (req) => {
+export const checkIn = onCall(async (req: CallableRequest) => {
   const { uid, gid } = approvedMember(req);
   const code = String(req.data?.code ?? '').replace(/\D/g, '');
   if (code.length !== 6) throw fail('invalid-argument', 'Enter the 6-digit code on the exco screen.');
@@ -484,7 +484,7 @@ export const checkIn = onCall(async (req) => {
 });
 
 /** Exco looks someone up (scanned tag/card or typed state code) to see their photo first. */
-export const lookupMember = onCall(async (req) => {
+export const lookupMember = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const a = await attendeeRef(e.gid, lagosDate(), uid).get();
@@ -492,7 +492,7 @@ export const lookupMember = onCall(async (req) => {
 });
 
 /** Exco checks in someone without a working phone (printed card, or manual by state code). */
-export const excoCheckIn = onCall(async (req) => {
+export const excoCheckIn = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const method = req.data?.method === 'card' ? 'card' : 'manual';
@@ -504,7 +504,7 @@ export const excoCheckIn = onCall(async (req) => {
 });
 
 /** Pregnant and nursing mothers get a priority tag (P1, P2 …). The reason is never stored. */
-export const setPriority = onCall(async (req) => {
+export const setPriority = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const sid = lagosDate();
@@ -524,7 +524,7 @@ export const setPriority = onCall(async (req) => {
 });
 
 /** "Call priority" or "Call next batch". Notifies everyone in the batch. */
-export const callNext = onCall(async (req) => {
+export const callNext = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const sid = lagosDate();
   const mode = req.data?.mode === 'priority' ? 'priority' : 'next';
@@ -571,7 +571,7 @@ export const callNext = onCall(async (req) => {
 });
 
 /** Exco scans a tag at the thumbprint table. Green = thumbprint, red = wait. */
-export const tableCheck = onCall(async (req) => {
+export const tableCheck = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const sid = lagosDate();
@@ -598,7 +598,7 @@ export const tableCheck = onCall(async (req) => {
 });
 
 /** After the LGI thumbprints them, the exco taps Done. The tag can never be used again today. */
-export const markDone = onCall(async (req) => {
+export const markDone = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const sid = lagosDate();
@@ -683,14 +683,14 @@ async function settle(gid: string, reference: string, paidKobo: number) {
 }
 
 /** Bank list for the exco's "where should dues go" form. */
-export const listBanks = onCall({ secrets: [paystackSecret] }, async (req) => {
+export const listBanks = onCall({ secrets: [paystackSecret] }, async (req: CallableRequest) => {
   await exco(req);
   const banks = await paystack<{ name: string; code: string; active: boolean }[]>('/bank?country=nigeria&perPage=200');
   return banks.filter((b) => b.active).map((b) => ({ name: b.name, code: b.code }));
 });
 
 /** Shows the account name before saving, so the wrong account isn't used. */
-export const resolveAccount = onCall({ secrets: [paystackSecret] }, async (req) => {
+export const resolveAccount = onCall({ secrets: [paystackSecret] }, async (req: CallableRequest) => {
   await exco(req);
   const acct = String(req.data?.accountNumber ?? '').replace(/\D/g, '');
   const bank = String(req.data?.bankCode ?? '');
@@ -700,7 +700,7 @@ export const resolveAccount = onCall({ secrets: [paystackSecret] }, async (req) 
 });
 
 /** Saves the group's dues account as a Paystack subaccount (created once, updated on handover). */
-export const setPayoutAccount = onCall({ secrets: [paystackSecret] }, async (req) => {
+export const setPayoutAccount = onCall({ secrets: [paystackSecret] }, async (req: CallableRequest) => {
   const e = await exco(req);
   const acct = String(req.data?.accountNumber ?? '').replace(/\D/g, '');
   const bankCode = String(req.data?.bankCode ?? '');
@@ -732,7 +732,7 @@ export const setPayoutAccount = onCall({ secrets: [paystackSecret] }, async (req
 });
 
 /** Exco creates a dues item, e.g. "November dues ₦1,000". */
-export const createDues = onCall(async (req) => {
+export const createDues = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const title = text(req.data?.title, 'Title', 3, 60);
   const amount = Number(req.data?.amountNaira);
@@ -751,7 +751,7 @@ export const createDues = onCall(async (req) => {
   return { ok: true, duesId: ref.id };
 });
 
-export const closeDues = onCall(async (req) => {
+export const closeDues = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const duesId = String(req.data?.duesId ?? '');
   await duesRef(e.gid, duesId).update({ active: false, closedAt: FieldValue.serverTimestamp() });
@@ -760,7 +760,7 @@ export const closeDues = onCall(async (req) => {
 });
 
 /** Member starts an online payment. Returns the Paystack checkout link. */
-export const startPayment = onCall({ secrets: [paystackSecret] }, async (req) => {
+export const startPayment = onCall({ secrets: [paystackSecret] }, async (req: CallableRequest) => {
   const { uid, gid } = approvedMember(req);
   const duesId = String(req.data?.duesId ?? '');
   const returnUrl = String(req.data?.returnUrl ?? '');
@@ -819,7 +819,7 @@ export const startPayment = onCall({ secrets: [paystackSecret] }, async (req) =>
 });
 
 /** Called when the member returns from Paystack. Safe to call more than once. */
-export const verifyPayment = onCall({ secrets: [paystackSecret] }, async (req) => {
+export const verifyPayment = onCall({ secrets: [paystackSecret] }, async (req: CallableRequest) => {
   const { uid, gid } = approvedMember(req);
   const reference = String(req.data?.reference ?? '');
   const p = await paymentRef(gid, reference).get();
@@ -856,7 +856,7 @@ export const paystackWebhook = onRequest({ secrets: [paystackSecret] }, async (r
 });
 
 /** Treasurer records cash. The member must confirm it on their phone before it counts. */
-export const recordCash = onCall(async (req) => {
+export const recordCash = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const duesId = String(req.data?.duesId ?? '');
@@ -901,7 +901,7 @@ export const recordCash = onCall(async (req) => {
 });
 
 /** Member confirms (or disputes) cash the treasurer recorded. */
-export const respondCash = onCall(async (req) => {
+export const respondCash = onCall(async (req: CallableRequest) => {
   const { uid, gid } = approvedMember(req);
   const duesId = String(req.data?.duesId ?? '');
   const confirm = req.data?.confirm === true;
@@ -923,7 +923,7 @@ export const respondCash = onCall(async (req) => {
 });
 
 /** Buzz everyone who hasn't paid yet. */
-export const remindDues = onCall(async (req) => {
+export const remindDues = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const duesId = String(req.data?.duesId ?? '');
   const d = await duesRef(e.gid, duesId).get();
