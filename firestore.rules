@@ -1,0 +1,81 @@
+rules_version = '2';
+
+// CDS Pass security rules.
+// Everything that matters (numbers, turns, approvals, check-ins) is written
+// ONLY by Cloud Functions. Phones can read what they are allowed to see,
+// and can only change their own phone number, photo and notification tokens.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Approved member of this CDS group (claims are set by Cloud Functions).
+    function inGroup(gid) {
+      return signedIn()
+        && request.auth.token.gid == gid
+        && request.auth.token.approved == true;
+    }
+
+    function isExco(gid) {
+      return inGroup(gid) && request.auth.token.role == 'exco';
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn()
+        && (request.auth.uid == uid || isExco(resource.data.groupId));
+
+      // A member may only change these fields on their own profile.
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['phone', 'photoURL', 'fcmTokens', 'updatedAt']);
+
+      allow create, delete: if false;
+    }
+
+    match /groups/{gid} {
+      allow read: if inGroup(gid);
+      allow write: if false;
+
+      // Door-code secret. Never readable from a phone.
+      match /private/{doc} {
+        allow read, write: if false;
+      }
+
+      // Activity log: excos can read, nobody can edit.
+      match /logs/{logId} {
+        allow read: if isExco(gid);
+        allow write: if false;
+      }
+
+      // Dues: everyone in the group sees what's due; each member sees only their own
+      // status and receipts; excos see everyone's. Only the server writes.
+      match /dues/{duesId} {
+        allow read: if inGroup(gid);
+        allow write: if false;
+
+        match /status/{uid} {
+          allow read: if (inGroup(gid) && request.auth.uid == uid) || isExco(gid);
+          allow write: if false;
+        }
+      }
+
+      match /payments/{ref} {
+        allow read: if (inGroup(gid) && resource.data.uid == request.auth.uid) || isExco(gid);
+        allow write: if false;
+      }
+
+      match /sessions/{sid} {
+        allow read: if inGroup(gid);
+        allow write: if false;
+
+        match /attendees/{uid} {
+          allow read: if (inGroup(gid) && request.auth.uid == uid) || isExco(gid);
+          allow write: if false;
+        }
+      }
+    }
+  }
+}

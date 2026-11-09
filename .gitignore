@@ -1,0 +1,14 @@
+node_modules/
+dist/
+functions/lib/
+.env
+.env.*
+!.env.example
+.firebaserc
+.firebase/
+*.log
+firebase-debug.*
+.DS_Store
+.secret.local
+server/dist/
+server/keys.env

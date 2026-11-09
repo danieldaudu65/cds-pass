@@ -1,0 +1,142 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------- Theme colours (RGB triplets) ---------- */
+:root,
+.theme-light {
+  --paper: 243 247 242;
+  --card: 255 255 255;
+  --ink: 16 35 26;
+  --muted: 74 94 83;
+  --line: 220 232 223;
+  --green: 11 107 58;
+  --green-text: 11 107 58;
+  --green-light: 227 242 232;
+  --warn: 138 90 0;
+  --warn-bg: 255 244 214;
+  --bad-text: 180 35 24;
+  --bad-bg: 253 231 229;
+  --shadow: 11 107 58;
+  color-scheme: light;
+}
+
+.dark {
+  --paper: 9 20 14;
+  --card: 18 33 25;
+  --ink: 231 241 234;
+  --muted: 157 179 166;
+  --line: 38 58 46;
+  --green: 16 133 74;
+  --green-text: 74 199 134;
+  --green-light: 22 55 37;
+  --warn: 242 196 107;
+  --warn-bg: 58 46 16;
+  --bad-text: 252 129 120;
+  --bad-bg: 61 23 20;
+  --shadow: 0 0 0;
+  color-scheme: dark;
+}
+
+/* Things that must stay white (QR codes, printed cards) keep light colours even in dark mode. */
+.dark .theme-light {
+  --paper: 243 247 242;
+  --card: 255 255 255;
+  --ink: 16 35 26;
+  --muted: 74 94 83;
+  --line: 220 232 223;
+  --green: 11 107 58;
+  --green-text: 11 107 58;
+  --green-light: 227 242 232;
+  --warn: 138 90 0;
+  --warn-bg: 255 244 214;
+  --bad-text: 180 35 24;
+  --bad-bg: 253 231 229;
+  color-scheme: light;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+  body {
+    @apply bg-paper text-ink font-sans antialiased transition-colors duration-300;
+    -webkit-tap-highlight-color: transparent;
+  }
+  input,
+  select,
+  textarea,
+  button {
+    font: inherit;
+  }
+  ::placeholder {
+    color: rgb(var(--muted) / 0.6);
+  }
+}
+
+@layer components {
+  /* Stand-alone pages (welcome, sign up, log in, pending): full screen on phones,
+     a framed "app window" on laptops. */
+  .screen {
+    @apply mx-auto flex min-h-[100dvh] w-full max-w-md flex-col bg-paper lg:my-8 lg:min-h-[calc(100dvh-4rem)] lg:overflow-hidden lg:rounded-[32px] lg:shadow-lift;
+  }
+  .card {
+    @apply rounded-3xl bg-card p-5 shadow-card;
+  }
+  .label {
+    @apply mb-1.5 block text-sm font-semibold text-muted;
+  }
+  .input {
+    @apply h-14 w-full rounded-2xl border-2 border-line bg-card px-4 text-base text-ink outline-none transition focus:border-green;
+  }
+  .grid-bg {
+    background-image: radial-gradient(rgba(255, 255, 255, 0.09) 1px, transparent 1px);
+    background-size: 18px 18px;
+  }
+}
+
+/* Text colours that need a lighter shade on dark backgrounds. */
+.text-green {
+  color: rgb(var(--green-text));
+}
+.text-bad {
+  color: rgb(var(--bad-text));
+}
+
+/* Laptop backdrop behind the framed pages */
+@media (min-width: 1024px) {
+  body {
+    background-color: #03301a;
+    background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px),
+      radial-gradient(circle at 20% 20%, rgba(14, 127, 70, 0.55), transparent 55%);
+    background-size: 22px 22px, 100% 100%;
+  }
+}
+
+/* Printed member cards */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #fff !important;
+  }
+  .print-grid {
+    display: grid !important;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8mm;
+  }
+  .print-card {
+    break-inside: avoid;
+    box-shadow: none !important;
+    border: 1px solid #0b6b3a;
+  }
+}
+
+/* QR scanner highlight */
+.scan-region-highlight-svg,
+.code-outline-highlight {
+  stroke: #e3f2e8 !important;
+}

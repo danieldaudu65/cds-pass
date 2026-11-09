@@ -1,0 +1,27 @@
+{
+  "name": "cds-pass-server",
+  "private": true,
+  "version": "0.1.0",
+  "main": "dist/main.js",
+  "engines": {
+    "node": ">=20.6"
+  },
+  "scripts": {
+    "dev": "tsx watch --env-file=dev.env src/main.ts",
+    "dev:keys": "tsx watch --env-file=dev.env --env-file=keys.env src/main.ts",
+    "build": "tsc",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.1",
+    "firebase-admin": "^12.6.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.16.10",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.2"
+  }
+}

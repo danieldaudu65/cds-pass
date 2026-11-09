@@ -1,0 +1,27 @@
+# Render blueprint: New → Blueprint → pick this repo. Creates the free API server.
+services:
+  - type: web
+    name: cds-pass-api
+    runtime: node
+    plan: free
+    region: frankfurt
+    rootDir: server
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node dist/main.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: SERVICE_FEE_PERCENT
+        value: "3"
+      - key: PAYSTACK_FEE_PERCENT
+        value: "1.5"
+      # Fill these in on the Render dashboard (never commit them):
+      - key: CORS_ORIGINS # e.g. https://your-id.web.app
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT # service-account JSON (or base64 of it)
+        sync: false
+      - key: FIREBASE_STORAGE_BUCKET # e.g. your-id.firebasestorage.app
+        sync: false
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
