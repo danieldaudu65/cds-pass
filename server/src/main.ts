@@ -10,6 +10,7 @@ import express, { type Request, type Response } from 'express';
 import { getAuth } from 'firebase-admin/auth';
 import { HttpsError, type Callable, type RawEndpoint } from './compat';
 import * as handlers from './handlers';
+import { uploadRouter } from './upload';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -20,6 +21,9 @@ const origins = (process.env.CORS_ORIGINS ?? 'http://localhost:5173')
   .map((s) => s.trim())
   .filter(Boolean);
 app.use(cors({ origin: origins, maxAge: 86400 }));
+
+// Profile photos → Cloudinary (multipart upload, so this goes before express.json)
+app.use('/upload', uploadRouter);
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, time: Date.now() });

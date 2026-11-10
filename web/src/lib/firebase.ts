@@ -6,7 +6,6 @@ import {
   persistentLocalCache,
   persistentMultipleTabManager,
 } from 'firebase/firestore';
-import { connectStorageEmulator, getStorage } from 'firebase/storage';
 
 const env = import.meta.env;
 
@@ -27,15 +26,12 @@ export const db = initializeFirestore(app, {
   localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
 });
 
-export const storage = getStorage(app);
-
 /** The CDS Pass API server (Express on Render). */
 export const API_URL = ((env.VITE_API_URL as string) || 'http://localhost:8787').replace(/\/$/, '');
 
 if (env.VITE_USE_EMULATORS === 'true') {
   connectAuthEmulator(auth, 'http://localhost:9099', { disableWarnings: true });
   connectFirestoreEmulator(db, 'localhost', 8080);
-  connectStorageEmulator(storage, 'localhost', 9199);
 }
 
 let wakeNoticeShown = false;
