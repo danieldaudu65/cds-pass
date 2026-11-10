@@ -15,14 +15,22 @@ export async function uploadAvatar(_uid: string, blob: Blob): Promise<string> {
   form.append('file', blob, 'avatar.jpg');
 
   let res: Response;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
   try {
     res = await fetch(`${API_URL}/upload/avatar`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` }, // no Content-Type: the browser sets it for FormData
       body: form,
+      signal: controller.signal,
     });
   } catch {
+    if (controller.signal.aborted) {
+      throw Object.assign(new Error('Photo upload took too long. Check your connection and try again.'), { code: 'functions/deadline-exceeded' });
+    }
     throw Object.assign(new Error('No internet connection.'), { code: 'functions/unavailable' });
+  } finally {
+    clearTimeout(timeout);
   }
 
   const json = (await res.json().catch(() => ({}))) as { url?: string; error?: { message?: string } };

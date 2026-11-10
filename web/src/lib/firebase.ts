@@ -49,17 +49,26 @@ export function callable<Req = unknown, Res = unknown>(name: string) {
       wakeNoticeShown = true;
       void import('./toast').then(({ toast }) => toast('Server is waking up…', 'info', 'This can take up to a minute the first time. Please wait.'));
     }, 6000);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 90_000);
     let res: Response;
     try {
       res = await fetch(`${API_URL}/api/${name}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
         body: JSON.stringify({ data }),
+        signal: controller.signal,
       });
     } catch {
+      if (controller.signal.aborted) {
+        throw Object.assign(new Error('The server took too long to respond. Your account may already have been created. Please try signing in, or continue signup to finish your profile.'), {
+          code: 'functions/deadline-exceeded',
+        });
+      }
       throw Object.assign(new Error('No internet connection.'), { code: 'functions/unavailable' });
     } finally {
       clearTimeout(slow);
+      clearTimeout(timeout);
     }
     const json = (await res.json().catch(() => ({}))) as { result?: Res; error?: { status?: string; message?: string } };
     if (!res.ok) {
@@ -87,7 +96,7 @@ export function errorText(e: unknown): string {
     case 'functions/unavailable':
       return 'No internet connection. Check your data and try again.';
     case 'functions/deadline-exceeded':
-      return 'The server did not respond. Please try again in a moment.';
+      return err.message ?? 'The server did not respond. Please try again in a moment.';
   }
   const msg = err?.message ?? 'Something went wrong.';
   return msg.replace(/^Firebase:\s*/, '').replace(/\s*\(.*\)\.?$/, '');

@@ -21,7 +21,7 @@ function stateCodeFromCurrentUser(): string {
 }
 
 export default function Signup({ finish = false }: { finish?: boolean }) {
-  const { refreshClaims, logout } = useAuth();
+  const { logout } = useAuth();
   const steps = finish ? ['Details', 'Photo', 'CDS group'] : ['Details', 'Photo', 'CDS group', 'PIN'];
   const [rawStep, setStep] = useState(0);
   // If sign-up switches to "finish" mode (fewer steps), never point past the last step.
@@ -103,7 +103,9 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
         const r = await api.createGroup({ ...profile, group });
         toast('CDS group created', 'success', `Share this group code with your members: ${r.joinCode}`);
       }
-      await refreshClaims();
+      // AuthProvider refreshes claims when it observes an approved profile.
+      // Do not hold the signup screen open waiting for an extra token refresh.
+      setBusy('');
     } catch (e) {
       setError(errorText(e));
       setBusy('');
