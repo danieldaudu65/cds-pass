@@ -55,7 +55,7 @@ export default function CallBatch() {
               className="relative text-6xl font-extrabold"
               style={{ textShadow: '0 4px 0 #064726, 0 12px 24px rgba(0,0,0,.3)' }}
             >
-              {batchLabel(batch)}
+              {open ? batchLabel(batch) : session?.status === 'closed' ? 'STOPPED' : '—'}
             </motion.p>
           </AnimatePresence>
           {batch && (
@@ -66,6 +66,9 @@ export default function CallBatch() {
         </div>
 
         {!open && <ErrorBox>Today's meeting is not open.</ErrorBox>}
+        {!open && session?.status === 'closed' && (
+          <p className="text-center text-sm text-muted">Batch calls and member turn alerts are paused until an exco opens the meeting again.</p>
+        )}
 
         <div className="card space-y-3">
           <div className="flex items-center justify-between">

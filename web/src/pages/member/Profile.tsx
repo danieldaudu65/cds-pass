@@ -22,15 +22,15 @@ export default function Profile() {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    void pushState().then(setPush);
-  }, []);
+    void pushState(me.uid).then(setPush);
+  }, [me.uid]);
 
   async function turnOnPush() {
     setError('');
     setBusy('push');
     try {
       await enableNotifications(me.uid);
-      setPush('granted');
+      setPush('enabled');
       toast('Notifications on', 'success', "We'll buzz you when your batch is called.");
     } catch (e) {
       setError(errorText(e));
@@ -62,7 +62,7 @@ export default function Profile() {
       <TopBar title="Profile" sub={group?.name} />
       <Page className="space-y-4">
         <div className="card">
-          <PhotoPicker value={photo} onChange={(b, err) => (setPhoto(b), setError(err ?? ''))} />
+          <PhotoPicker value={photo} currentPhotoURL={me.photoURL} onChange={(b, err) => (setPhoto(b), setError(err ?? ''))} />
           {!photo && me.photoURL && (
             <p className="mt-3 text-center text-xs text-muted">Your current photo is shown on your tag. Pick a new one to replace it.</p>
           )}
@@ -91,8 +91,10 @@ export default function Profile() {
             <div className="flex-1">
               <p className="font-bold">Batch alerts</p>
               <p className="text-sm text-muted">
-                {push === 'granted'
-                  ? 'On. Your phone buzzes when your batch is called.'
+                {push === 'enabled'
+                  ? 'Enabled on this device. Your phone can buzz when your batch is called.'
+                  : push === 'granted'
+                    ? 'Browser permission is allowed. Connect this device to turn on batch alerts.'
                   : push === 'denied'
                     ? 'Blocked. Allow notifications in your browser settings.'
                     : push === 'unsupported'
@@ -101,7 +103,7 @@ export default function Profile() {
               </p>
             </div>
           </div>
-          {push !== 'granted' && push !== 'denied' && (
+          {push !== 'enabled' && push !== 'denied' && push !== 'unsupported' && (
             <Button variant="ghost" loading={busy === 'push'} onClick={turnOnPush}>
               Turn on alerts
             </Button>

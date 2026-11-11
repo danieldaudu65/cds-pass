@@ -68,8 +68,14 @@ export default function Home() {
 
           {att && (
             <>
-              <Pill tone={status === 'turn' ? 'green' : status === 'done' ? 'green' : 'warn'}>
-                {status === 'turn' ? "It's your turn" : status === 'done' ? 'Thumbprinted ✓' : 'Checked in'}
+              <Pill tone={session?.status === 'closed' ? 'muted' : status === 'turn' ? 'green' : status === 'done' ? 'green' : 'warn'}>
+                {session?.status === 'closed'
+                  ? 'Meeting ended'
+                  : status === 'turn'
+                    ? "It's your turn"
+                    : status === 'done'
+                      ? 'Thumbprinted ✓'
+                      : 'Checked in'}
               </Pill>
               <span className="text-xs font-bold tracking-[0.3em] text-muted">YOUR NUMBER</span>
               <motion.span

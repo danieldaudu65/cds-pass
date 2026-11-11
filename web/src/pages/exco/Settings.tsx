@@ -18,6 +18,7 @@ const actionText: Record<string, string> = {
   settings_changed: 'Changed settings',
   session_opened: 'Opened the meeting',
   session_closed: 'Closed the meeting',
+  notification_test: 'Tested push notifications',
   manual_checkin: 'Manual check-in',
   priority_given: 'Gave a priority tag',
   batch_called: 'Called a batch',
@@ -60,6 +61,25 @@ export default function Settings() {
     setBusy('');
     if (!pos) return setError('Could not get your location. Turn on location and try again.');
     await run('venue', () => api.updateGroupSettings({ venue: { ...pos, radiusM: Number(radius) || 300 } }), 'Venue saved. Members must be within range to scan in.');
+  }
+
+  async function testNotification() {
+    setError('');
+    setBusy('notification');
+    try {
+      const result = await api.testNotification({});
+      if (!result.registered) {
+        setError(`No approved members have alerts registered yet (${result.members} members in the group). Members need to turn on alerts in their Profile.`);
+      } else if (!result.sent) {
+        setError(`Firebase delivered 0 of ${result.registered} registered member devices. Members should re-enable alerts; check the server logs if this continues.`);
+      } else {
+        toast('Test notification sent', 'success', `${result.sent} devices notified across ${result.members} approved members.`);
+      }
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy('');
+    }
   }
 
   return (
@@ -114,6 +134,18 @@ export default function Settings() {
 
         <div className="card">
           <ThemeToggle />
+        </div>
+
+        <div className="card space-y-3">
+          <p className="font-bold">Test notifications</p>
+          <p className="text-sm text-muted">The main exco can send a test alert to every approved CDS member who has enabled notifications.</p>
+          {group?.createdBy === me.uid ? (
+            <Button variant="ghost" loading={busy === 'notification'} onClick={testNotification}>
+              Send test notification to all members
+            </Button>
+          ) : (
+            <p className="text-sm font-semibold text-muted">Only the main exco can send the group test notification.</p>
+          )}
         </div>
 
         <ErrorBox>{error}</ErrorBox>

@@ -15,7 +15,8 @@ export function QRScan({ onResult, paused = false, className = '' }: Props) {
   const cb = useRef(onResult);
   const pausedRef = useRef(paused);
   const last = useRef<{ text: string; at: number }>({ text: '', at: 0 });
-  const [state, setState] = useState<'starting' | 'on' | 'error'>('starting');
+  const scannerRef = useRef<QrScanner | null>(null);
+  const [state, setState] = useState<'idle' | 'starting' | 'on' | 'error'>('idle');
   const [error, setError] = useState('');
 
   cb.current = onResult;
@@ -42,23 +43,40 @@ export function QRScan({ onResult, paused = false, className = '' }: Props) {
         maxScansPerSecond: 6,
       },
     );
-    scanner
-      .start()
-      .then(() => setState('on'))
-      .catch((e: unknown) => {
-        setState('error');
-        const msg = String((e as Error)?.message ?? e);
-        setError(
-          /permission|denied|NotAllowed/i.test(msg)
-            ? 'Camera permission is blocked. Allow the camera in your browser settings, or type the code instead.'
-            : 'Could not open the camera on this phone. Type the code instead.',
-        );
-      });
+    scannerRef.current = scanner;
     return () => {
       scanner.stop();
       scanner.destroy();
+      scannerRef.current = null;
     };
   }, []);
+
+  async function startCamera() {
+    if (!window.isSecureContext) {
+      setState('error');
+      setError('Camera access requires HTTPS. Open the secure CDS Pass website, or type the door code.');
+      return;
+    }
+    setState('starting');
+    setError('');
+    try {
+      await scannerRef.current?.start();
+      setState('on');
+    } catch (e) {
+      setState('error');
+      const err = e as { name?: string; message?: string };
+      const msg = `${err.name ?? ''} ${err.message ?? e}`;
+      setError(
+        /NotAllowed|permission|denied/i.test(msg)
+          ? 'Camera permission is blocked. Allow camera access for this website in your browser settings, then try again.'
+          : /NotFound/i.test(msg)
+            ? 'No camera was found on this device. Type the door code instead.'
+            : /NotReadable|TrackStart/i.test(msg)
+              ? 'The camera is busy in another app. Close that app and try again.'
+              : `Could not open the camera. Check this site’s camera permission and try again. ${err.message ?? ''}`.trim(),
+      );
+    }
+  }
 
   return (
     <div className={`relative mx-auto max-w-[480px] overflow-hidden rounded-3xl bg-green-deep ${className}`}>
@@ -68,8 +86,13 @@ export function QRScan({ onResult, paused = false, className = '' }: Props) {
           <Spinner light size={32} />
         </div>
       )}
-      {state === 'error' && (
-        <div className="absolute inset-0 grid place-items-center p-6 text-center text-sm font-semibold text-white">{error}</div>
+      {state !== 'on' && state !== 'starting' && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center text-sm font-semibold text-white">
+          <p>{state === 'error' ? error : 'Tap below to let CDS Pass open your camera.'}</p>
+          <button type="button" onClick={() => void startCamera()} className="rounded-xl bg-white px-5 py-3 font-bold text-green">
+            {state === 'error' ? 'Try camera again' : 'Open camera'}
+          </button>
+        </div>
       )}
     </div>
   );

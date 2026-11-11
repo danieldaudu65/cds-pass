@@ -4,7 +4,15 @@ import { compressPhoto } from '../lib/image';
 import { Icon } from './ui';
 
 /** Take a selfie or choose a photo. Returns a small, square JPEG. */
-export function PhotoPicker({ value, onChange }: { value: Blob | null; onChange: (b: Blob | null, err?: string) => void }) {
+export function PhotoPicker({
+  value,
+  currentPhotoURL,
+  onChange,
+}: {
+  value: Blob | null;
+  currentPhotoURL?: string | null;
+  onChange: (b: Blob | null, err?: string) => void;
+}) {
   const cam = useRef<HTMLInputElement>(null);
   const gallery = useRef<HTMLInputElement>(null);
   const [preview, setPreview] = useState<string | null>(null);
@@ -32,8 +40,8 @@ export function PhotoPicker({ value, onChange }: { value: Blob | null; onChange:
         animate={{ scale: 1, rotate: 0 }}
         className="relative h-40 w-40 overflow-hidden rounded-full bg-green-light shadow-lift ring-8 ring-white"
       >
-        {preview ? (
-          <img src={preview} alt="Your profile" className="h-full w-full object-cover" />
+        {preview || currentPhotoURL ? (
+          <img src={preview ?? currentPhotoURL ?? undefined} alt="Your profile" className="h-full w-full object-cover" />
         ) : (
           <div className="grid h-full w-full place-items-center text-green">
             <Icon name="user" size={64} />

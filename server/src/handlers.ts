@@ -222,7 +222,7 @@ async function admit(
   });
 }
 
-async function notify(uids: string[], title: string, body: string, link = '/tag'): Promise<number> {
+async function notify(uids: string[], title: string, body: string, link = '/tag', kind = 'alert'): Promise<number> {
   if (!uids.length) return 0;
   const snaps = await db.getAll(...uids.map((u) => userRef(u)));
   const owner = new Map<string, string>();
@@ -236,7 +236,7 @@ async function notify(uids: string[], title: string, body: string, link = '/tag'
       const res = await getMessaging().sendEachForMulticast({
         tokens: chunk,
         // Data-only message: the service worker shows it, so tapping opens /tag.
-        data: { title, body, link },
+        data: { title, body, link, kind },
         webpush: { headers: { Urgency: 'high', TTL: '900' } },
       });
       sent += res.successCount;
@@ -262,6 +262,14 @@ async function notify(uids: string[], title: string, body: string, link = '/tag'
   return sent;
 }
 
+/** Broadcast an event to every approved member of a CDS group. */
+async function notifyApprovedGroup(gid: string, title: string, body: string, link = '/home') {
+  const users = await db.collection('users').where('groupId', '==', gid).get();
+  const recipients = users.docs.filter((d) => d.data().status === 'approved').map((d) => d.id);
+  const sent = await notify(recipients, title, body, link, 'group-event');
+  return { sent, members: recipients.length };
+}
+
 // ---------------------------------------------------------------- accounts
 
 /** New corps member joins a CDS group with the group's join code. Starts as "pending". */
@@ -285,6 +293,14 @@ export const registerMember = onCall(async (req: CallableRequest) => {
   });
   await auth.setCustomUserClaims(uid, { gid, role: 'member', approved: false });
   await log(gid, uid, 'member_registered', { target: uid, stateCode: p.stateCode });
+  const excos = await db.collection('users').where('groupId', '==', gid).get();
+  await notify(
+    excos.docs.filter((d) => d.data().status === 'approved' && d.data().role === 'exco').map((d) => d.id),
+    'New member needs approval',
+    `${p.fullName} (${p.stateCode}) has requested to join your CDS group.`,
+    '/exco/members',
+    'member-request',
+  );
   return { ok: true, status: 'pending', groupName: g.docs[0].data().name };
 });
 
@@ -346,6 +362,9 @@ export const approveMember = onCall(async (req: CallableRequest) => {
     target: uid,
     stateCode: user.stateCode,
   });
+  if (approve) {
+    await notify([uid], 'CDS membership approved', 'Your CDS group has approved your registration. Open CDS Pass to continue.', '/home', 'member-approved');
+  }
   return { ok: true };
 });
 
@@ -366,6 +385,13 @@ export const setRole = onCall(async (req: CallableRequest) => {
   await userRef(uid).update({ role });
   await auth.setCustomUserClaims(uid, { gid: e.gid, role, approved: true });
   await log(e.gid, e.uid, 'role_changed', { target: uid, role });
+  await notify(
+    [uid],
+    role === 'exco' ? 'You are now a CDS exco' : 'CDS exco access removed',
+    role === 'exco' ? 'Your CDS group has given you exco access.' : 'Your CDS group has changed your access to member.',
+    '/home',
+    'role-changed',
+  );
   return { ok: true };
 });
 
@@ -377,6 +403,7 @@ export const resetPin = onCall(async (req: CallableRequest) => {
   if (!/^\d{6}$/.test(pin)) throw fail('invalid-argument', 'The new PIN must be 6 digits.');
   await auth.updateUser(uid, { password: pin });
   await log(e.gid, e.uid, 'pin_reset', { target: uid, stateCode: user.stateCode });
+  await notify([uid], 'Your CDS Pass PIN was reset', 'An exco reset your PIN. Sign in with the new PIN they gave you.', '/login', 'pin-reset');
   return { ok: true };
 });
 
@@ -401,6 +428,12 @@ export const updateGroupSettings = onCall(async (req: CallableRequest) => {
   if (!Object.keys(patch).length) return { ok: true };
   await groupRef(e.gid).update(patch);
   await log(e.gid, e.uid, 'settings_changed', { patch });
+  if ('venue' in patch) {
+    const venueMessage = patch.venue
+      ? `Venue location checking is on. You must be near the CDS venue to scan in (within ${(patch.venue as { radiusM: number }).radiusM} metres).`
+      : 'Venue location checking has been turned off for your CDS group.';
+    await notifyApprovedGroup(e.gid, 'CDS venue settings updated', venueMessage, '/home');
+  }
   return { ok: true };
 });
 
@@ -426,6 +459,7 @@ export const startSession = onCall(async (req: CallableRequest) => {
     });
   }
   await log(e.gid, e.uid, 'session_opened', { sessionId: sid });
+  await notifyApprovedGroup(e.gid, "Today's CDS meeting is open", 'The meeting is open. Scan the door code at the venue to check in.', '/home');
   return { ok: true, sessionId: sid };
 });
 
@@ -434,6 +468,7 @@ export const endSession = onCall(async (req: CallableRequest) => {
   const sid = lagosDate();
   await sessionRef(e.gid, sid).update({ status: 'closed', closedAt: FieldValue.serverTimestamp() });
   await log(e.gid, e.uid, 'session_closed', { sessionId: sid });
+  await notifyApprovedGroup(e.gid, "Today's CDS meeting has ended", 'The exco has ended the meeting. Batch calls are stopped.', '/home');
   return { ok: true };
 });
 
@@ -582,9 +617,33 @@ export const callNext = onCall(async (req: CallableRequest) => {
     .map((d) => d.id);
 
   const label = batch.kind === 'priority' ? 'Priority' : `No. ${batch.from} – ${batch.to}`;
-  const sent = await notify(targets, `${label}: it's your turn`, 'Go to the thumbprint table now and show your CDS Pass tag.');
+  const latest = await sessionRef(e.gid, sid).get();
+  if (!latest.exists || latest.data()!.status !== 'open' || latest.data()!.batchSeq !== batch.seq) {
+    throw fail('failed-precondition', 'The meeting ended before this batch could be called. No alerts were sent.');
+  }
+  const sent = await notify(targets, `${label}: it's your turn`, 'Go to the thumbprint table now and show your CDS Pass tag.', '/tag', 'batch-call');
   await log(e.gid, e.uid, 'batch_called', { label, notified: sent });
   return { ok: true, batch, notified: sent, inBatch: targets.length };
+});
+
+/** Sends a test push only to the signed-in exco's own registered devices. */
+export const testNotification = onCall(async (req: CallableRequest) => {
+  const e = await mainExco(req);
+  const members = await db.collection('users').where('groupId', '==', e.gid).get();
+  const targets = members.docs
+    .filter((d) => d.data().status === 'approved' && Array.isArray(d.data().fcmTokens) && d.data().fcmTokens.length > 0)
+    .map((d) => d.id);
+  const registered = members.docs.filter((d) => d.data().status === 'approved').length;
+  if (!targets.length) return { sent: 0, registered: 0, members: registered };
+  const sent = await notify(
+    targets,
+    'CDS Pass test notification',
+    `${e.name} sent a test notification for your CDS group.`,
+    '/home',
+    'group-test',
+  );
+  await log(e.gid, e.uid, 'notification_test', { notified: sent, targetMembers: targets.length });
+  return { sent, registered: targets.length, members: registered };
 });
 
 /** Exco scans a tag at the thumbprint table. Green = thumbprint, red = wait. */
@@ -745,6 +804,7 @@ export const setPayoutAccount = onCall({ secrets: [paystackSecret] }, async (req
     payout: { bankName, accountName: account_name, last4: acct.slice(-4), setBy: e.uid, setAt: FieldValue.serverTimestamp() },
   });
   await log(e.gid, e.uid, 'payout_account_set', { label: `${bankName} ****${acct.slice(-4)} (${account_name})` });
+  await notifyApprovedGroup(e.gid, 'CDS dues account updated', 'Your group has updated the account used for CDS dues. Check the Dues page before making a payment.', '/dues');
   return { ok: true, accountName: account_name };
 });
 
@@ -765,14 +825,24 @@ export const createDues = onCall(async (req: CallableRequest) => {
     createdAt: FieldValue.serverTimestamp(),
   });
   await log(e.gid, e.uid, 'dues_created', { label: `${title} · ${naira(Math.round(amount * 100))}` });
+  await notifyApprovedGroup(
+    e.gid,
+    `New CDS dues: ${title}`,
+    `${naira(Math.round(amount * 100))}${dueDate ? ` · due ${dueDate}` : ''}. Open CDS Pass to view or pay.`,
+    '/dues',
+  );
   return { ok: true, duesId: ref.id };
 });
 
 export const closeDues = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const duesId = String(req.data?.duesId ?? '');
-  await duesRef(e.gid, duesId).update({ active: false, closedAt: FieldValue.serverTimestamp() });
+  const ref = duesRef(e.gid, duesId);
+  const dues = await ref.get();
+  if (!dues.exists) throw fail('not-found', 'Those dues could not be found.');
+  await ref.update({ active: false, closedAt: FieldValue.serverTimestamp() });
   await log(e.gid, e.uid, 'dues_closed', { duesId });
+  await notifyApprovedGroup(e.gid, 'CDS dues closed', `${String(dues.data()!.title)} is now closed.`, '/dues');
   return { ok: true };
 });
 

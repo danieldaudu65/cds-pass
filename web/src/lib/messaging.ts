@@ -3,17 +3,21 @@ import { getMessaging, getToken, isSupported, onMessage } from 'firebase/messagi
 import { app, db } from './firebase';
 import { VAPID_KEY } from './appConfig';
 import { registerServiceWorker } from './sw';
-import { toast } from './toast';
+import { batchTurnToast, toast } from './toast';
 
-export type PushState = 'unsupported' | 'default' | 'granted' | 'denied';
+export type PushState = 'unsupported' | 'default' | 'granted' | 'enabled' | 'denied';
 
-export async function pushState(): Promise<PushState> {
+export async function pushState(uid?: string): Promise<PushState> {
   if (!('Notification' in window) || !(await isSupported())) return 'unsupported';
+  if (Notification.permission === 'granted' && uid && localStorage.getItem(`cdspass:push:${uid}`) === 'on') return 'enabled';
   return Notification.permission as PushState;
 }
 
 /** Asks permission, gets an FCM token and saves it on the member's profile. */
 export async function enableNotifications(uid: string): Promise<void> {
+  if (!VAPID_KEY.trim()) {
+    throw new Error('Push alerts are not configured yet. The site owner must add the Firebase Web Push key before alerts can work.');
+  }
   if (!(await isSupported())) {
     throw new Error(
       /iPhone|iPad/.test(navigator.userAgent)
@@ -32,7 +36,7 @@ export async function enableNotifications(uid: string): Promise<void> {
   });
   if (!token) throw new Error('Could not set up notifications. Try again.');
   await updateDoc(doc(db, 'users', uid), { fcmTokens: arrayUnion(token), updatedAt: serverTimestamp() });
-  localStorage.setItem('cdspass:push', 'on');
+  localStorage.setItem(`cdspass:push:${uid}`, 'on');
 }
 
 /** When the site is open, show incoming pushes as an in-app toast instead. */
@@ -41,6 +45,7 @@ export async function listenForegroundPush() {
   onMessage(getMessaging(app), (payload) => {
     const d = payload.data ?? {};
     navigator.vibrate?.([300, 120, 300]);
-    toast(d.title ?? 'CDS Pass', 'success', d.body);
+    if (d.kind === 'batch-call') batchTurnToast(d.title ?? "It's your turn!", d.body);
+    else toast(d.title ?? 'CDS Pass', 'success', d.body);
   });
 }

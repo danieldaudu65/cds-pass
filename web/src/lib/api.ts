@@ -33,6 +33,7 @@ export const api = {
   excoCheckIn: callable<Who & { method: 'card' | 'manual' }, { number: number; already: boolean; member: PublicMember }>('excoCheckIn'),
   setPriority: callable<Who, { ok: true; pNumber: number }>('setPriority'),
   callNext: callable<{ mode: 'priority' | 'next' }, { ok: true; batch: Batch; notified: number; inBatch: number }>('callNext'),
+  testNotification: callable<Record<string, never>, { sent: number; registered: number; members: number }>('testNotification'),
   tableCheck: callable<Who, TableCheckResponse>('tableCheck'),
   markDone: callable<Who, { ok: true }>('markDone'),
 

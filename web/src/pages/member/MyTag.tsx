@@ -85,7 +85,7 @@ export default function MyTag() {
           </Button>
         </div>
 
-        {att ? (
+        {att && session?.status !== 'closed' ? (
           <motion.div className="grid grid-cols-2 gap-3">
             <div className="card !p-4">
               <p className="text-xs font-semibold text-muted">Now calling</p>
@@ -102,15 +102,20 @@ export default function MyTag() {
               </p>
             </div>
           </motion.div>
+        ) : att ? (
+          <div className="card text-center">
+            <p className="font-extrabold">Today's meeting has ended</p>
+            <p className="mt-1 text-sm text-muted">Your attendance record is saved. Check back when your exco opens another meeting.</p>
+          </div>
         ) : (
           <Link to="/scan" className="block rounded-2xl bg-green py-4 text-center font-bold text-white">
             Scan in to get your number
           </Link>
         )}
 
-        <p className={`text-center text-sm ${status === 'turn' ? 'text-white' : 'text-muted'}`}>
+        {session?.status !== 'closed' && <p className={`text-center text-sm ${status === 'turn' ? 'text-white' : 'text-muted'}`}>
           At the table, tap the card to show your QR. The exco scans it and checks your NYSC ID card.
-        </p>
+        </p>}
       </Page>
     </div>
   );
