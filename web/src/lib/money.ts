@@ -1,10 +1,9 @@
+import { PAYSTACK_FEE_PERCENT, SERVICE_FEE_PERCENT } from './appConfig';
+
 export const naira = (kobo: number) =>
   `₦${(kobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
 
 /** Same maths as duesCharges on the server: dues + 3% service + Paystack's exact charge, rounded up to the naira. */
-const SERVICE_FEE_PERCENT = Number(import.meta.env.VITE_SERVICE_FEE_PERCENT ?? 3);
-const PAYSTACK_FEE_PERCENT = Number(import.meta.env.VITE_PAYSTACK_FEE_PERCENT ?? 1.5);
-
 export function duesCharges(amountKobo: number) {
   const servicePercent = SERVICE_FEE_PERCENT;
   const paystackPercent = PAYSTACK_FEE_PERCENT;

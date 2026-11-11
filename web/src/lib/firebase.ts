@@ -1,22 +1,14 @@
 import { initializeApp } from 'firebase/app';
-import { connectAuthEmulator, getAuth } from 'firebase/auth';
+import { getAuth } from 'firebase/auth';
 import {
-  connectFirestoreEmulator,
   initializeFirestore,
   persistentLocalCache,
   persistentMultipleTabManager,
 } from 'firebase/firestore';
 
-const env = import.meta.env;
+import { API_URL, firebaseConfig } from './appConfig';
 
-export const firebaseConfig = {
-  apiKey: env.VITE_FB_API_KEY as string,
-  authDomain: env.VITE_FB_AUTH_DOMAIN as string,
-  projectId: env.VITE_FB_PROJECT_ID as string,
-  storageBucket: env.VITE_FB_STORAGE_BUCKET as string,
-  messagingSenderId: env.VITE_FB_MESSAGING_SENDER_ID as string,
-  appId: env.VITE_FB_APP_ID as string,
-};
+export { firebaseConfig, API_URL } from './appConfig';
 
 export const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
@@ -25,14 +17,6 @@ export const auth = getAuth(app);
 export const db = initializeFirestore(app, {
   localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
 });
-
-/** The CDS Pass API server (Express on Render). */
-export const API_URL = ((env.VITE_API_URL as string) || 'http://localhost:8787').replace(/\/$/, '');
-
-if (env.VITE_USE_EMULATORS === 'true') {
-  connectAuthEmulator(auth, 'http://localhost:9099', { disableWarnings: true });
-  connectFirestoreEmulator(db, 'localhost', 8080);
-}
 
 let wakeNoticeShown = false;
 

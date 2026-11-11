@@ -1,6 +1,7 @@
 import { arrayUnion, doc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { getMessaging, getToken, isSupported, onMessage } from 'firebase/messaging';
 import { app, db } from './firebase';
+import { VAPID_KEY } from './appConfig';
 import { registerServiceWorker } from './sw';
 import { toast } from './toast';
 
@@ -26,7 +27,7 @@ export async function enableNotifications(uid: string): Promise<void> {
   const reg = await registerServiceWorker();
   if (!reg) throw new Error('Could not set up notifications on this browser.');
   const token = await getToken(getMessaging(app), {
-    vapidKey: import.meta.env.VITE_FB_VAPID_KEY as string,
+    vapidKey: VAPID_KEY,
     serviceWorkerRegistration: reg,
   });
   if (!token) throw new Error('Could not set up notifications. Try again.');
