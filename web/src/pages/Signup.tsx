@@ -1,7 +1,7 @@
 import { createUserWithEmailAndPassword } from 'firebase/auth';
 import { motion } from 'framer-motion';
 import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { PhotoPicker } from '../components/PhotoPicker';
 import { Button, ErrorBox, Field, TopBar } from '../components/ui';
 import { useAuth } from '../hooks/useAuth';
@@ -22,6 +22,7 @@ function stateCodeFromCurrentUser(): string {
 
 export default function Signup({ finish = false }: { finish?: boolean }) {
   const { logout } = useAuth();
+  const navigate = useNavigate();
   const steps = finish ? ['Details', 'Photo', 'CDS group'] : ['Details', 'Photo', 'CDS group', 'PIN'];
   const [rawStep, setStep] = useState(0);
   // If sign-up switches to "finish" mode (fewer steps), never point past the last step.
@@ -82,6 +83,7 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
 
   async function submit() {
     const sc = normalizeStateCode(stateCode)!;
+    let nextPath: string | undefined;
     setSignupLock(finish ? 'finish' : 'signup');
     try {
       let uid = auth.currentUser?.uid;
@@ -99,9 +101,11 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
       if (mode === 'join') {
         const r = await api.registerMember({ ...profile, joinCode: joinCode.trim().toUpperCase() });
         toast(`Joined ${r.groupName}`, 'success', 'An exco will approve you at your next CDS.');
+        nextPath = '/pending';
       } else {
         const r = await api.createGroup({ ...profile, group });
         toast('CDS group created', 'success', `Share this group code with your members: ${r.joinCode}`);
+        nextPath = '/exco';
       }
       // AuthProvider refreshes claims when it observes an approved profile.
       // Do not hold the signup screen open waiting for an extra token refresh.
@@ -111,6 +115,7 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
       setBusy('');
     } finally {
       setSignupLock(false);
+      if (nextPath) navigate(nextPath, { replace: true });
     }
   }
 
