@@ -37,6 +37,27 @@ function Splash() {
   );
 }
 
+function ProfileReadError({ message, onLogout }: { message: string; onLogout: () => void }) {
+  return (
+    <div className="grid min-h-[100dvh] place-items-center bg-paper px-6 text-ink">
+      <div className="w-full max-w-md space-y-4 rounded-3xl bg-card p-6 shadow-card">
+        <h1 className="text-xl font-extrabold">Couldn’t load your CDS profile</h1>
+        <p className="text-sm text-muted">
+          Your login worked, but CDS Pass could not check your saved registration. This can happen if the connection
+          failed or this website is connected to a different Firebase project. Your account has not been deleted.
+        </p>
+        <p className="break-words rounded-xl bg-line p-3 text-xs text-muted">{message}</p>
+        <button onClick={() => window.location.reload()} className="h-12 w-full rounded-2xl bg-green font-bold text-white">
+          Try again
+        </button>
+        <button onClick={onLogout} className="w-full py-2 text-sm font-bold text-muted">
+          Log out
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /** Phone: one column + bottom bar. Laptop: sidebar + wider content. */
 function AppShell({ mode }: { mode: 'member' | 'exco' }) {
   return (
@@ -61,12 +82,20 @@ function ExcoLayout() {
 }
 
 export default function App() {
-  const { user, profile, ready } = useAuth();
+  const { user, profile, profileError, ready, logout } = useAuth();
   const lock = useSignupLock();
 
   useEffect(() => {
     if (ready) startOfflineSync();
   }, [ready]);
+
+  if (user && profileError) {
+    return (
+      <InstallGate>
+        <ProfileReadError message={profileError} onLogout={() => void logout()} />
+      </InstallGate>
+    );
+  }
 
   let routes: JSX.Element;
   if (user === undefined || (!lock && user && profile === undefined)) {

@@ -7,7 +7,7 @@ import { MemberCard } from '../../components/MemberCard';
 import { QRScan } from '../../components/QRScan';
 import { Button, ErrorBox, Icon, Page, Pill } from '../../components/ui';
 import { useMe } from '../../hooks/useAuth';
-import { useGroupMembers } from '../../hooks/useLive';
+import { useGroup, useGroupMembers } from '../../hooks/useLive';
 import { api } from '../../lib/api';
 import { errorText } from '../../lib/firebase';
 import { parseQR } from '../../lib/rules';
@@ -18,7 +18,9 @@ type Filter = 'pending' | 'approved' | 'excos';
 
 export default function Members() {
   const me = useMe();
+  const group = useGroup(me.groupId);
   const members = useGroupMembers(me.groupId);
+  const isMainExco = group?.createdBy === me.uid;
   const [filter, setFilter] = useState<Filter>('pending');
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<Profile | null>(null);
@@ -99,7 +101,7 @@ export default function Members() {
                     </Button>
                   </>
                 )}
-                {selected.status === 'approved' && selected.uid !== me.uid && (
+                {selected.status === 'approved' && selected.uid !== me.uid && isMainExco && (
                   <Button
                     variant="outline"
                     loading={busy === 'role'}
@@ -113,6 +115,11 @@ export default function Members() {
                   >
                     {selected.role === 'exco' ? 'Remove as exco' : 'Make exco'}
                   </Button>
+                )}
+                {selected.status === 'approved' && selected.uid !== me.uid && group && !isMainExco && (
+                  <p className="rounded-xl bg-line px-3 py-2 text-sm text-muted">
+                    Only the main exco who created this CDS group can change exco roles.
+                  </p>
                 )}
                 {selected.status === 'approved' && (
                   <Button variant="ghost" loading={busy === 'pin'} onClick={resetPin}>

@@ -15,6 +15,8 @@ interface AuthState {
   user: User | null | undefined;
   /** undefined = loading, null = account exists but registration not finished */
   profile: Profile | null | undefined;
+  /** A read failure is different from a profile that does not exist. */
+  profileError: string | null;
   claims: Claims;
   /** true when the login token already carries the approval (needed for reading group data) */
   ready: boolean;
@@ -27,6 +29,7 @@ const Ctx = createContext<AuthState | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null | undefined>(undefined);
   const [profile, setProfile] = useState<Profile | null | undefined>(undefined);
+  const [profileError, setProfileError] = useState<string | null>(null);
   const [claims, setClaims] = useState<Claims>({});
 
   const refreshClaims = useCallback(async () => {
@@ -42,6 +45,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setUser(u);
         if (!u) {
           setProfile(null);
+          setProfileError(null);
           setClaims({});
           return;
         }
@@ -63,12 +67,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   useEffect(() => {
-    if (!user) return;
+    if (!user) {
+      setProfileError(null);
+      return;
+    }
     setProfile(undefined);
+    setProfileError(null);
     return onSnapshot(
       doc(db, 'users', user.uid),
-      (snap) => setProfile(snap.exists() ? ({ uid: snap.id, ...snap.data() } as Profile) : null),
-      () => setProfile(null),
+      (snap) => {
+        setProfileError(null);
+        setProfile(snap.exists() ? ({ uid: snap.id, ...snap.data() } as Profile) : null);
+      },
+      (error) => {
+        console.error('Could not load the signed-in user profile:', error);
+        setProfile(undefined);
+        setProfileError(error.message || 'Could not read your CDS profile.');
+      },
     );
   }, [user]);
 
@@ -88,9 +103,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await signOut(auth);
   }, []);
 
-  return (
-    <Ctx.Provider value={{ user, profile, claims, ready, refreshClaims, logout }}>{children}</Ctx.Provider>
-  );
+  return <Ctx.Provider value={{ user, profile, profileError, claims, ready, refreshClaims, logout }}>{children}</Ctx.Provider>;
 }
 
 export function useAuth(): AuthState {

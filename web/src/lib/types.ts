@@ -18,6 +18,7 @@ export interface Profile {
 
 export interface Group {
   id: string;
+  createdBy: string;
   name: string;
   lga: string;
   state: string;

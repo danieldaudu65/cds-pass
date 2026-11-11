@@ -88,6 +88,16 @@ async function exco(req: CallableRequest) {
   return { uid, gid, name: u.fullName as string };
 }
 
+/** The group creator is the main exco and owns role assignments and dues creation. */
+async function mainExco(req: CallableRequest) {
+  const e = await exco(req);
+  const group = (await groupRef(e.gid).get()).data();
+  if (!group || group.createdBy !== e.uid) {
+    throw fail('permission-denied', 'Only the main exco who created this CDS group can do this.');
+  }
+  return e;
+}
+
 function text(v: unknown, label: string, min: number, max: number): string {
   if (typeof v !== 'string') throw fail('invalid-argument', `${label} is required.`);
   const s = v.trim().replace(/\s+/g, ' ');
@@ -344,10 +354,14 @@ export const approveMember = onCall(async (req: CallableRequest) => {
 
 /** Make someone an exco (or back to member). */
 export const setRole = onCall(async (req: CallableRequest) => {
-  const e = await exco(req);
+  const e = await mainExco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const role: Role = req.data?.role === 'exco' ? 'exco' : 'member';
   if (uid === e.uid && role !== 'exco') throw fail('failed-precondition', 'You cannot remove yourself as exco.');
+  const group = (await groupRef(e.gid).get()).data();
+  if (uid === group?.createdBy && role !== 'exco') {
+    throw fail('failed-precondition', 'The main exco who created this CDS group cannot be demoted.');
+  }
   if (user.status !== 'approved') throw fail('failed-precondition', 'Approve this member first.');
   await userRef(uid).update({ role });
   await auth.setCustomUserClaims(uid, { gid: e.gid, role, approved: true });
@@ -736,7 +750,7 @@ export const setPayoutAccount = onCall({ secrets: [paystackSecret] }, async (req
 
 /** Exco creates a dues item, e.g. "November dues ₦1,000". */
 export const createDues = onCall(async (req: CallableRequest) => {
-  const e = await exco(req);
+  const e = await mainExco(req);
   const title = text(req.data?.title, 'Title', 3, 60);
   const amount = Number(req.data?.amountNaira);
   if (!Number.isFinite(amount) || amount < 50 || amount > 100_000) throw fail('invalid-argument', 'Amount must be ₦50 – ₦100,000.');

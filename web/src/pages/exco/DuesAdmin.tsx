@@ -274,7 +274,9 @@ function DuesDetail({ dues }: { dues: Dues }) {
 
 export default function DuesAdmin() {
   const me = useMe();
+  const group = useGroup(me.groupId);
   const dues = useActiveDues(me.groupId);
+  const isMainExco = group?.createdBy === me.uid;
   const [creating, setCreating] = useState(false);
 
   return (
@@ -282,13 +284,22 @@ export default function DuesAdmin() {
       <ExcoHeader title="Dues" sub="Online and cash payments" />
       <Page className="space-y-4">
         <PayoutAccount />
-        {creating ? (
+        {isMainExco && (creating ? (
           <NewDues onDone={() => setCreating(false)} />
         ) : (
           <Button onClick={() => setCreating(true)}>+ New dues</Button>
+        ))}
+        {group && !isMainExco && (
+          <p className="rounded-2xl bg-line px-4 py-3 text-sm text-muted">
+            Only the main exco who created this CDS group can create new dues. You can still manage existing dues here.
+          </p>
         )}
         {dues?.map((d) => <DuesDetail key={d.id} dues={d} />)}
-        {dues && dues.length === 0 && !creating && <p className="text-center text-sm text-muted">No open dues. Create one above.</p>}
+        {dues && dues.length === 0 && !creating && (
+          <p className="text-center text-sm text-muted">
+            {isMainExco ? 'No open dues. Create one above.' : 'No open dues. Ask the main exco to create one.'}
+          </p>
+        )}
         <p className="text-center text-xs text-muted">
           Cash only counts after the member confirms it on their phone. Every cash record is in the activity log.
         </p>
