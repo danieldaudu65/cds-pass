@@ -17,8 +17,10 @@ services:
       - key: PAYSTACK_FEE_PERCENT
         value: "1.5"
       # Fill these in on the Render dashboard (never commit them):
-      - key: CORS_ORIGINS # e.g. https://your-id.web.app
+      - key: CORS_ORIGINS # Set to https://cdspass.name.ng in the Render dashboard.
         sync: false
+      - key: PLATFORM_ADMIN_STATE_CODE
+        value: LA/26B/2578
       - key: FIREBASE_SERVICE_ACCOUNT # service-account JSON (or base64 of it)
         sync: false
       - key: FIREBASE_STORAGE_BUCKET # e.g. your-id.firebasestorage.app

@@ -16,10 +16,11 @@ const app = express();
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
 
-const origins = (process.env.CORS_ORIGINS ?? 'http://localhost:5173')
+const configuredOrigins = (process.env.CORS_ORIGINS ?? 'http://localhost:5173')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+const origins = [...new Set([...configuredOrigins, 'https://cdspass.name.ng'])];
 app.use(cors({ origin: origins, maxAge: 86400 }));
 
 // Profile photos → Cloudinary (multipart upload, so this goes before express.json)

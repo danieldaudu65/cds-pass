@@ -69,7 +69,7 @@ the phone still buzzes and shows "It's your turn!" when the batch is called.
 3. **Firestore Database → Create** (location `europe-west1`, production mode).
 4. **Storage → Get started.** New projects need the **Blaze** plan for Storage (free allowance still applies;
    set a $5 budget alert). No card? Ask for photos to be moved to Cloudinary instead.
-5. **Project settings → Your apps → Web `</>`** → copy the config into `web\.env`.
+5. **Project settings → Your apps → Web `</>`** → update the public Firebase settings in `web/src/lib/appConfig.ts`.
 6. **Project settings → Cloud Messaging → Web Push certificates → Generate key pair** → `VITE_FB_VAPID_KEY`.
 7. **Project settings → Service accounts → Generate new private key** → downloads a JSON file. Keep it secret.
 
@@ -79,24 +79,23 @@ the phone still buzzes and shows "It's your turn!" when the batch is called.
 3. Fill in the environment variables Render asks for:
    - `FIREBASE_SERVICE_ACCOUNT`: paste the whole JSON file from step 1.7
    - `FIREBASE_STORAGE_BUCKET`: e.g. `your-id.firebasestorage.app`
-   - `CORS_ORIGINS`: `https://your-id.web.app,https://your-id.firebaseapp.com`
+   - `CORS_ORIGINS`: `https://cdspass.name.ng` (add any other live frontend domains if they are still used)
+   - `PLATFORM_ADMIN_STATE_CODE`: `LA/26B/2578`, the one account allowed to create groups
    - `PAYSTACK_SECRET_KEY`: test key first, live key later
-4. After it deploys, open `https://cds-pass-api.onrender.com/health`. It should show `{"ok":true}`.
+4. After it deploys, open `https://cds-pass.onrender.com/health`. It should show `{"ok":true}`.
 5. **Keep it awake on CDS days:** free Render servers sleep after 15 min idle (first request then takes ~50 s).
    Create a free job on <https://cron-job.org> that opens `/health` every 10 minutes.
 
-### 3. Website on Firebase Hosting
-In `web\.env` set the real Firebase values, `VITE_USE_EMULATORS=false` and
-`VITE_API_URL=https://cds-pass-api.onrender.com`. Then:
+### 3. Website on cPanel or Netlify
+The live site is `https://cdspass.name.ng`. Build the frontend with:
 ```powershell
-cd C:\Projects\cds-pass
-firebase use --add          # pick your project, alias: default
-firebase deploy             # builds the website and uploads it + database/storage rules
+npm --prefix web run build
 ```
+Upload the contents of `web/dist` to the site's document root. Keep SPA rewrites enabled so routes such as `/exco` load on refresh.
 
 ### 4. After the first deploy
-- Paystack → Settings → API Keys & Webhooks → **Webhook URL**: `https://cds-pass-api.onrender.com/paystack/webhook`
-- Photos in shared tag images: `gsutil cors set cors.json gs://your-id.firebasestorage.app`
+- Paystack → Settings → API Keys & Webhooks → **Webhook URL**: `https://cds-pass.onrender.com/paystack/webhook`
+- Photos in shared tag images: `gsutil cors set cors.json gs://cds-pass.firebasestorage.app`
 - Test on real phones: install (Android "Install app", iPhone Share → Add to Home Screen), turn on alerts,
   call a batch, pay a dues with a Paystack test card, record and confirm cash.
 

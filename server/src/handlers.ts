@@ -307,6 +307,12 @@ export const registerMember = onCall(async (req: CallableRequest) => {
 /** An exco creates a new CDS group and becomes its first exco. */
 export const createGroup = onCall(async (req : CallableRequest) => {
   const { uid } = signedIn(req);
+  const adminStateCode = normalizeStateCode(process.env.PLATFORM_ADMIN_STATE_CODE);
+  const adminEmail = adminStateCode ? stateCodeToEmail(adminStateCode).toLowerCase() : '';
+  const account = await auth.getUser(uid);
+  if (!adminEmail || account.email?.toLowerCase() !== adminEmail) {
+    throw fail('permission-denied', 'Only the CDS Pass administrator can create a new CDS group. Join an existing group with its code.');
+  }
   const p = await validateProfile(uid, req.data);
   const name = text(req.data?.group?.name, 'CDS group name', 3, 60);
   const lga = text(req.data?.group?.lga, 'LGA', 2, 60);

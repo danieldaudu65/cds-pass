@@ -57,6 +57,13 @@ export function QRScan({ onResult, paused = false, className = '' }: Props) {
       setError('Camera access requires HTTPS. Open the secure CDS Pass website, or type the door code.');
       return;
     }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setState('error');
+      setError(/WhatsApp|Instagram|FBAN|FBAV|; wv\)/i.test(navigator.userAgent)
+        ? 'This in-app browser does not provide camera access. Open CDS Pass in Chrome or Safari, then try again.'
+        : 'This browser does not support camera access. Open CDS Pass in an updated Chrome or Safari browser.');
+      return;
+    }
     setState('starting');
     setError('');
     try {

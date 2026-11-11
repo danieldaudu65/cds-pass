@@ -7,6 +7,7 @@ import { Button, ErrorBox, Field, TopBar } from '../components/ui';
 import { useAuth } from '../hooks/useAuth';
 import { api } from '../lib/api';
 import { auth, errorText } from '../lib/firebase';
+import { PLATFORM_ADMIN_STATE_CODE } from '../lib/appConfig';
 import { normalizePhone, normalizeStateCode, stateCodeToEmail } from '../lib/rules';
 import { setSignupLock } from '../lib/signupLock';
 import { toast } from '../lib/toast';
@@ -42,6 +43,7 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
 
   const [error, setError] = useState('');
   const [busy, setBusy] = useState('');
+  const canCreateGroup = normalizeStateCode(stateCode) === PLATFORM_ADMIN_STATE_CODE;
 
   function validate(i: number): string {
     if (i === 0) {
@@ -206,8 +208,8 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
                   <h2 className="text-2xl font-extrabold">Your CDS group</h2>
                   <p className="text-muted">Ask your CDS exco for the group code.</p>
                 </div>
-                <div className="grid grid-cols-2 gap-2 rounded-2xl bg-line p-1.5">
-                  {(['join', 'create'] as Mode[]).map((m) => (
+                <div className={`grid gap-2 rounded-2xl bg-line p-1.5 ${canCreateGroup ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                  {(canCreateGroup ? (['join', 'create'] as Mode[]) : (['join'] as Mode[])).map((m) => (
                     <button
                       key={m}
                       type="button"
