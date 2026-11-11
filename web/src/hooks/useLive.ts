@@ -1,9 +1,7 @@
 import {
   collection,
   doc,
-  limit,
   onSnapshot,
-  orderBy,
   query,
   where,
   type DocumentData,
@@ -11,6 +9,7 @@ import {
 } from 'firebase/firestore';
 import { useEffect, useMemo, useState } from 'react';
 import { db } from '../lib/firebase';
+import { api } from '../lib/api';
 import { lagosDate } from '../lib/rules';
 import type { Attendee, Dues, DuesStatus, Group, LogEntry, Payment, Profile, Session } from '../lib/types';
 
@@ -98,11 +97,23 @@ export function useGroupMembers(gid: string | undefined) {
 }
 
 export function useLogs(gid: string | undefined, max = 50) {
-  const q = useMemo(
-    () => (gid ? query(collection(db, `groups/${gid}/logs`), orderBy('at', 'desc'), limit(max)) : null),
-    [gid, max],
-  );
-  return useList<LogEntry>(q, `logs:${gid}:${max}`);
+  const [logs, setLogs] = useState<LogEntry[] | undefined>(undefined);
+  useEffect(() => {
+    if (!gid) {
+      setLogs([]);
+      return;
+    }
+    let active = true;
+    setLogs(undefined);
+    void api.getLogs({ limit: max }).then((entries) => {
+      if (active) setLogs(entries);
+    }).catch((error) => {
+      console.error('Could not load activity history.', error);
+      if (active) setLogs([]);
+    });
+    return () => { active = false; };
+  }, [gid, max]);
+  return logs;
 }
 
 export function useActiveDues(gid: string | undefined) {

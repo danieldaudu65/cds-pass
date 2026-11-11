@@ -7,6 +7,8 @@ import { api } from '../../lib/api';
 import { getPosition } from '../../lib/device';
 import { errorText } from '../../lib/firebase';
 import { toast } from '../../lib/toast';
+import { normalizeStateCode } from '../../lib/rules';
+import { PLATFORM_ADMIN_STATE_CODE } from '../../lib/appConfig';
 
 const actionText: Record<string, string> = {
   group_created: 'Created the group',
@@ -41,6 +43,8 @@ export default function Settings() {
   const [radius, setRadius] = useState('300');
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
+  const [newGroup, setNewGroup] = useState({ name: '', lga: '', state: '', mainExcoStateCode: '' });
+  const [createdGroup, setCreatedGroup] = useState<{ joinCode: string; mainExcoStateCode: string } | null>(null);
 
   async function run(label: string, fn: () => Promise<unknown>, ok: string) {
     setError('');
@@ -75,6 +79,26 @@ export default function Settings() {
       } else {
         toast('Test notification sent', 'success', `${result.sent} devices notified across ${result.members} approved members.`);
       }
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function createGroup() {
+    setError('');
+    const mainExcoStateCode = normalizeStateCode(newGroup.mainExcoStateCode);
+    if (!mainExcoStateCode) return setError('Enter a valid state code for the new group’s main exco.');
+    setBusy('create-group');
+    try {
+      const result = await api.createManagedGroup({
+        group: { name: newGroup.name, lga: newGroup.lga, state: newGroup.state },
+        mainExcoStateCode,
+      });
+      setCreatedGroup({ joinCode: result.joinCode, mainExcoStateCode: result.mainExcoStateCode });
+      setNewGroup({ name: '', lga: '', state: '', mainExcoStateCode: '' });
+      toast('CDS group created', 'success', `Share code ${result.joinCode} with the appointed main exco.`);
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -139,7 +163,7 @@ export default function Settings() {
         <div className="card space-y-3">
           <p className="font-bold">Test notifications</p>
           <p className="text-sm text-muted">The main exco can send a test alert to every approved CDS member who has enabled notifications.</p>
-          {group?.createdBy === me.uid ? (
+          {(group?.mainExcoUid ?? group?.createdBy) === me.uid ? (
             <Button variant="ghost" loading={busy === 'notification'} onClick={testNotification}>
               Send test notification to all members
             </Button>
@@ -147,6 +171,42 @@ export default function Settings() {
             <p className="text-sm font-semibold text-muted">Only the main exco can send the group test notification.</p>
           )}
         </div>
+
+        {me.stateCode === PLATFORM_ADMIN_STATE_CODE && (
+          <div className="card space-y-3">
+            <p className="font-bold">Create another CDS group</p>
+            <p className="text-sm text-muted">Choose the member who will own this group as its main exco. Your current group membership will stay as it is.</p>
+            <Field label="New CDS group name" placeholder="Digital Skills CDS" value={newGroup.name} onChange={(e) => setNewGroup({ ...newGroup, name: e.target.value })} />
+            <Field label="LGA" placeholder="Ikorodu" value={newGroup.lga} onChange={(e) => setNewGroup({ ...newGroup, lga: e.target.value })} />
+            <Field label="State" placeholder="Lagos" value={newGroup.state} onChange={(e) => setNewGroup({ ...newGroup, state: e.target.value })} />
+            <Field
+              label="Main exco state code"
+              placeholder="LA/26B/1142"
+              autoCapitalize="characters"
+              value={newGroup.mainExcoStateCode}
+              onChange={(e) => setNewGroup({ ...newGroup, mainExcoStateCode: e.target.value })}
+            />
+            <Button loading={busy === 'create-group'} onClick={createGroup}>Create CDS group</Button>
+            {createdGroup && (
+              <div className="rounded-2xl bg-green-light p-4 text-center">
+                <p className="text-sm font-semibold text-muted">Give this group code to {createdGroup.mainExcoStateCode}</p>
+                <p className="my-2 text-3xl font-extrabold tracking-[0.3em] text-green">{createdGroup.joinCode}</p>
+                <p className="text-xs text-muted">They join with this code and their state code. CDS Pass will make them the approved main exco automatically.</p>
+                <Button
+                  className="mt-3"
+                  variant="ghost"
+                  onClick={() => {
+                    const text = `You are the main exco for a CDS Pass group. Open ${location.origin}, sign up with state code ${createdGroup.mainExcoStateCode}, and join using group code ${createdGroup.joinCode}.`;
+                    if (navigator.share) void navigator.share({ text }).catch(() => undefined);
+                    else void navigator.clipboard?.writeText(text).then(() => toast('Instructions copied', 'success'));
+                  }}
+                >
+                  Share setup instructions
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
 
         <ErrorBox>{error}</ErrorBox>
 
@@ -162,7 +222,7 @@ export default function Settings() {
                   {l.stateCode ? ` · ${l.stateCode}` : ''}
                   {typeof l.reason === 'string' ? ` · ${String(l.reason).replace(/_/g, ' ')}` : ''}
                 </p>
-                <p className="text-xs text-muted">{l.at?.toDate().toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}</p>
+                <p className="text-xs text-muted">{l.atMs ? new Date(l.atMs).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' }) : 'Time unavailable'}</p>
               </li>
             ))}
           </ul>

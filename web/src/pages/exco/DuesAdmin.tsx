@@ -276,7 +276,7 @@ export default function DuesAdmin() {
   const me = useMe();
   const group = useGroup(me.groupId);
   const dues = useActiveDues(me.groupId);
-  const isMainExco = group?.createdBy === me.uid;
+  const isMainExco = (group?.mainExcoUid ?? group?.createdBy) === me.uid;
   const [creating, setCreating] = useState(false);
 
   return (

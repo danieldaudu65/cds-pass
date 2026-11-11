@@ -35,6 +35,11 @@ service cloud.firestore {
       allow create, delete: if false;
     }
 
+    // Main-exco state-code reservations are written and consumed only by the API server.
+    match /mainExcoReservations/{reservationId} {
+      allow read, write: if false;
+    }
+
     match /groups/{gid} {
       allow read: if inGroup(gid);
       allow write: if false;

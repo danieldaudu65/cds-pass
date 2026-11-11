@@ -25,6 +25,10 @@ services:
         sync: false
       - key: FIREBASE_STORAGE_BUCKET # e.g. your-id.firebasestorage.app
         sync: false
+      - key: MONGODB_URI # MongoDB Atlas connection string; keep this server-side only.
+        sync: false
+      - key: MONGODB_DATABASE
+        value: cds_pass
       - key: PAYSTACK_SECRET_KEY
         sync: false
       - key: CLOUDINARY_CLOUD_NAME

@@ -19,6 +19,8 @@ export interface Profile {
 export interface Group {
   id: string;
   createdBy: string;
+  mainExcoUid?: string | null;
+  mainExcoStateCode?: string | null;
   name: string;
   lga: string;
   state: string;
@@ -75,8 +77,8 @@ export type Batch =
 export interface Session {
   id: string;
   status: 'open' | 'closed';
-  nextNumber: number;
-  nextPriority: number;
+  nextNumber?: number;
+  nextPriority?: number;
   lastTo: number;
   batchSeq: number;
   batch: Batch | null;
@@ -120,6 +122,7 @@ export interface TableCheckResponse {
 export interface LogEntry {
   id: string;
   at?: Timestamp;
+  atMs?: number | null;
   by: string;
   action: string;
   target?: string;

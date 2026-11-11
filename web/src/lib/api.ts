@@ -1,5 +1,5 @@
 import { callable } from './firebase';
-import type { Attendee, Batch, PublicMember, TableCheckResponse } from './types';
+import type { Attendee, Batch, LogEntry, PublicMember, TableCheckResponse } from './types';
 
 interface ProfileInput {
   stateCode: string;
@@ -10,9 +10,13 @@ interface ProfileInput {
 type Who = { uid?: string; stateCode?: string };
 
 export const api = {
+  getLogs: callable<{ limit: number }, LogEntry[]>('getLogs'),
   // accounts
-  registerMember: callable<ProfileInput & { joinCode: string }, { ok: true; status: string; groupName: string }>('registerMember'),
-  createGroup: callable<ProfileInput & { group: { name: string; lga: string; state: string } }, { ok: true; groupId: string; joinCode: string }>('createGroup'),
+  registerMember: callable<ProfileInput & { joinCode: string }, { ok: true; status: 'pending' | 'approved'; role: 'member' | 'exco'; groupName: string }>('registerMember'),
+  createManagedGroup: callable<
+    { group: { name: string; lga: string; state: string }; mainExcoStateCode: string },
+    { ok: true; groupId: string; joinCode: string; mainExcoStateCode: string }
+  >('createManagedGroup'),
   approveMember: callable<Who & { approve: boolean }, { ok: true }>('approveMember'),
   setRole: callable<Who & { role: 'member' | 'exco' }, { ok: true }>('setRole'),
   resetPin: callable<Who & { pin: string }, { ok: true }>('resetPin'),

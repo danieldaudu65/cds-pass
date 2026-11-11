@@ -20,7 +20,7 @@ export default function Members() {
   const me = useMe();
   const group = useGroup(me.groupId);
   const members = useGroupMembers(me.groupId);
-  const isMainExco = group?.createdBy === me.uid;
+  const isMainExco = (group?.mainExcoUid ?? group?.createdBy) === me.uid;
   const [filter, setFilter] = useState<Filter>('pending');
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<Profile | null>(null);

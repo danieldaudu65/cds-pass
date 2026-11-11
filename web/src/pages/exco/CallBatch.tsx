@@ -15,7 +15,7 @@ export default function CallBatch() {
   const batch = session?.batch ?? null;
   const size = group?.batchSize ?? 20;
   const nextFrom = (session?.lastTo ?? 0) + 1;
-  const lastNumber = (session?.nextNumber ?? 1) - 1;
+  const lastNumber = Math.max((session?.nextNumber ?? 1) - 1, ...(attendees ?? []).map((a) => a.number), 0);
 
   const inCurrent =
     batch?.kind === 'regular'

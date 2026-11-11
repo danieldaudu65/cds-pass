@@ -16,7 +16,8 @@ A web app that ends the queue for numbers at NYSC CDS.
 |---|---|---|
 | Website (React, installable app) | Firebase Hosting | `web/` |
 | API server (Express): all anti-cheat rules, dues, Paystack | **Render** (free tier) | `server/` |
-| Database, logins, profile photos, notifications | Firebase (Firestore, Auth, Storage, Cloud Messaging) | `firestore.rules`, `storage.rules` |
+| Live app data, logins, profile photos, push delivery | Firebase (Firestore, Auth, Storage, Cloud Messaging) | `firestore.rules`, `storage.rules` |
+| Non-live exco activity history | MongoDB Atlas via the API server (with Firestore fallback) | `server/src/mongo.ts` |
 
 The old `functions/` folder is no longer used; the same code now lives in `server/src/handlers.ts`.
 You can delete `functions/` when you like.
@@ -80,11 +81,26 @@ the phone still buzzes and shows "It's your turn!" when the batch is called.
    - `FIREBASE_SERVICE_ACCOUNT`: paste the whole JSON file from step 1.7
    - `FIREBASE_STORAGE_BUCKET`: e.g. `your-id.firebasestorage.app`
    - `CORS_ORIGINS`: `https://cdspass.name.ng` (add any other live frontend domains if they are still used)
-   - `PLATFORM_ADMIN_STATE_CODE`: `LA/26B/2578`, the one account allowed to create groups
+   - `PLATFORM_ADMIN_STATE_CODE`: the platform admin state code; that account creates groups in Exco → Settings and assigns each group’s main exco state code. The appointed person joins with the group code and is auto-approved as main exco.
    - `PAYSTACK_SECRET_KEY`: test key first, live key later
+   - `MONGODB_URI`: MongoDB Atlas connection string (server secret; never add it to `web/.env`)
+   - `MONGODB_DATABASE`: database name, normally `cds_pass`
 4. After it deploys, open `https://cds-pass.onrender.com/health`. It should show `{"ok":true}`.
 5. **Keep it awake on CDS days:** free Render servers sleep after 15 min idle (first request then takes ~50 s).
    Create a free job on <https://cron-job.org> that opens `/health` every 10 minutes.
+
+### MongoDB and Firestore roles
+Firestore remains the source of truth for accounts, groups, approvals, dues/payment state, attendance,
+meeting status, queue state, and notification tokens. Those items need Firestore security rules or live
+updates. MongoDB stores the exco activity history, which is read when Settings opens rather than streamed
+live. If MongoDB is not configured or unavailable, the API keeps the app working using the existing
+Firestore activity log. When MongoDB is first configured, the API copies up to the latest 1,000 existing
+Firestore log entries for that group into MongoDB.
+
+Create an Atlas database user and set Atlas Network Access so the Render API can connect. Put the URI in
+Render as `MONGODB_URI`. For local testing, set the same variable in `server/dev.env` (which must remain
+private); leave it unset to use the Firestore fallback. Never put a MongoDB URI in frontend environment
+variables or commit it to Git.
 
 ### 3. Website on cPanel or Netlify
 The live site is `https://cdspass.name.ng`. Build the frontend with:

@@ -7,13 +7,10 @@ import { Button, ErrorBox, Field, TopBar } from '../components/ui';
 import { useAuth } from '../hooks/useAuth';
 import { api } from '../lib/api';
 import { auth, errorText } from '../lib/firebase';
-import { PLATFORM_ADMIN_STATE_CODE } from '../lib/appConfig';
 import { normalizePhone, normalizeStateCode, stateCodeToEmail } from '../lib/rules';
 import { setSignupLock } from '../lib/signupLock';
 import { toast } from '../lib/toast';
 import { uploadAvatar } from '../lib/upload';
-
-type Mode = 'join' | 'create';
 
 /** State code is recoverable from the hidden login email (la26b1142@cdspass.app). */
 function stateCodeFromCurrentUser(): string {
@@ -34,16 +31,13 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
   const [fullName, setFullName] = useState('');
   const [phone, setPhone] = useState('');
   const [photo, setPhoto] = useState<Blob | null>(null);
-  const [mode, setMode] = useState<Mode>('join');
   const [joinCode, setJoinCode] = useState('');
-  const [group, setGroup] = useState({ name: '', lga: '', state: '' });
   const [pin, setPin] = useState('');
   const [pin2, setPin2] = useState('');
   const [consent, setConsent] = useState(false);
 
   const [error, setError] = useState('');
   const [busy, setBusy] = useState('');
-  const canCreateGroup = normalizeStateCode(stateCode) === PLATFORM_ADMIN_STATE_CODE;
 
   function validate(i: number): string {
     if (i === 0) {
@@ -53,9 +47,7 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
     }
     if (i === 1 && !photo) return 'Add a profile picture.';
     if (i === 2) {
-      if (mode === 'join' && joinCode.trim().length !== 6) return 'Enter the 6-character CDS group code from your exco.';
-      if (mode === 'create' && (group.name.trim().length < 3 || group.lga.trim().length < 2 || group.state.trim().length < 2))
-        return 'Fill in the CDS group name, LGA and state.';
+      if (joinCode.trim().length !== 6) return 'Enter the 6-character CDS group code from your exco.';
     }
     if (i === 3) {
       if (!/^\d{6}$/.test(pin)) return 'Your PIN must be 6 digits.';
@@ -100,14 +92,13 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
 
       setBusy('Saving your details…');
       const profile = { stateCode: sc, fullName: fullName.trim(), phone: normalizePhone(phone)!, photoURL };
-      if (mode === 'join') {
-        const r = await api.registerMember({ ...profile, joinCode: joinCode.trim().toUpperCase() });
+      const r = await api.registerMember({ ...profile, joinCode: joinCode.trim().toUpperCase() });
+      if (r.status === 'approved' && r.role === 'exco') {
+        toast(`You are the main exco for ${r.groupName}`, 'success', 'You can now set up the group and promote other members.');
+        nextPath = '/exco';
+      } else {
         toast(`Joined ${r.groupName}`, 'success', 'An exco will approve you at your next CDS.');
         nextPath = '/pending';
-      } else {
-        const r = await api.createGroup({ ...profile, group });
-        toast('CDS group created', 'success', `Share this group code with your members: ${r.joinCode}`);
-        nextPath = '/exco';
       }
       // AuthProvider refreshes claims when it observes an approved profile.
       // Do not hold the signup screen open waiting for an extra token refresh.
@@ -208,43 +199,15 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
                   <h2 className="text-2xl font-extrabold">Your CDS group</h2>
                   <p className="text-muted">Ask your CDS exco for the group code.</p>
                 </div>
-                <div className={`grid gap-2 rounded-2xl bg-line p-1.5 ${canCreateGroup ? 'grid-cols-2' : 'grid-cols-1'}`}>
-                  {(canCreateGroup ? (['join', 'create'] as Mode[]) : (['join'] as Mode[])).map((m) => (
-                    <button
-                      key={m}
-                      type="button"
-                      onClick={() => setMode(m)}
-                      className={`h-12 rounded-xl text-sm font-bold transition-colors ${mode === m ? 'bg-green text-white shadow-card' : 'text-muted'}`}
-                    >
-                      {m === 'join' ? 'Join with code' : "I'm an exco"}
-                    </button>
-                  ))}
-                </div>
-                {mode === 'join' ? (
-                  <Field
-                    label="CDS group code"
-                    placeholder="K7Q2MX"
-                    autoCapitalize="characters"
-                    maxLength={6}
-                    className="input text-center text-2xl font-extrabold tracking-[0.4em]"
-                    value={joinCode}
-                    onChange={(e) => setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))}
-                  />
-                ) : (
-                  <>
-                    <Field
-                      label="CDS group name"
-                      placeholder="Digital Skills CDS"
-                      value={group.name}
-                      onChange={(e) => setGroup({ ...group, name: e.target.value })}
-                    />
-                    <Field label="LGA" placeholder="Ikorodu" value={group.lga} onChange={(e) => setGroup({ ...group, lga: e.target.value })} />
-                    <Field label="State" placeholder="Lagos" value={group.state} onChange={(e) => setGroup({ ...group, state: e.target.value })} />
-                    <p className="rounded-2xl bg-warn-bg px-4 py-3 text-sm text-warn">
-                      You'll be the first exco of this group and can add other excos later.
-                    </p>
-                  </>
-                )}
+                <Field
+                  label="CDS group code"
+                  placeholder="K7Q2MX"
+                  autoCapitalize="characters"
+                  maxLength={6}
+                  className="input text-center text-2xl font-extrabold tracking-[0.4em]"
+                  value={joinCode}
+                  onChange={(e) => setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))}
+                />
               </>
             )}
 

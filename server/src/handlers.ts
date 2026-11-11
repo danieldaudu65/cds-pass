@@ -13,6 +13,7 @@ import { initAdmin } from './admin';
 import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { getAuth } from 'firebase-admin/auth';
 import { getMessaging } from 'firebase-admin/messaging';
+import { mongoCollection, mongoConfigured } from './mongo';
 import { createHmac, randomBytes, randomInt } from 'crypto';
 import {
   Batch,
@@ -51,18 +52,80 @@ const userRef = (uid: string) => db.doc(`users/${uid}`);
 const groupRef = (gid: string) => db.doc(`groups/${gid}`);
 const keysRef = (gid: string) => db.doc(`groups/${gid}/private/keys`);
 const sessionRef = (gid: string, sid: string) => db.doc(`groups/${gid}/sessions/${sid}`);
+const sessionCounterRef = (gid: string, sid: string) => db.doc(`groups/${gid}/private/session-${sid}`);
+const mainExcoReservationRef = (stateCode: string) => db.doc(`mainExcoReservations/${stateCode.replace(/\//g, '')}`);
 const attendeeRef = (gid: string, sid: string, uid: string) =>
   db.doc(`groups/${gid}/sessions/${sid}/attendees/${uid}`);
 
 async function log(gid: string, by: string, action: string, detail: Record<string, unknown> = {}) {
-  await db.collection(`groups/${gid}/logs`).add({
-    at: FieldValue.serverTimestamp(),
+  const entry = {
+    gid,
+    at: new Date(),
     sessionId: lagosDate(),
     by,
     action,
     ...detail,
-  });
+  };
+  if (mongoConfigured()) {
+    try {
+      await (await mongoCollection('activity_logs')).insertOne(entry);
+      return;
+    } catch (error) {
+      console.error('MongoDB activity log write failed; using Firestore fallback.', error);
+    }
+  }
+  await db.collection(`groups/${gid}/logs`).add({ ...entry, at: FieldValue.serverTimestamp() });
 }
+
+/** Activity history is read on demand; the live meeting and member data stay in Firestore. */
+export const getLogs = onCall(async (req: CallableRequest) => {
+  const e = await exco(req);
+  const requestedLimit = Number(req.data?.limit ?? 40);
+  const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(1, Math.floor(requestedLimit))) : 40;
+
+  if (mongoConfigured()) {
+    try {
+      const collection = await mongoCollection<any>('activity_logs');
+      if (!(await collection.countDocuments({ gid: e.gid }))) {
+        const legacy = await db.collection(`groups/${e.gid}/logs`).orderBy('at', 'desc').limit(1000).get();
+        if (!legacy.empty) {
+          await collection.bulkWrite(legacy.docs.map((doc) => {
+            const { at, ...data } = doc.data();
+            return {
+              updateOne: {
+                filter: { _id: doc.id },
+                update: { $setOnInsert: { ...data, gid: e.gid, at: (at as Timestamp | undefined)?.toDate() ?? new Date(0) } },
+                upsert: true,
+              },
+            };
+          }));
+        }
+      }
+      const entries = await collection
+        .find({ gid: e.gid })
+        .sort({ at: -1 })
+        .limit(limit)
+        .toArray();
+      if (entries.length) {
+        return entries.map(({ _id, at, ...entry }) => ({
+          ...entry,
+          id: String(_id),
+          atMs: at instanceof Date ? at.getTime() : null,
+        }));
+      }
+      // Keep the existing Firestore history visible during the one-time migration.
+    } catch (error) {
+      console.error('MongoDB activity log read failed; using Firestore fallback.', error);
+    }
+  }
+
+  const legacy = await db.collection(`groups/${e.gid}/logs`).orderBy('at', 'desc').limit(limit).get();
+  return legacy.docs.map((doc) => {
+    const data = doc.data();
+    const at = data.at as Timestamp | undefined;
+    return { ...data, id: doc.id, atMs: at?.toMillis() ?? null };
+  });
+});
 
 function signedIn(req: CallableRequest): { uid: string; claims: Claims } {
   if (!req.auth) throw fail('unauthenticated', 'Please log in first.');
@@ -92,10 +155,20 @@ async function exco(req: CallableRequest) {
 async function mainExco(req: CallableRequest) {
   const e = await exco(req);
   const group = (await groupRef(e.gid).get()).data();
-  if (!group || group.createdBy !== e.uid) {
+  if (!group || (group.mainExcoUid ?? group.createdBy) !== e.uid) {
     throw fail('permission-denied', 'Only the main exco who created this CDS group can do this.');
   }
   return e;
+}
+
+async function platformAdmin(req: CallableRequest) {
+  const { uid } = signedIn(req);
+  const adminStateCode = normalizeStateCode(process.env.PLATFORM_ADMIN_STATE_CODE);
+  const account = await auth.getUser(uid);
+  if (!adminStateCode || account.email?.toLowerCase() !== stateCodeToEmail(adminStateCode).toLowerCase()) {
+    throw fail('permission-denied', 'Only the CDS Pass platform administrator can create CDS groups.');
+  }
+  return { uid, adminStateCode };
 }
 
 function text(v: unknown, label: string, min: number, max: number): string {
@@ -196,14 +269,18 @@ async function admit(
   return db.runTransaction(async (tx) => {
     const sRef = sessionRef(gid, sid);
     const aRef = attendeeRef(gid, sid, uid);
-    const [s, a] = await Promise.all([tx.get(sRef), tx.get(aRef)]);
+    const cRef = sessionCounterRef(gid, sid);
+    const [s, a, c] = await Promise.all([tx.get(sRef), tx.get(aRef), tx.get(cRef)]);
     if (!s.exists || s.data()!.status !== 'open') {
       throw fail('failed-precondition', "Today's CDS meeting has not been opened by an exco yet.");
     }
     if (a.exists) return { number: a.data()!.number as number, already: true };
 
-    const number = s.data()!.nextNumber as number;
-    tx.update(sRef, { nextNumber: number + 1 });
+    const number = (c.data()?.nextNumber ?? s.data()!.nextNumber ?? 1) as number;
+    tx.set(cRef, { nextNumber: number + 1, nextPriority: c.data()?.nextPriority ?? s.data()!.nextPriority ?? 1 }, { merge: true });
+    if (Object.hasOwn(s.data()!, 'nextNumber') || Object.hasOwn(s.data()!, 'nextPriority')) {
+      tx.update(sRef, { nextNumber: FieldValue.delete(), nextPriority: FieldValue.delete() });
+    }
     tx.set(aRef, {
       uid,
       number,
@@ -283,74 +360,116 @@ export const registerMember = onCall(async (req: CallableRequest) => {
   if (g.empty) throw fail('not-found', 'No CDS group with that code. Ask your exco for it.');
   const gid = g.docs[0].id;
 
-  await userRef(uid).set({
-    ...p,
-    groupId: gid,
-    role: 'member',
-    status: 'pending',
-    fcmTokens: [],
-    createdAt: FieldValue.serverTimestamp(),
+  const gRef = groupRef(gid);
+  let isMainExco = false;
+  let groupName = '';
+  await db.runTransaction(async (tx) => {
+    const [groupSnap, existingUser] = await Promise.all([tx.get(gRef), tx.get(userRef(uid))]);
+    if (!groupSnap.exists) throw fail('not-found', 'That CDS group no longer exists.');
+    if (existingUser.exists) throw fail('already-exists', 'This account is already registered with a CDS group.');
+    const groupData = groupSnap.data()!;
+    groupName = groupData.name as string;
+    isMainExco = groupData.mainExcoStateCode === p.stateCode;
+    if (isMainExco) {
+      const reservationRef = mainExcoReservationRef(p.stateCode);
+      const reservation = await tx.get(reservationRef);
+      if (!reservation.exists || reservation.data()!.groupId !== gid) {
+        throw fail('permission-denied', 'This state code was not appointed as the main exco for this group.');
+      }
+      if ((groupData.mainExcoUid && groupData.mainExcoUid !== uid) || (reservation.data()!.claimedUid && reservation.data()!.claimedUid !== uid)) {
+        throw fail('already-exists', 'The appointed main exco account has already been claimed. Contact the CDS Pass administrator.');
+      }
+      tx.update(gRef, { mainExcoUid: uid, mainExcoClaimedAt: FieldValue.serverTimestamp() });
+      tx.update(reservationRef, { claimedUid: uid, claimedAt: FieldValue.serverTimestamp() });
+    }
+    const role: Role = isMainExco ? 'exco' : 'member';
+    const status = isMainExco ? 'approved' : 'pending';
+    tx.set(userRef(uid), {
+      ...p,
+      groupId: gid,
+      role,
+      status,
+      fcmTokens: [],
+      createdAt: FieldValue.serverTimestamp(),
+      ...(isMainExco ? { approvedAt: FieldValue.serverTimestamp(), approvedBy: groupData.createdBy } : {}),
+    });
   });
-  await auth.setCustomUserClaims(uid, { gid, role: 'member', approved: false });
+  const role: Role = isMainExco ? 'exco' : 'member';
+  const status = isMainExco ? 'approved' : 'pending';
+  await auth.setCustomUserClaims(uid, { gid, role, approved: isMainExco });
   await log(gid, uid, 'member_registered', { target: uid, stateCode: p.stateCode });
-  const excos = await db.collection('users').where('groupId', '==', gid).get();
-  await notify(
-    excos.docs.filter((d) => d.data().status === 'approved' && d.data().role === 'exco').map((d) => d.id),
-    'New member needs approval',
-    `${p.fullName} (${p.stateCode}) has requested to join your CDS group.`,
-    '/exco/members',
-    'member-request',
-  );
-  return { ok: true, status: 'pending', groupName: g.docs[0].data().name };
+  if (!isMainExco) {
+    const excos = await db.collection('users').where('groupId', '==', gid).get();
+    await notify(
+      excos.docs.filter((d) => d.data().status === 'approved' && d.data().role === 'exco').map((d) => d.id),
+      'New member needs approval',
+      `${p.fullName} (${p.stateCode}) has requested to join your CDS group.`,
+      '/exco/members',
+      'member-request',
+    );
+  }
+  return { ok: true, status, role, groupName };
 });
 
-/** An exco creates a new CDS group and becomes its first exco. */
-export const createGroup = onCall(async (req : CallableRequest) => {
-  const { uid } = signedIn(req);
-  const adminStateCode = normalizeStateCode(process.env.PLATFORM_ADMIN_STATE_CODE);
-  const adminEmail = adminStateCode ? stateCodeToEmail(adminStateCode).toLowerCase() : '';
-  const account = await auth.getUser(uid);
-  if (!adminEmail || account.email?.toLowerCase() !== adminEmail) {
-    throw fail('permission-denied', 'Only the CDS Pass administrator can create a new CDS group. Join an existing group with its code.');
-  }
-  const p = await validateProfile(uid, req.data);
+/** The platform admin creates groups without replacing their own group membership. */
+export const createManagedGroup = onCall(async (req: CallableRequest) => {
+  const { uid, adminStateCode } = await platformAdmin(req);
   const name = text(req.data?.group?.name, 'CDS group name', 3, 60);
   const lga = text(req.data?.group?.lga, 'LGA', 2, 60);
   const state = text(req.data?.group?.state, 'State', 2, 40);
-
-  let joinCode = newJoinCode();
-  for (let i = 0; i < 5; i++) {
-    const clash = await db.collection('groups').where('joinCode', '==', joinCode).limit(1).get();
-    if (clash.empty) break;
-    joinCode = newJoinCode();
+  const mainExcoStateCode = normalizeStateCode(req.data?.mainExcoStateCode);
+  if (!mainExcoStateCode) throw fail('invalid-argument', 'Enter a valid state code for the new group’s main exco.');
+  if (mainExcoStateCode === adminStateCode) {
+    throw fail('failed-precondition', 'Use a different state code for this group’s main exco. Your platform admin account stays in its current CDS group.');
+  }
+  const reservationRef = mainExcoReservationRef(mainExcoStateCode);
+  const existingReservation = await reservationRef.get();
+  if (existingReservation.exists) throw fail('already-exists', 'That state code is already appointed as a group’s main exco.');
+  try {
+    const existingAuth = await auth.getUserByEmail(stateCodeToEmail(mainExcoStateCode));
+    if ((await userRef(existingAuth.uid).get()).exists) {
+      throw fail('already-exists', 'That state code already has a CDS Pass profile. Choose a state code that can join this new group.');
+    }
+  } catch (err) {
+    if (err instanceof HttpsError) throw err;
+    if ((err as { code?: string }).code !== 'auth/user-not-found') throw err;
   }
 
+  let joinCode = newJoinCode();
+  let uniqueCode = false;
+  for (let i = 0; i < 10; i++) {
+    const clash = await db.collection('groups').where('joinCode', '==', joinCode).limit(1).get();
+    if (clash.empty) { uniqueCode = true; break; }
+    joinCode = newJoinCode();
+  }
+  if (!uniqueCode) throw fail('resource-exhausted', 'Could not create a unique group code. Please try again.');
+
   const gRef = db.collection('groups').doc();
-  const batch = db.batch();
-  batch.set(gRef, {
-    name,
-    lga,
-    state,
-    joinCode,
-    batchSize: DEFAULT_BATCH_SIZE,
-    venue: null,
-    createdBy: uid,
-    createdAt: FieldValue.serverTimestamp(),
+  await db.runTransaction(async (tx) => {
+    const reservation = await tx.get(reservationRef);
+    if (reservation.exists) throw fail('already-exists', 'That state code is already appointed as a group’s main exco.');
+    tx.create(gRef, {
+      name,
+      lga,
+      state,
+      joinCode,
+      batchSize: DEFAULT_BATCH_SIZE,
+      venue: null,
+      createdBy: uid,
+      mainExcoUid: null,
+      mainExcoStateCode,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    tx.create(keysRef(gRef.id), { doorSecret: randomBytes(32).toString('hex') });
+    tx.create(reservationRef, { groupId: gRef.id, stateCode: mainExcoStateCode, createdBy: uid, createdAt: FieldValue.serverTimestamp() });
   });
-  batch.set(keysRef(gRef.id), { doorSecret: randomBytes(32).toString('hex') });
-  batch.set(userRef(uid), {
-    ...p,
-    groupId: gRef.id,
-    role: 'exco',
-    status: 'approved',
-    fcmTokens: [],
-    createdAt: FieldValue.serverTimestamp(),
-    approvedAt: FieldValue.serverTimestamp(),
-  });
-  await batch.commit();
-  await auth.setCustomUserClaims(uid, { gid: gRef.id, role: 'exco', approved: true });
   await log(gRef.id, uid, 'group_created', { name });
-  return { ok: true, groupId: gRef.id, joinCode };
+  return { ok: true, groupId: gRef.id, joinCode, mainExcoStateCode };
+});
+
+/** Deprecated endpoint retained to give old clients a safe error instead of replacing an admin profile. */
+export const createGroup = onCall(async () => {
+  throw fail('failed-precondition', 'Create groups from Exco → Settings using the platform admin account.');
 });
 
 /** Exco approves (after checking the NYSC ID card) or rejects a pending member. */
@@ -384,7 +503,7 @@ export const setRole = onCall(async (req: CallableRequest) => {
   const role: Role = req.data?.role === 'exco' ? 'exco' : 'member';
   if (uid === e.uid && role !== 'exco') throw fail('failed-precondition', 'You cannot remove yourself as exco.');
   const group = (await groupRef(e.gid).get()).data();
-  if (uid === group?.createdBy && role !== 'exco') {
+  if (uid === (group?.mainExcoUid ?? group?.createdBy) && role !== 'exco') {
     throw fail('failed-precondition', 'The main exco who created this CDS group cannot be demoted.');
   }
   if (user.status !== 'approved') throw fail('failed-precondition', 'Approve this member first.');
@@ -449,21 +568,34 @@ export const startSession = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const sid = lagosDate();
   const ref = sessionRef(e.gid, sid);
-  const snap = await ref.get();
-  if (snap.exists) {
-    await ref.update({ status: 'open', reopenedAt: FieldValue.serverTimestamp() });
-  } else {
-    await ref.set({
-      status: 'open',
-      openedAt: FieldValue.serverTimestamp(),
-      openedBy: e.uid,
-      nextNumber: 1,
-      nextPriority: 1,
-      lastTo: 0,
-      batchSeq: 0,
-      batch: null,
-    });
-  }
+  const counter = sessionCounterRef(e.gid, sid);
+  await db.runTransaction(async (tx) => {
+    const [session, counts] = await Promise.all([tx.get(ref), tx.get(counter)]);
+    const previous = session.data();
+    if (!counts.exists) {
+      tx.set(counter, {
+        nextNumber: previous?.nextNumber ?? 1,
+        nextPriority: previous?.nextPriority ?? 1,
+      });
+    }
+    if (session.exists) {
+      tx.update(ref, {
+        status: 'open',
+        reopenedAt: FieldValue.serverTimestamp(),
+        nextNumber: FieldValue.delete(),
+        nextPriority: FieldValue.delete(),
+      });
+    } else {
+      tx.set(ref, {
+        status: 'open',
+        openedAt: FieldValue.serverTimestamp(),
+        openedBy: e.uid,
+        lastTo: 0,
+        batchSeq: 0,
+        batch: null,
+      });
+    }
+  });
   await log(e.gid, e.uid, 'session_opened', { sessionId: sid });
   await notifyApprovedGroup(e.gid, "Today's CDS meeting is open", 'The meeting is open. Scan the door code at the venue to check in.', '/home');
   return { ok: true, sessionId: sid };
@@ -569,11 +701,16 @@ export const setPriority = onCall(async (req: CallableRequest) => {
   const pNumber = await db.runTransaction(async (tx) => {
     const sRef = sessionRef(e.gid, sid);
     const aRef = attendeeRef(e.gid, sid, uid);
-    const [s, a] = await Promise.all([tx.get(sRef), tx.get(aRef)]);
+    const cRef = sessionCounterRef(e.gid, sid);
+    const [s, a, c] = await Promise.all([tx.get(sRef), tx.get(aRef), tx.get(cRef)]);
+    if (!s.exists || s.data()!.status !== 'open') throw fail('failed-precondition', "Open today's CDS meeting first.");
     if (!a.exists) throw fail('failed-precondition', 'Check this person in first.');
     if (a.data()!.priority) return a.data()!.pNumber as number;
-    const n = s.data()!.nextPriority as number;
-    tx.update(sRef, { nextPriority: n + 1 });
+    const n = (c.data()?.nextPriority ?? s.data()!.nextPriority ?? 1) as number;
+    tx.set(cRef, { nextNumber: c.data()?.nextNumber ?? s.data()!.nextNumber ?? 1, nextPriority: n + 1 }, { merge: true });
+    if (Object.hasOwn(s.data()!, 'nextNumber') || Object.hasOwn(s.data()!, 'nextPriority')) {
+      tx.update(sRef, { nextNumber: FieldValue.delete(), nextPriority: FieldValue.delete() });
+    }
     tx.update(aRef, { priority: true, pNumber: n, priorityBy: e.uid });
     return n;
   });
@@ -591,17 +728,18 @@ export const callNext = onCall(async (req: CallableRequest) => {
 
   const batch = await db.runTransaction(async (tx) => {
     const sRef = sessionRef(e.gid, sid);
-    const s = await tx.get(sRef);
+    const cRef = sessionCounterRef(e.gid, sid);
+    const [s, c] = await Promise.all([tx.get(sRef), tx.get(cRef)]);
     if (!s.exists || s.data()!.status !== 'open') throw fail('failed-precondition', "Open today's CDS meeting first.");
     const d = s.data()!;
     const seq = (d.batchSeq as number) + 1;
     let b: Batch;
     if (mode === 'priority') {
-      if ((d.nextPriority as number) <= 1) throw fail('failed-precondition', 'Nobody has a priority tag yet.');
+      if (((c.data()?.nextPriority ?? d.nextPriority ?? 1) as number) <= 1) throw fail('failed-precondition', 'Nobody has a priority tag yet.');
       b = { kind: 'priority', seq };
     } else {
       const from = (d.lastTo as number) + 1;
-      if (from > (d.nextNumber as number) - 1) {
+      if (from > ((c.data()?.nextNumber ?? d.nextNumber ?? 1) as number) - 1) {
         throw fail('failed-precondition', `Nobody has checked in beyond No. ${from - 1} yet.`);
       }
       b = { kind: 'regular', seq, from, to: from + size - 1 };
