@@ -35,7 +35,9 @@ npm install
 cd ..\web
 npm install
 ```
-`web\.env` must have `VITE_USE_EMULATORS=true`. `VITE_API_URL` defaults to `http://localhost:8787`.
+For safe testing, `web\.env` must have `VITE_USE_EMULATORS=true`: `npm run dev` then uses the emulators and the
+server on `http://localhost:8787` (no real data, no real money). Without it, `npm run dev` talks to the **live**
+Firebase and Render server. `npm run build` always uses the live settings in `web/src/lib/appConfig.ts`.
 
 **Every time: three terminals**
 ```powershell
@@ -82,6 +84,8 @@ the phone still buzzes and shows "It's your turn!" when the batch is called.
    - `FIREBASE_STORAGE_BUCKET`: e.g. `your-id.firebasestorage.app`
    - `CORS_ORIGINS`: `https://cdspass.name.ng` (add any other live frontend domains if they are still used)
    - `PLATFORM_ADMIN_STATE_CODE`: the platform admin state code; that account creates groups in Exco → Settings and assigns each group’s main exco state code. The appointed person joins with the group code and is auto-approved as main exco.
+     **First-time setup:** on a fresh database the platform admin signs up with their state code and picks
+     **Start my CDS group** on the group step, which makes them that group's main exco.
    - `PAYSTACK_SECRET_KEY`: test key first, live key later
    - `MONGODB_URI`: MongoDB Atlas connection string (server secret; never add it to `web/.env`)
    - `MONGODB_DATABASE`: database name, normally `cds_pass`
@@ -98,9 +102,9 @@ Firestore activity log. When MongoDB is first configured, the API copies up to t
 Firestore log entries for that group into MongoDB.
 
 Create an Atlas database user and set Atlas Network Access so the Render API can connect. Put the URI in
-Render as `MONGODB_URI`. For local testing, set the same variable in `server/dev.env` (which must remain
-private); leave it unset to use the Firestore fallback. Never put a MongoDB URI in frontend environment
-variables or commit it to Git.
+Render as `MONGODB_URI`. For local testing, put it in `server/keys.env` (git-ignored) and run `npm run dev:keys`;
+leave it out to use the Firestore fallback. Never put it in `server/dev.env` (that file is committed) or in
+any frontend file.
 
 ### 3. Website on cPanel or Netlify
 The live site is `https://cdspass.name.ng`. Build the frontend with:

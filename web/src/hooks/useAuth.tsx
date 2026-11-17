@@ -60,8 +60,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             return;
           }
         }
-        const t = await u.getIdTokenResult();
-        setClaims({ gid: t.claims.gid as string, role: t.claims.role as Claims['role'], approved: t.claims.approved === true });
+        try {
+          const t = await u.getIdTokenResult();
+          setClaims({ gid: t.claims.gid as string, role: t.claims.role as Claims['role'], approved: t.claims.approved === true });
+        } catch (e) {
+          // Offline at start-up: the refresh below (or the "Try again" screen) picks the claims up later.
+          console.warn('Could not read login permissions yet.', e);
+        }
       }),
     [],
   );

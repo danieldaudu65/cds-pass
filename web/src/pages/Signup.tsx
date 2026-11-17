@@ -1,12 +1,13 @@
 import { createUserWithEmailAndPassword } from 'firebase/auth';
 import { motion } from 'framer-motion';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { PhotoPicker } from '../components/PhotoPicker';
 import { Button, ErrorBox, Field, TopBar } from '../components/ui';
 import { useAuth } from '../hooks/useAuth';
 import { api } from '../lib/api';
-import { auth, errorText } from '../lib/firebase';
+import { auth, errorText, wakeServer } from '../lib/firebase';
+import { PLATFORM_ADMIN_STATE_CODE } from '../lib/appConfig';
 import { normalizePhone, normalizeStateCode, stateCodeToEmail } from '../lib/rules';
 import { setSignupLock } from '../lib/signupLock';
 import { toast } from '../lib/toast';
@@ -19,7 +20,7 @@ function stateCodeFromCurrentUser(): string {
 }
 
 export default function Signup({ finish = false }: { finish?: boolean }) {
-  const { logout } = useAuth();
+  const { logout, profile: savedProfile, claims } = useAuth();
   const navigate = useNavigate();
   const steps = finish ? ['Details', 'Photo', 'CDS group'] : ['Details', 'Photo', 'CDS group', 'PIN'];
   const [rawStep, setStep] = useState(0);
@@ -32,12 +33,43 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
   const [phone, setPhone] = useState('');
   const [photo, setPhoto] = useState<Blob | null>(null);
   const [joinCode, setJoinCode] = useState('');
+  // Only the platform admin may start a brand-new group while signing up (first-time setup).
+  const [startGroup, setStartGroup] = useState(false);
+  const [group, setGroup] = useState({ name: '', lga: '', state: '' });
+  const isPlatformAdmin = normalizeStateCode(stateCode) === PLATFORM_ADMIN_STATE_CODE;
+  const creatingGroup = isPlatformAdmin && startGroup;
+  /** Set once the server has saved everything; we then wait for the profile to arrive before leaving. */
+  const [doneTo, setDoneTo] = useState<string | null>(null);
   const [pin, setPin] = useState('');
   const [pin2, setPin2] = useState('');
   const [consent, setConsent] = useState(false);
 
   const [error, setError] = useState('');
   const [busy, setBusy] = useState('');
+
+  // Wake the free Render server now, so it is ready by the time the form is submitted.
+  useEffect(() => wakeServer(), []);
+
+  // Never leave the sign-up lock on if this screen goes away (e.g. log out).
+  useEffect(() => () => setSignupLock(false), []);
+
+  // Leave only when the saved profile (and, for excos, the new permissions) has reached this phone.
+  // Leaving earlier made the app flash back to "Finish signing up".
+  useEffect(() => {
+    if (!doneTo) return;
+    const profileReady = !!savedProfile;
+    const excoReady = savedProfile?.status !== 'approved' || (claims.approved === true && claims.role === savedProfile.role);
+    const go = () => {
+      setSignupLock(false);
+      navigate(doneTo, { replace: true });
+    };
+    if (profileReady && excoReady) {
+      go();
+      return;
+    }
+    const t = setTimeout(go, 12000); // safety net: never stay stuck on this screen
+    return () => clearTimeout(t);
+  }, [doneTo, savedProfile, claims.approved, claims.role, navigate]);
 
   function validate(i: number): string {
     if (i === 0) {
@@ -47,7 +79,10 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
     }
     if (i === 1 && !photo) return 'Add a profile picture.';
     if (i === 2) {
-      if (joinCode.trim().length !== 6) return 'Enter the 6-character CDS group code from your exco.';
+      if (creatingGroup) {
+        if (group.name.trim().length < 3 || group.lga.trim().length < 2 || group.state.trim().length < 2)
+          return 'Fill in the CDS group name, LGA and state.';
+      } else if (joinCode.trim().length !== 6) return 'Enter the 6-character CDS group code from your exco.';
     }
     if (i === 3) {
       if (!/^\d{6}$/.test(pin)) return 'Your PIN must be 6 digits.';
@@ -77,38 +112,45 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
 
   async function submit() {
     const sc = normalizeStateCode(stateCode)!;
-    let nextPath: string | undefined;
+    setError('');
     setSignupLock(finish ? 'finish' : 'signup');
     try {
       let uid = auth.currentUser?.uid;
-      if (!finish) {
+      if (!uid) {
         setBusy('Creating your account…');
         uid = (await createUserWithEmailAndPassword(auth, stateCodeToEmail(sc), pin)).user.uid;
       }
-      if (!uid) throw new Error('Please log in again.');
 
       setBusy('Uploading your photo…');
       const photoURL = await uploadAvatar(uid, photo!);
 
       setBusy('Saving your details…');
       const profile = { stateCode: sc, fullName: fullName.trim(), phone: normalizePhone(phone)!, photoURL };
-      const r = await api.registerMember({ ...profile, joinCode: joinCode.trim().toUpperCase() });
-      if (r.status === 'approved' && r.role === 'exco') {
-        toast(`You are the main exco for ${r.groupName}`, 'success', 'You can now set up the group and promote other members.');
-        nextPath = '/exco';
-      } else {
-        toast(`Joined ${r.groupName}`, 'success', 'An exco will approve you at your next CDS.');
-        nextPath = '/pending';
+      let to = '/pending';
+      try {
+        const r = creatingGroup
+          ? await api.registerPlatformAdmin({ ...profile, group })
+          : await api.registerMember({ ...profile, joinCode: joinCode.trim().toUpperCase() });
+        if (r.status === 'approved' && r.role === 'exco') {
+          to = '/exco';
+          if ('joinCode' in r) toast(`${r.groupName} is ready`, 'success', `Share group code ${r.joinCode} with your members.`);
+          else toast(`You are the main exco for ${r.groupName}`, 'success', 'You can now set up the group and promote other members.');
+        } else {
+          toast(`Joined ${r.groupName}`, 'success', 'An exco will approve you at your next CDS.');
+        }
+      } catch (e) {
+        // A slow first try may have finished on the server after the phone gave up. Then the profile
+        // already exists, and that is a success, not an error.
+        if ((e as { code?: string }).code !== 'functions/already-exists' || !/already registered/i.test(String((e as Error).message))) throw e;
       }
-      // AuthProvider refreshes claims when it observes an approved profile.
-      // Do not hold the signup screen open waiting for an extra token refresh.
-      setBusy('');
+      setBusy('Opening your account…');
+      setDoneTo(to);
     } catch (e) {
+      // The login may exist now even though the profile doesn't. Keep everything typed so far and
+      // let them press the button again; it continues from where it stopped.
+      setSignupLock(auth.currentUser ? 'finish' : false);
       setError(errorText(e));
       setBusy('');
-    } finally {
-      setSignupLock(false);
-      if (nextPath) navigate(nextPath, { replace: true });
     }
   }
 
@@ -199,15 +241,40 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
                   <h2 className="text-2xl font-extrabold">Your CDS group</h2>
                   <p className="text-muted">Ask your CDS exco for the group code.</p>
                 </div>
-                <Field
-                  label="CDS group code"
-                  placeholder="K7Q2MX"
-                  autoCapitalize="characters"
-                  maxLength={6}
-                  className="input text-center text-2xl font-extrabold tracking-[0.4em]"
-                  value={joinCode}
-                  onChange={(e) => setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))}
-                />
+                {isPlatformAdmin && (
+                  <div className="grid grid-cols-2 gap-2 rounded-2xl bg-line p-1.5">
+                    {[false, true].map((m) => (
+                      <button
+                        key={String(m)}
+                        type="button"
+                        onClick={() => setStartGroup(m)}
+                        className={`h-12 rounded-xl text-sm font-bold transition-colors ${startGroup === m ? 'bg-green text-white shadow-card' : 'text-muted'}`}
+                      >
+                        {m ? 'Start my CDS group' : 'Join with code'}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {creatingGroup ? (
+                  <>
+                    <Field label="CDS group name" placeholder="Digital Skills CDS" value={group.name} onChange={(e) => setGroup({ ...group, name: e.target.value })} />
+                    <Field label="LGA" placeholder="Ikorodu" value={group.lga} onChange={(e) => setGroup({ ...group, lga: e.target.value })} />
+                    <Field label="State" placeholder="Lagos" value={group.state} onChange={(e) => setGroup({ ...group, state: e.target.value })} />
+                    <p className="rounded-2xl bg-warn-bg px-4 py-3 text-sm text-warn">
+                      Platform admin setup: you become this group's main exco. Create other groups later in Exco → Settings.
+                    </p>
+                  </>
+                ) : (
+                  <Field
+                    label="CDS group code"
+                    placeholder="K7Q2MX"
+                    autoCapitalize="characters"
+                    maxLength={6}
+                    className="input text-center text-2xl font-extrabold tracking-[0.4em]"
+                    value={joinCode}
+                    onChange={(e) => setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))}
+                  />
+                )}
               </>
             )}
 

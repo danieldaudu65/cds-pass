@@ -13,6 +13,10 @@ export const api = {
   getLogs: callable<{ limit: number }, LogEntry[]>('getLogs'),
   // accounts
   registerMember: callable<ProfileInput & { joinCode: string }, { ok: true; status: 'pending' | 'approved'; role: 'member' | 'exco'; groupName: string }>('registerMember'),
+  registerPlatformAdmin: callable<
+    ProfileInput & { group: { name: string; lga: string; state: string } },
+    { ok: true; status: 'approved'; role: 'exco'; groupName: string; joinCode: string }
+  >('registerPlatformAdmin'),
   createManagedGroup: callable<
     { group: { name: string; lga: string; state: string }; mainExcoStateCode: string },
     { ok: true; groupId: string; joinCode: string; mainExcoStateCode: string }

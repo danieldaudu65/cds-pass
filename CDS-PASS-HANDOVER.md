@@ -7,6 +7,29 @@
 
 ---
 
+## 0. CURRENT STATE (read this first — updated 17 Nov 2026)
+
+Some later sections were written before these changes; where they disagree, **this section wins**.
+
+| Thing | Now |
+|---|---|
+| Live website | **https://cdspass.name.ng** (cPanel). Build `npm --prefix web run build`, upload `web/dist` (has `.htaccess` SPA rewrite). Not Firebase Hosting. |
+| API server | **https://cds-pass.onrender.com** (Render free tier, `render.yaml`) |
+| Firebase project | **`cds-pass`** — Auth + Firestore + Cloud Messaging only. **Firebase Storage is NOT used.** |
+| Web config | Hard-coded public values in `web/src/lib/appConfig.ts` (Firebase config, API URL, VAPID key, fee %, platform admin state code). `npm run dev` + `VITE_USE_EMULATORS=true` in `web/.env` → emulators + `http://localhost:8787`; a build always uses live values. |
+| Profile photos | **Cloudinary**, via `POST /upload/avatar` (multipart, Bearer token) in `server/src/upload.ts`; public_id = uid. Env: `CLOUDINARY_CLOUD_NAME/_API_KEY/_API_SECRET`. |
+| Activity log | **MongoDB Atlas** collection `activity_logs` (`server/src/mongo.ts`, env `MONGODB_URI`, `MONGODB_DATABASE`), falls back to Firestore `groups/{gid}/logs`. Read via API action `getLogs`. |
+| Dues charges | member pays dues + 3% service + Paystack's exact charge (`duesCharges` in `server/src/shared.ts` and `web/src/lib/money.ts`). |
+| Who creates groups | **Platform admin** (env `PLATFORM_ADMIN_STATE_CODE`, currently `LA/26B/2578`). First time: admin signs up and chooses "Start my CDS group" (`registerPlatformAdmin`). Later: Exco → Settings → `createManagedGroup` names a **main exco** by state code (reservation in `mainExcoReservations/{statecode}`); that person signs up with the join code and is auto-approved as main exco. `createGroup` is retired. |
+| Main exco | `groups.mainExcoUid` (fallback `createdBy`). Only the main exco can `setRole`, `createDues`, `testNotification`. |
+| Queue counters | moved out of the session doc into `groups/{gid}/private/session-{date}` `{nextNumber, nextPriority}`. |
+| Extra pushes | meeting opened/ended, dues created/closed, dues account changed, venue changed, approved, role changed, PIN reset, new member waiting (to excos). FCM data includes `kind`. |
+| Sign-up flow | `Signup.tsx`: account → photo upload → register → waits until the profile (and exco claims) reach the phone before leaving. If anything fails after the login is created, the form keeps the typed data and continues from there. Server is pinged (`wakeServer`) when sign-up/login opens. `App.tsx` shows a retry screen instead of an endless spinner if permissions don't load. |
+| Render env vars | `FIREBASE_SERVICE_ACCOUNT`, `CORS_ORIGINS=https://cdspass.name.ng`, `PAYSTACK_SECRET_KEY`, `MONGODB_URI`, `MONGODB_DATABASE`, `CLOUDINARY_*`, `PLATFORM_ADMIN_STATE_CODE`, `SERVICE_FEE_PERCENT`, `PAYSTACK_FEE_PERCENT`. |
+| Deploy rules | `firebase deploy --only firestore:rules` (firebase.json has no hosting/storage any more). |
+
+---
+
 ## 1. What the app does
 
 CDS Pass is a **web app (installable PWA)** for Nigerian NYSC **CDS (Community Development Service) groups**.
@@ -334,15 +357,19 @@ Files in this section:
 - `server/src/compat.ts`
 - `server/src/handlers.ts`
 - `server/src/main.ts`
+- `server/src/mongo.ts`
 - `server/src/shared.ts`
+- `server/src/upload.ts`
 - `server/tsconfig.json`
 - `web/.env.example`
 - `web/index.html`
 - `web/package.json`
 - `web/postcss.config.js`
+- `web/public/.htaccess`
 - `web/public/firebase-messaging-sw.js`
 - `web/public/icon.svg`
 - `web/public/manifest.webmanifest`
+- `web/scripts/generate-share-card.ps1`
 - `web/src/App.tsx`
 - `web/src/components/Avatar.tsx`
 - `web/src/components/BottomNav.tsx`
@@ -364,6 +391,7 @@ Files in this section:
 - `web/src/hooks/useMyDay.ts`
 - `web/src/index.css`
 - `web/src/lib/api.ts`
+- `web/src/lib/appConfig.ts`
 - `web/src/lib/device.ts`
 - `web/src/lib/firebase.ts`
 - `web/src/lib/image.ts`
@@ -439,11 +467,25 @@ server/keys.env
 ### `cors.json`
 
 ```json
+
 [
   {
-    "origin": ["*"],
-    "method": ["GET"],
-    "maxAgeSeconds": 3600
+    "origin": [
+      "https://cdspass.name.ng"
+    ],
+    "method": [
+      "GET",
+      "POST",
+      "PUT",
+      "DELETE",
+      "HEAD"
+    ],
+    "maxAgeSeconds": 3600,
+    "responseHeader": [
+      "Content-Type",
+      "Authorization",
+      "x-goog-resumable"
+    ]
   }
 ]
 ```
@@ -458,55 +500,12 @@ server/keys.env
     "rules": "firestore.rules",
     "indexes": "firestore.indexes.json"
   },
-  "storage": {
-    "rules": "storage.rules"
-  },
-  "hosting": {
-    "public": "web/dist",
-    "predeploy": [
-      "npm --prefix web run build"
-    ],
-    "ignore": [
-      "firebase.json",
-      "**/.*",
-      "**/node_modules/**"
-    ],
-    "rewrites": [
-      {
-        "source": "**",
-        "destination": "/index.html"
-      }
-    ],
-    "headers": [
-      {
-        "source": "/firebase-messaging-sw.js",
-        "headers": [
-          {
-            "key": "Cache-Control",
-            "value": "no-cache"
-          }
-        ]
-      },
-      {
-        "source": "/assets/**",
-        "headers": [
-          {
-            "key": "Cache-Control",
-            "value": "public, max-age=31536000, immutable"
-          }
-        ]
-      }
-    ]
-  },
   "emulators": {
     "auth": {
       "port": 9099
     },
     "firestore": {
       "port": 8080
-    },
-    "storage": {
-      "port": 9199
     },
     "ui": {
       "enabled": true
@@ -566,6 +565,11 @@ service cloud.firestore {
              .hasOnly(['phone', 'photoURL', 'fcmTokens', 'updatedAt']);
 
       allow create, delete: if false;
+    }
+
+    // Main-exco state-code reservations are written and consumed only by the API server.
+    match /mainExcoReservations/{reservationId} {
+      allow read, write: if false;
     }
 
     match /groups/{gid} {
@@ -638,13 +642,25 @@ services:
       - key: PAYSTACK_FEE_PERCENT
         value: "1.5"
       # Fill these in on the Render dashboard (never commit them):
-      - key: CORS_ORIGINS # e.g. https://your-id.web.app
+      - key: CORS_ORIGINS # Set to https://cdspass.name.ng in the Render dashboard.
         sync: false
+      - key: PLATFORM_ADMIN_STATE_CODE
+        value: LA/26B/2578
       - key: FIREBASE_SERVICE_ACCOUNT # service-account JSON (or base64 of it)
         sync: false
       - key: FIREBASE_STORAGE_BUCKET # e.g. your-id.firebasestorage.app
         sync: false
+      - key: MONGODB_URI # MongoDB Atlas connection string; keep this server-side only.
+        sync: false
+      - key: MONGODB_DATABASE
+        value: cds_pass
       - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
         sync: false
 ```
 
@@ -677,18 +693,22 @@ service firebase.storage {
 # Local development settings (no secrets here). `npm run dev` loads this file.
 PORT=8787
 CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+PLATFORM_ADMIN_STATE_CODE=LA/26B/2578
 
 # Talk to the Firebase emulators running on this PC
 GCLOUD_PROJECT=demo-cds-pass
 FIRESTORE_EMULATOR_HOST=127.0.0.1:8080
 FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099
-FIREBASE_STORAGE_EMULATOR_HOST=127.0.0.1:9199
 
 # Online dues charges on top of the dues: 3% yours + 1.5% for Paystack
 SERVICE_FEE_PERCENT=3
 PAYSTACK_FEE_PERCENT=1.5
 
-# For online payments, put PAYSTACK_SECRET_KEY=sk_test_... in keys.env and run `npm run dev:keys`
+# Secrets NEVER go in this file (it is uploaded to GitHub). Put them in server/keys.env, which is ignored:
+#   PAYSTACK_SECRET_KEY=sk_test_...
+#   CLOUDINARY_CLOUD_NAME=...  CLOUDINARY_API_KEY=...  CLOUDINARY_API_SECRET=...
+#   MONGODB_URI=...   (leave out to keep the activity log in the local Firestore emulator)
+# then run `npm run dev:keys`.
 ```
 
 ---
@@ -711,13 +731,17 @@ PAYSTACK_FEE_PERCENT=1.5
     "start": "node dist/main.js"
   },
   "dependencies": {
+    "cloudinary": "^2.5.1",
     "cors": "^2.8.5",
     "express": "^4.21.1",
-    "firebase-admin": "^12.6.0"
+    "firebase-admin": "^12.6.0",
+    "mongodb": "^7.8.0",
+    "multer": "^2.0.2"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
+    "@types/multer": "^1.4.13",
     "@types/node": "^20.16.10",
     "tsx": "^4.19.1",
     "typescript": "^5.6.2"
@@ -855,6 +879,7 @@ import { initAdmin } from './admin';
 import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { getAuth } from 'firebase-admin/auth';
 import { getMessaging } from 'firebase-admin/messaging';
+import { mongoCollection, mongoConfigured } from './mongo';
 import { createHmac, randomBytes, randomInt } from 'crypto';
 import {
   Batch,
@@ -893,18 +918,80 @@ const userRef = (uid: string) => db.doc(`users/${uid}`);
 const groupRef = (gid: string) => db.doc(`groups/${gid}`);
 const keysRef = (gid: string) => db.doc(`groups/${gid}/private/keys`);
 const sessionRef = (gid: string, sid: string) => db.doc(`groups/${gid}/sessions/${sid}`);
+const sessionCounterRef = (gid: string, sid: string) => db.doc(`groups/${gid}/private/session-${sid}`);
+const mainExcoReservationRef = (stateCode: string) => db.doc(`mainExcoReservations/${stateCode.replace(/\//g, '')}`);
 const attendeeRef = (gid: string, sid: string, uid: string) =>
   db.doc(`groups/${gid}/sessions/${sid}/attendees/${uid}`);
 
 async function log(gid: string, by: string, action: string, detail: Record<string, unknown> = {}) {
-  await db.collection(`groups/${gid}/logs`).add({
-    at: FieldValue.serverTimestamp(),
+  const entry = {
+    gid,
+    at: new Date(),
     sessionId: lagosDate(),
     by,
     action,
     ...detail,
-  });
+  };
+  if (mongoConfigured()) {
+    try {
+      await (await mongoCollection('activity_logs')).insertOne(entry);
+      return;
+    } catch (error) {
+      console.error('MongoDB activity log write failed; using Firestore fallback.', error);
+    }
+  }
+  await db.collection(`groups/${gid}/logs`).add({ ...entry, at: FieldValue.serverTimestamp() });
 }
+
+/** Activity history is read on demand; the live meeting and member data stay in Firestore. */
+export const getLogs = onCall(async (req: CallableRequest) => {
+  const e = await exco(req);
+  const requestedLimit = Number(req.data?.limit ?? 40);
+  const limit = Number.isFinite(requestedLimit) ? Math.min(100, Math.max(1, Math.floor(requestedLimit))) : 40;
+
+  if (mongoConfigured()) {
+    try {
+      const collection = await mongoCollection<any>('activity_logs');
+      if (!(await collection.countDocuments({ gid: e.gid }))) {
+        const legacy = await db.collection(`groups/${e.gid}/logs`).orderBy('at', 'desc').limit(1000).get();
+        if (!legacy.empty) {
+          await collection.bulkWrite(legacy.docs.map((doc) => {
+            const { at, ...data } = doc.data();
+            return {
+              updateOne: {
+                filter: { _id: doc.id },
+                update: { $setOnInsert: { ...data, gid: e.gid, at: (at as Timestamp | undefined)?.toDate() ?? new Date(0) } },
+                upsert: true,
+              },
+            };
+          }));
+        }
+      }
+      const entries = await collection
+        .find({ gid: e.gid })
+        .sort({ at: -1 })
+        .limit(limit)
+        .toArray();
+      if (entries.length) {
+        return entries.map(({ _id, at, ...entry }) => ({
+          ...entry,
+          id: String(_id),
+          atMs: at instanceof Date ? at.getTime() : null,
+        }));
+      }
+      // Keep the existing Firestore history visible during the one-time migration.
+    } catch (error) {
+      console.error('MongoDB activity log read failed; using Firestore fallback.', error);
+    }
+  }
+
+  const legacy = await db.collection(`groups/${e.gid}/logs`).orderBy('at', 'desc').limit(limit).get();
+  return legacy.docs.map((doc) => {
+    const data = doc.data();
+    const at = data.at as Timestamp | undefined;
+    return { ...data, id: doc.id, atMs: at?.toMillis() ?? null };
+  });
+});
 
 function signedIn(req: CallableRequest): { uid: string; claims: Claims } {
   if (!req.auth) throw fail('unauthenticated', 'Please log in first.');
@@ -928,6 +1015,26 @@ async function exco(req: CallableRequest) {
     throw fail('permission-denied', 'Only excos of this CDS group can do this.');
   }
   return { uid, gid, name: u.fullName as string };
+}
+
+/** The group creator is the main exco and owns role assignments and dues creation. */
+async function mainExco(req: CallableRequest) {
+  const e = await exco(req);
+  const group = (await groupRef(e.gid).get()).data();
+  if (!group || (group.mainExcoUid ?? group.createdBy) !== e.uid) {
+    throw fail('permission-denied', 'Only the main exco who created this CDS group can do this.');
+  }
+  return e;
+}
+
+async function platformAdmin(req: CallableRequest) {
+  const { uid } = signedIn(req);
+  const adminStateCode = normalizeStateCode(process.env.PLATFORM_ADMIN_STATE_CODE);
+  const account = await auth.getUser(uid);
+  if (!adminStateCode || account.email?.toLowerCase() !== stateCodeToEmail(adminStateCode).toLowerCase()) {
+    throw fail('permission-denied', 'Only the CDS Pass platform administrator can create CDS groups.');
+  }
+  return { uid, adminStateCode };
 }
 
 function text(v: unknown, label: string, min: number, max: number): string {
@@ -1028,14 +1135,18 @@ async function admit(
   return db.runTransaction(async (tx) => {
     const sRef = sessionRef(gid, sid);
     const aRef = attendeeRef(gid, sid, uid);
-    const [s, a] = await Promise.all([tx.get(sRef), tx.get(aRef)]);
+    const cRef = sessionCounterRef(gid, sid);
+    const [s, a, c] = await Promise.all([tx.get(sRef), tx.get(aRef), tx.get(cRef)]);
     if (!s.exists || s.data()!.status !== 'open') {
       throw fail('failed-precondition', "Today's CDS meeting has not been opened by an exco yet.");
     }
     if (a.exists) return { number: a.data()!.number as number, already: true };
 
-    const number = s.data()!.nextNumber as number;
-    tx.update(sRef, { nextNumber: number + 1 });
+    const number = (c.data()?.nextNumber ?? s.data()!.nextNumber ?? 1) as number;
+    tx.set(cRef, { nextNumber: number + 1, nextPriority: c.data()?.nextPriority ?? s.data()!.nextPriority ?? 1 }, { merge: true });
+    if (Object.hasOwn(s.data()!, 'nextNumber') || Object.hasOwn(s.data()!, 'nextPriority')) {
+      tx.update(sRef, { nextNumber: FieldValue.delete(), nextPriority: FieldValue.delete() });
+    }
     tx.set(aRef, {
       uid,
       number,
@@ -1054,7 +1165,7 @@ async function admit(
   });
 }
 
-async function notify(uids: string[], title: string, body: string, link = '/tag'): Promise<number> {
+async function notify(uids: string[], title: string, body: string, link = '/tag', kind = 'alert'): Promise<number> {
   if (!uids.length) return 0;
   const snaps = await db.getAll(...uids.map((u) => userRef(u)));
   const owner = new Map<string, string>();
@@ -1063,30 +1174,30 @@ async function notify(uids: string[], title: string, body: string, link = '/tag'
 
   let sent = 0;
   try {
-  for (let i = 0; i < tokens.length; i += 500) {
-    const chunk = tokens.slice(i, i + 500);
-    const res = await getMessaging().sendEachForMulticast({
-      tokens: chunk,
-      // Data-only message: the service worker shows it, so tapping opens /tag.
-      data: { title, body, link },
-      webpush: { headers: { Urgency: 'high', TTL: '900' } },
-    });
-    sent += res.successCount;
-    await Promise.all(
-      res.responses.map((r, idx) => {
-        const code = r.error?.code;
-        if (
-          code === 'messaging/registration-token-not-registered' ||
-          code === 'messaging/invalid-registration-token' ||
-          code === 'messaging/invalid-argument'
-        ) {
-          const t = chunk[idx];
-          return userRef(owner.get(t)!).update({ fcmTokens: FieldValue.arrayRemove(t) });
-        }
-        return null;
-      }),
-    );
-  }
+    for (let i = 0; i < tokens.length; i += 500) {
+      const chunk = tokens.slice(i, i + 500);
+      const res = await getMessaging().sendEachForMulticast({
+        tokens: chunk,
+        // Data-only message: the service worker shows it, so tapping opens /tag.
+        data: { title, body, link, kind },
+        webpush: { headers: { Urgency: 'high', TTL: '900' } },
+      });
+      sent += res.successCount;
+      await Promise.all(
+        res.responses.map((r, idx) => {
+          const code = r.error?.code;
+          if (
+            code === 'messaging/registration-token-not-registered' ||
+            code === 'messaging/invalid-registration-token' ||
+            code === 'messaging/invalid-argument'
+          ) {
+            const t = chunk[idx];
+            return userRef(owner.get(t)!).update({ fcmTokens: FieldValue.arrayRemove(t) });
+          }
+          return null;
+        }),
+      );
+    }
   } catch (err) {
     // Notifications must never break check-in or batch calling.
     console.error('notify failed', err);
@@ -1094,10 +1205,18 @@ async function notify(uids: string[], title: string, body: string, link = '/tag'
   return sent;
 }
 
+/** Broadcast an event to every approved member of a CDS group. */
+async function notifyApprovedGroup(gid: string, title: string, body: string, link = '/home') {
+  const users = await db.collection('users').where('groupId', '==', gid).get();
+  const recipients = users.docs.filter((d) => d.data().status === 'approved').map((d) => d.id);
+  const sent = await notify(recipients, title, body, link, 'group-event');
+  return { sent, members: recipients.length };
+}
+
 // ---------------------------------------------------------------- accounts
 
 /** New corps member joins a CDS group with the group's join code. Starts as "pending". */
-export const registerMember = onCall(async (req) => {
+export const registerMember = onCall(async (req: CallableRequest) => {
   const { uid } = signedIn(req);
   const p = await validateProfile(uid, req.data);
   const joinCode = String(req.data?.joinCode ?? '').trim().toUpperCase();
@@ -1107,64 +1226,176 @@ export const registerMember = onCall(async (req) => {
   if (g.empty) throw fail('not-found', 'No CDS group with that code. Ask your exco for it.');
   const gid = g.docs[0].id;
 
-  await userRef(uid).set({
-    ...p,
-    groupId: gid,
-    role: 'member',
-    status: 'pending',
-    fcmTokens: [],
-    createdAt: FieldValue.serverTimestamp(),
+  const gRef = groupRef(gid);
+  let isMainExco = false;
+  let groupName = '';
+  await db.runTransaction(async (tx) => {
+    const [groupSnap, existingUser] = await Promise.all([tx.get(gRef), tx.get(userRef(uid))]);
+    if (!groupSnap.exists) throw fail('not-found', 'That CDS group no longer exists.');
+    if (existingUser.exists) throw fail('already-exists', 'This account is already registered with a CDS group.');
+    const groupData = groupSnap.data()!;
+    groupName = groupData.name as string;
+    isMainExco = groupData.mainExcoStateCode === p.stateCode;
+    if (isMainExco) {
+      const reservationRef = mainExcoReservationRef(p.stateCode);
+      const reservation = await tx.get(reservationRef);
+      if (!reservation.exists || reservation.data()!.groupId !== gid) {
+        throw fail('permission-denied', 'This state code was not appointed as the main exco for this group.');
+      }
+      if ((groupData.mainExcoUid && groupData.mainExcoUid !== uid) || (reservation.data()!.claimedUid && reservation.data()!.claimedUid !== uid)) {
+        throw fail('already-exists', 'The appointed main exco account has already been claimed. Contact the CDS Pass administrator.');
+      }
+      tx.update(gRef, { mainExcoUid: uid, mainExcoClaimedAt: FieldValue.serverTimestamp() });
+      tx.update(reservationRef, { claimedUid: uid, claimedAt: FieldValue.serverTimestamp() });
+    }
+    const role: Role = isMainExco ? 'exco' : 'member';
+    const status = isMainExco ? 'approved' : 'pending';
+    tx.set(userRef(uid), {
+      ...p,
+      groupId: gid,
+      role,
+      status,
+      fcmTokens: [],
+      createdAt: FieldValue.serverTimestamp(),
+      ...(isMainExco ? { approvedAt: FieldValue.serverTimestamp(), approvedBy: groupData.createdBy } : {}),
+    });
   });
-  await auth.setCustomUserClaims(uid, { gid, role: 'member', approved: false });
+  const role: Role = isMainExco ? 'exco' : 'member';
+  const status = isMainExco ? 'approved' : 'pending';
+  await auth.setCustomUserClaims(uid, { gid, role, approved: isMainExco });
   await log(gid, uid, 'member_registered', { target: uid, stateCode: p.stateCode });
-  return { ok: true, status: 'pending', groupName: g.docs[0].data().name };
+  if (!isMainExco) {
+    const excos = await db.collection('users').where('groupId', '==', gid).get();
+    await notify(
+      excos.docs.filter((d) => d.data().status === 'approved' && d.data().role === 'exco').map((d) => d.id),
+      'New member needs approval',
+      `${p.fullName} (${p.stateCode}) has requested to join your CDS group.`,
+      '/exco/members',
+      'member-request',
+    );
+  }
+  return { ok: true, status, role, groupName };
 });
 
-/** An exco creates a new CDS group and becomes its first exco. */
-export const createGroup = onCall(async (req) => {
-  const { uid } = signedIn(req);
+/** The platform admin creates groups without replacing their own group membership. */
+export const createManagedGroup = onCall(async (req: CallableRequest) => {
+  const { uid, adminStateCode } = await platformAdmin(req);
+  const name = text(req.data?.group?.name, 'CDS group name', 3, 60);
+  const lga = text(req.data?.group?.lga, 'LGA', 2, 60);
+  const state = text(req.data?.group?.state, 'State', 2, 40);
+  const mainExcoStateCode = normalizeStateCode(req.data?.mainExcoStateCode);
+  if (!mainExcoStateCode) throw fail('invalid-argument', 'Enter a valid state code for the new group’s main exco.');
+  if (mainExcoStateCode === adminStateCode) {
+    throw fail('failed-precondition', 'Use a different state code for this group’s main exco. Your platform admin account stays in its current CDS group.');
+  }
+  const reservationRef = mainExcoReservationRef(mainExcoStateCode);
+  const existingReservation = await reservationRef.get();
+  if (existingReservation.exists) throw fail('already-exists', 'That state code is already appointed as a group’s main exco.');
+  try {
+    const existingAuth = await auth.getUserByEmail(stateCodeToEmail(mainExcoStateCode));
+    if ((await userRef(existingAuth.uid).get()).exists) {
+      throw fail('already-exists', 'That state code already has a CDS Pass profile. Choose a state code that can join this new group.');
+    }
+  } catch (err) {
+    if (err instanceof HttpsError) throw err;
+    if ((err as { code?: string }).code !== 'auth/user-not-found') throw err;
+  }
+
+  let joinCode = newJoinCode();
+  let uniqueCode = false;
+  for (let i = 0; i < 10; i++) {
+    const clash = await db.collection('groups').where('joinCode', '==', joinCode).limit(1).get();
+    if (clash.empty) { uniqueCode = true; break; }
+    joinCode = newJoinCode();
+  }
+  if (!uniqueCode) throw fail('resource-exhausted', 'Could not create a unique group code. Please try again.');
+
+  const gRef = db.collection('groups').doc();
+  await db.runTransaction(async (tx) => {
+    const reservation = await tx.get(reservationRef);
+    if (reservation.exists) throw fail('already-exists', 'That state code is already appointed as a group’s main exco.');
+    tx.create(gRef, {
+      name,
+      lga,
+      state,
+      joinCode,
+      batchSize: DEFAULT_BATCH_SIZE,
+      venue: null,
+      createdBy: uid,
+      mainExcoUid: null,
+      mainExcoStateCode,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    tx.create(keysRef(gRef.id), { doorSecret: randomBytes(32).toString('hex') });
+    tx.create(reservationRef, { groupId: gRef.id, stateCode: mainExcoStateCode, createdBy: uid, createdAt: FieldValue.serverTimestamp() });
+  });
+  await log(gRef.id, uid, 'group_created', { name });
+  return { ok: true, groupId: gRef.id, joinCode, mainExcoStateCode };
+});
+
+/** Deprecated endpoint retained to give old clients a safe error instead of replacing an admin profile. */
+export const createGroup = onCall(async () => {
+  throw fail('failed-precondition', 'Create groups from Exco → Settings using the platform admin account.');
+});
+
+/**
+ * First-time setup for the platform admin: signs up AND starts their own CDS group in one step,
+ * becoming its approved main exco. Without this the admin could never reach Exco → Settings on a
+ * fresh database, because every other sign-up needs a group code.
+ */
+export const registerPlatformAdmin = onCall(async (req: CallableRequest) => {
+  const { uid, adminStateCode } = await platformAdmin(req);
   const p = await validateProfile(uid, req.data);
+  if (p.stateCode !== adminStateCode) throw fail('permission-denied', 'Only the CDS Pass platform administrator can do this.');
   const name = text(req.data?.group?.name, 'CDS group name', 3, 60);
   const lga = text(req.data?.group?.lga, 'LGA', 2, 60);
   const state = text(req.data?.group?.state, 'State', 2, 40);
 
   let joinCode = newJoinCode();
-  for (let i = 0; i < 5; i++) {
+  let uniqueCode = false;
+  for (let i = 0; i < 10; i++) {
     const clash = await db.collection('groups').where('joinCode', '==', joinCode).limit(1).get();
-    if (clash.empty) break;
+    if (clash.empty) { uniqueCode = true; break; }
     joinCode = newJoinCode();
   }
+  if (!uniqueCode) throw fail('resource-exhausted', 'Could not create a unique group code. Please try again.');
 
   const gRef = db.collection('groups').doc();
-  const batch = db.batch();
-  batch.set(gRef, {
-    name,
-    lga,
-    state,
-    joinCode,
-    batchSize: DEFAULT_BATCH_SIZE,
-    venue: null,
-    createdBy: uid,
-    createdAt: FieldValue.serverTimestamp(),
+  await db.runTransaction(async (tx) => {
+    const existing = await tx.get(userRef(uid));
+    if (existing.exists) throw fail('already-exists', 'This account is already registered.');
+    tx.create(gRef, {
+      name,
+      lga,
+      state,
+      joinCode,
+      batchSize: DEFAULT_BATCH_SIZE,
+      venue: null,
+      createdBy: uid,
+      mainExcoUid: uid,
+      mainExcoStateCode: p.stateCode,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    tx.create(keysRef(gRef.id), { doorSecret: randomBytes(32).toString('hex') });
+    tx.create(userRef(uid), {
+      ...p,
+      groupId: gRef.id,
+      role: 'exco',
+      status: 'approved',
+      fcmTokens: [],
+      createdAt: FieldValue.serverTimestamp(),
+      approvedAt: FieldValue.serverTimestamp(),
+      approvedBy: uid,
+    });
   });
-  batch.set(keysRef(gRef.id), { doorSecret: randomBytes(32).toString('hex') });
-  batch.set(userRef(uid), {
-    ...p,
-    groupId: gRef.id,
-    role: 'exco',
-    status: 'approved',
-    fcmTokens: [],
-    createdAt: FieldValue.serverTimestamp(),
-    approvedAt: FieldValue.serverTimestamp(),
-  });
-  await batch.commit();
   await auth.setCustomUserClaims(uid, { gid: gRef.id, role: 'exco', approved: true });
   await log(gRef.id, uid, 'group_created', { name });
-  return { ok: true, groupId: gRef.id, joinCode };
+  return { ok: true, status: 'approved', role: 'exco', groupName: name, joinCode };
 });
 
+
 /** Exco approves (after checking the NYSC ID card) or rejects a pending member. */
-export const approveMember = onCall(async (req) => {
+export const approveMember = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const approve = req.data?.approve !== false;
@@ -1178,35 +1409,53 @@ export const approveMember = onCall(async (req) => {
     target: uid,
     stateCode: user.stateCode,
   });
+  if (approve) {
+    await notify([uid], 'CDS membership approved', 'Your CDS group has approved your registration. Open CDS Pass to continue.', '/home', 'member-approved');
+  }
   return { ok: true };
 });
 
+
+
+
 /** Make someone an exco (or back to member). */
-export const setRole = onCall(async (req) => {
-  const e = await exco(req);
+export const setRole = onCall(async (req: CallableRequest) => {
+  const e = await mainExco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const role: Role = req.data?.role === 'exco' ? 'exco' : 'member';
   if (uid === e.uid && role !== 'exco') throw fail('failed-precondition', 'You cannot remove yourself as exco.');
+  const group = (await groupRef(e.gid).get()).data();
+  if (uid === (group?.mainExcoUid ?? group?.createdBy) && role !== 'exco') {
+    throw fail('failed-precondition', 'The main exco who created this CDS group cannot be demoted.');
+  }
   if (user.status !== 'approved') throw fail('failed-precondition', 'Approve this member first.');
   await userRef(uid).update({ role });
   await auth.setCustomUserClaims(uid, { gid: e.gid, role, approved: true });
   await log(e.gid, e.uid, 'role_changed', { target: uid, role });
+  await notify(
+    [uid],
+    role === 'exco' ? 'You are now a CDS exco' : 'CDS exco access removed',
+    role === 'exco' ? 'Your CDS group has given you exco access.' : 'Your CDS group has changed your access to member.',
+    '/home',
+    'role-changed',
+  );
   return { ok: true };
 });
 
 /** Exco resets a member's PIN after checking their NYSC ID card. */
-export const resetPin = onCall(async (req) => {
+export const resetPin = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const pin = String(req.data?.pin ?? '');
   if (!/^\d{6}$/.test(pin)) throw fail('invalid-argument', 'The new PIN must be 6 digits.');
   await auth.updateUser(uid, { password: pin });
   await log(e.gid, e.uid, 'pin_reset', { target: uid, stateCode: user.stateCode });
+  await notify([uid], 'Your CDS Pass PIN was reset', 'An exco reset your PIN. Sign in with the new PIN they gave you.', '/login', 'pin-reset');
   return { ok: true };
 });
 
 /** Batch size and venue location. */
-export const updateGroupSettings = onCall(async (req) => {
+export const updateGroupSettings = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const patch: Record<string, unknown> = {};
   if (req.data?.batchSize != null) {
@@ -1226,44 +1475,65 @@ export const updateGroupSettings = onCall(async (req) => {
   if (!Object.keys(patch).length) return { ok: true };
   await groupRef(e.gid).update(patch);
   await log(e.gid, e.uid, 'settings_changed', { patch });
+  if ('venue' in patch) {
+    const venueMessage = patch.venue
+      ? `Venue location checking is on. You must be near the CDS venue to scan in (within ${(patch.venue as { radiusM: number }).radiusM} metres).`
+      : 'Venue location checking has been turned off for your CDS group.';
+    await notifyApprovedGroup(e.gid, 'CDS venue settings updated', venueMessage, '/home');
+  }
   return { ok: true };
 });
 
 // ---------------------------------------------------------------- CDS day
 
-export const startSession = onCall(async (req) => {
+export const startSession = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const sid = lagosDate();
   const ref = sessionRef(e.gid, sid);
-  const snap = await ref.get();
-  if (snap.exists) {
-    await ref.update({ status: 'open', reopenedAt: FieldValue.serverTimestamp() });
-  } else {
-    await ref.set({
-      status: 'open',
-      openedAt: FieldValue.serverTimestamp(),
-      openedBy: e.uid,
-      nextNumber: 1,
-      nextPriority: 1,
-      lastTo: 0,
-      batchSeq: 0,
-      batch: null,
-    });
-  }
+  const counter = sessionCounterRef(e.gid, sid);
+  await db.runTransaction(async (tx) => {
+    const [session, counts] = await Promise.all([tx.get(ref), tx.get(counter)]);
+    const previous = session.data();
+    if (!counts.exists) {
+      tx.set(counter, {
+        nextNumber: previous?.nextNumber ?? 1,
+        nextPriority: previous?.nextPriority ?? 1,
+      });
+    }
+    if (session.exists) {
+      tx.update(ref, {
+        status: 'open',
+        reopenedAt: FieldValue.serverTimestamp(),
+        nextNumber: FieldValue.delete(),
+        nextPriority: FieldValue.delete(),
+      });
+    } else {
+      tx.set(ref, {
+        status: 'open',
+        openedAt: FieldValue.serverTimestamp(),
+        openedBy: e.uid,
+        lastTo: 0,
+        batchSeq: 0,
+        batch: null,
+      });
+    }
+  });
   await log(e.gid, e.uid, 'session_opened', { sessionId: sid });
+  await notifyApprovedGroup(e.gid, "Today's CDS meeting is open", 'The meeting is open. Scan the door code at the venue to check in.', '/home');
   return { ok: true, sessionId: sid };
 });
 
-export const endSession = onCall(async (req) => {
+export const endSession = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const sid = lagosDate();
   await sessionRef(e.gid, sid).update({ status: 'closed', closedAt: FieldValue.serverTimestamp() });
   await log(e.gid, e.uid, 'session_closed', { sessionId: sid });
+  await notifyApprovedGroup(e.gid, "Today's CDS meeting has ended", 'The exco has ended the meeting. Batch calls are stopped.', '/home');
   return { ok: true };
 });
 
 /** The exco's door screen asks for a fresh code every ~25 seconds. */
-export const getDoorCode = onCall(async (req) => {
+export const getDoorCode = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const sid = lagosDate();
   const s = await sessionRef(e.gid, sid).get();
@@ -1280,7 +1550,7 @@ export const getDoorCode = onCall(async (req) => {
  * A member scans the door QR (or types the 6-digit code).
  * `scannedAt` is set when the scan was saved offline and is being sent later.
  */
-export const checkIn = onCall(async (req) => {
+export const checkIn = onCall(async (req: CallableRequest) => {
   const { uid, gid } = approvedMember(req);
   const code = String(req.data?.code ?? '').replace(/\D/g, '');
   if (code.length !== 6) throw fail('invalid-argument', 'Enter the 6-digit code on the exco screen.');
@@ -1326,7 +1596,7 @@ export const checkIn = onCall(async (req) => {
 });
 
 /** Exco looks someone up (scanned tag/card or typed state code) to see their photo first. */
-export const lookupMember = onCall(async (req) => {
+export const lookupMember = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const a = await attendeeRef(e.gid, lagosDate(), uid).get();
@@ -1334,7 +1604,7 @@ export const lookupMember = onCall(async (req) => {
 });
 
 /** Exco checks in someone without a working phone (printed card, or manual by state code). */
-export const excoCheckIn = onCall(async (req) => {
+export const excoCheckIn = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const method = req.data?.method === 'card' ? 'card' : 'manual';
@@ -1346,18 +1616,23 @@ export const excoCheckIn = onCall(async (req) => {
 });
 
 /** Pregnant and nursing mothers get a priority tag (P1, P2 …). The reason is never stored. */
-export const setPriority = onCall(async (req) => {
+export const setPriority = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const sid = lagosDate();
   const pNumber = await db.runTransaction(async (tx) => {
     const sRef = sessionRef(e.gid, sid);
     const aRef = attendeeRef(e.gid, sid, uid);
-    const [s, a] = await Promise.all([tx.get(sRef), tx.get(aRef)]);
+    const cRef = sessionCounterRef(e.gid, sid);
+    const [s, a, c] = await Promise.all([tx.get(sRef), tx.get(aRef), tx.get(cRef)]);
+    if (!s.exists || s.data()!.status !== 'open') throw fail('failed-precondition', "Open today's CDS meeting first.");
     if (!a.exists) throw fail('failed-precondition', 'Check this person in first.');
     if (a.data()!.priority) return a.data()!.pNumber as number;
-    const n = s.data()!.nextPriority as number;
-    tx.update(sRef, { nextPriority: n + 1 });
+    const n = (c.data()?.nextPriority ?? s.data()!.nextPriority ?? 1) as number;
+    tx.set(cRef, { nextNumber: c.data()?.nextNumber ?? s.data()!.nextNumber ?? 1, nextPriority: n + 1 }, { merge: true });
+    if (Object.hasOwn(s.data()!, 'nextNumber') || Object.hasOwn(s.data()!, 'nextPriority')) {
+      tx.update(sRef, { nextNumber: FieldValue.delete(), nextPriority: FieldValue.delete() });
+    }
     tx.update(aRef, { priority: true, pNumber: n, priorityBy: e.uid });
     return n;
   });
@@ -1366,7 +1641,7 @@ export const setPriority = onCall(async (req) => {
 });
 
 /** "Call priority" or "Call next batch". Notifies everyone in the batch. */
-export const callNext = onCall(async (req) => {
+export const callNext = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const sid = lagosDate();
   const mode = req.data?.mode === 'priority' ? 'priority' : 'next';
@@ -1375,17 +1650,18 @@ export const callNext = onCall(async (req) => {
 
   const batch = await db.runTransaction(async (tx) => {
     const sRef = sessionRef(e.gid, sid);
-    const s = await tx.get(sRef);
+    const cRef = sessionCounterRef(e.gid, sid);
+    const [s, c] = await Promise.all([tx.get(sRef), tx.get(cRef)]);
     if (!s.exists || s.data()!.status !== 'open') throw fail('failed-precondition', "Open today's CDS meeting first.");
     const d = s.data()!;
     const seq = (d.batchSeq as number) + 1;
     let b: Batch;
     if (mode === 'priority') {
-      if ((d.nextPriority as number) <= 1) throw fail('failed-precondition', 'Nobody has a priority tag yet.');
+      if (((c.data()?.nextPriority ?? d.nextPriority ?? 1) as number) <= 1) throw fail('failed-precondition', 'Nobody has a priority tag yet.');
       b = { kind: 'priority', seq };
     } else {
       const from = (d.lastTo as number) + 1;
-      if (from > (d.nextNumber as number) - 1) {
+      if (from > ((c.data()?.nextNumber ?? d.nextNumber ?? 1) as number) - 1) {
         throw fail('failed-precondition', `Nobody has checked in beyond No. ${from - 1} yet.`);
       }
       b = { kind: 'regular', seq, from, to: from + size - 1 };
@@ -1407,13 +1683,37 @@ export const callNext = onCall(async (req) => {
     .map((d) => d.id);
 
   const label = batch.kind === 'priority' ? 'Priority' : `No. ${batch.from} – ${batch.to}`;
-  const sent = await notify(targets, `${label}: it's your turn`, 'Go to the thumbprint table now and show your CDS Pass tag.');
+  const latest = await sessionRef(e.gid, sid).get();
+  if (!latest.exists || latest.data()!.status !== 'open' || latest.data()!.batchSeq !== batch.seq) {
+    throw fail('failed-precondition', 'The meeting ended before this batch could be called. No alerts were sent.');
+  }
+  const sent = await notify(targets, `${label}: it's your turn`, 'Go to the thumbprint table now and show your CDS Pass tag.', '/tag', 'batch-call');
   await log(e.gid, e.uid, 'batch_called', { label, notified: sent });
   return { ok: true, batch, notified: sent, inBatch: targets.length };
 });
 
+/** Main exco only: sends a test push to every approved member of the group who has alerts turned on. */
+export const testNotification = onCall(async (req: CallableRequest) => {
+  const e = await mainExco(req);
+  const members = await db.collection('users').where('groupId', '==', e.gid).get();
+  const targets = members.docs
+    .filter((d) => d.data().status === 'approved' && Array.isArray(d.data().fcmTokens) && d.data().fcmTokens.length > 0)
+    .map((d) => d.id);
+  const registered = members.docs.filter((d) => d.data().status === 'approved').length;
+  if (!targets.length) return { sent: 0, registered: 0, members: registered };
+  const sent = await notify(
+    targets,
+    'CDS Pass test notification',
+    `${e.name} sent a test notification for your CDS group.`,
+    '/home',
+    'group-test',
+  );
+  await log(e.gid, e.uid, 'notification_test', { notified: sent, targetMembers: targets.length });
+  return { sent, registered: targets.length, members: registered };
+});
+
 /** Exco scans a tag at the thumbprint table. Green = thumbprint, red = wait. */
-export const tableCheck = onCall(async (req) => {
+export const tableCheck = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const sid = lagosDate();
@@ -1440,7 +1740,7 @@ export const tableCheck = onCall(async (req) => {
 });
 
 /** After the LGI thumbprints them, the exco taps Done. The tag can never be used again today. */
-export const markDone = onCall(async (req) => {
+export const markDone = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const sid = lagosDate();
@@ -1525,14 +1825,14 @@ async function settle(gid: string, reference: string, paidKobo: number) {
 }
 
 /** Bank list for the exco's "where should dues go" form. */
-export const listBanks = onCall({ secrets: [paystackSecret] }, async (req) => {
+export const listBanks = onCall({ secrets: [paystackSecret] }, async (req: CallableRequest) => {
   await exco(req);
   const banks = await paystack<{ name: string; code: string; active: boolean }[]>('/bank?country=nigeria&perPage=200');
   return banks.filter((b) => b.active).map((b) => ({ name: b.name, code: b.code }));
 });
 
 /** Shows the account name before saving, so the wrong account isn't used. */
-export const resolveAccount = onCall({ secrets: [paystackSecret] }, async (req) => {
+export const resolveAccount = onCall({ secrets: [paystackSecret] }, async (req: CallableRequest) => {
   await exco(req);
   const acct = String(req.data?.accountNumber ?? '').replace(/\D/g, '');
   const bank = String(req.data?.bankCode ?? '');
@@ -1542,7 +1842,7 @@ export const resolveAccount = onCall({ secrets: [paystackSecret] }, async (req) 
 });
 
 /** Saves the group's dues account as a Paystack subaccount (created once, updated on handover). */
-export const setPayoutAccount = onCall({ secrets: [paystackSecret] }, async (req) => {
+export const setPayoutAccount = onCall({ secrets: [paystackSecret] }, async (req: CallableRequest) => {
   const e = await exco(req);
   const acct = String(req.data?.accountNumber ?? '').replace(/\D/g, '');
   const bankCode = String(req.data?.bankCode ?? '');
@@ -1570,12 +1870,13 @@ export const setPayoutAccount = onCall({ secrets: [paystackSecret] }, async (req
     payout: { bankName, accountName: account_name, last4: acct.slice(-4), setBy: e.uid, setAt: FieldValue.serverTimestamp() },
   });
   await log(e.gid, e.uid, 'payout_account_set', { label: `${bankName} ****${acct.slice(-4)} (${account_name})` });
+  await notifyApprovedGroup(e.gid, 'CDS dues account updated', 'Your group has updated the account used for CDS dues. Check the Dues page before making a payment.', '/dues');
   return { ok: true, accountName: account_name };
 });
 
 /** Exco creates a dues item, e.g. "November dues ₦1,000". */
-export const createDues = onCall(async (req) => {
-  const e = await exco(req);
+export const createDues = onCall(async (req: CallableRequest) => {
+  const e = await mainExco(req);
   const title = text(req.data?.title, 'Title', 3, 60);
   const amount = Number(req.data?.amountNaira);
   if (!Number.isFinite(amount) || amount < 50 || amount > 100_000) throw fail('invalid-argument', 'Amount must be ₦50 – ₦100,000.');
@@ -1590,19 +1891,29 @@ export const createDues = onCall(async (req) => {
     createdAt: FieldValue.serverTimestamp(),
   });
   await log(e.gid, e.uid, 'dues_created', { label: `${title} · ${naira(Math.round(amount * 100))}` });
+  await notifyApprovedGroup(
+    e.gid,
+    `New CDS dues: ${title}`,
+    `${naira(Math.round(amount * 100))}${dueDate ? ` · due ${dueDate}` : ''}. Open CDS Pass to view or pay.`,
+    '/dues',
+  );
   return { ok: true, duesId: ref.id };
 });
 
-export const closeDues = onCall(async (req) => {
+export const closeDues = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const duesId = String(req.data?.duesId ?? '');
-  await duesRef(e.gid, duesId).update({ active: false, closedAt: FieldValue.serverTimestamp() });
+  const ref = duesRef(e.gid, duesId);
+  const dues = await ref.get();
+  if (!dues.exists) throw fail('not-found', 'Those dues could not be found.');
+  await ref.update({ active: false, closedAt: FieldValue.serverTimestamp() });
   await log(e.gid, e.uid, 'dues_closed', { duesId });
+  await notifyApprovedGroup(e.gid, 'CDS dues closed', `${String(dues.data()!.title)} is now closed.`, '/dues');
   return { ok: true };
 });
 
 /** Member starts an online payment. Returns the Paystack checkout link. */
-export const startPayment = onCall({ secrets: [paystackSecret] }, async (req) => {
+export const startPayment = onCall({ secrets: [paystackSecret] }, async (req: CallableRequest) => {
   const { uid, gid } = approvedMember(req);
   const duesId = String(req.data?.duesId ?? '');
   const returnUrl = String(req.data?.returnUrl ?? '');
@@ -1661,7 +1972,7 @@ export const startPayment = onCall({ secrets: [paystackSecret] }, async (req) =>
 });
 
 /** Called when the member returns from Paystack. Safe to call more than once. */
-export const verifyPayment = onCall({ secrets: [paystackSecret] }, async (req) => {
+export const verifyPayment = onCall({ secrets: [paystackSecret] }, async (req: CallableRequest) => {
   const { uid, gid } = approvedMember(req);
   const reference = String(req.data?.reference ?? '');
   const p = await paymentRef(gid, reference).get();
@@ -1698,7 +2009,7 @@ export const paystackWebhook = onRequest({ secrets: [paystackSecret] }, async (r
 });
 
 /** Treasurer records cash. The member must confirm it on their phone before it counts. */
-export const recordCash = onCall(async (req) => {
+export const recordCash = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const duesId = String(req.data?.duesId ?? '');
@@ -1743,7 +2054,7 @@ export const recordCash = onCall(async (req) => {
 });
 
 /** Member confirms (or disputes) cash the treasurer recorded. */
-export const respondCash = onCall(async (req) => {
+export const respondCash = onCall(async (req: CallableRequest) => {
   const { uid, gid } = approvedMember(req);
   const duesId = String(req.data?.duesId ?? '');
   const confirm = req.data?.confirm === true;
@@ -1765,7 +2076,7 @@ export const respondCash = onCall(async (req) => {
 });
 
 /** Buzz everyone who hasn't paid yet. */
-export const remindDues = onCall(async (req) => {
+export const remindDues = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const duesId = String(req.data?.duesId ?? '');
   const d = await duesRef(e.gid, duesId).get();
@@ -1799,16 +2110,21 @@ import express, { type Request, type Response } from 'express';
 import { getAuth } from 'firebase-admin/auth';
 import { HttpsError, type Callable, type RawEndpoint } from './compat';
 import * as handlers from './handlers';
+import { uploadRouter } from './upload';
 
 const app = express();
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
 
-const origins = (process.env.CORS_ORIGINS ?? 'http://localhost:5173')
+const configuredOrigins = (process.env.CORS_ORIGINS ?? 'http://localhost:5173')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+const origins = [...new Set([...configuredOrigins, 'https://cdspass.name.ng'])];
 app.use(cors({ origin: origins, maxAge: 86400 }));
+
+// Profile photos → Cloudinary (multipart upload, so this goes before express.json)
+app.use('/upload', uploadRouter);
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, time: Date.now() });
@@ -1888,6 +2204,34 @@ app.listen(port, () => {
   console.log(`CDS Pass API listening on :${port}`);
   console.log(`Allowed websites: ${origins.join(', ')}`);
 });
+```
+
+---
+
+### `server/src/mongo.ts`
+
+```ts
+import { MongoClient, type Collection, type Document } from 'mongodb';
+
+let clientPromise: Promise<MongoClient> | null = null;
+
+export function mongoConfigured() {
+  return Boolean(process.env.MONGODB_URI);
+}
+
+export async function mongoCollection<T extends Document = Document>(name: string): Promise<Collection<T>> {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) throw new Error('MONGODB_URI is not configured.');
+  if (!clientPromise) {
+    const client = new MongoClient(uri, { maxPoolSize: 5, serverSelectionTimeoutMS: 8000 });
+    clientPromise = client.connect().catch((error) => {
+      clientPromise = null;
+      throw error;
+    });
+  }
+  const client = await clientPromise;
+  return client.db(process.env.MONGODB_DATABASE || 'cds_pass').collection<T>(name);
+}
 ```
 
 ---
@@ -1990,6 +2334,105 @@ export function duesCharges(amountKobo: number, servicePercent = 3, paystackPerc
 
 ---
 
+### `server/src/upload.ts`
+
+```ts
+/**
+ * Profile-photo upload (Cloudinary).
+ *
+ *   POST /upload/avatar    multipart/form-data, field "file"   →  { url }
+ *
+ * Same idea as BlockHub: the phone sends the photo to OUR server, the server
+ * puts it on Cloudinary, and sends back the URL. The app then saves only that
+ * URL in Firestore (users/{uid}.photoURL).
+ *
+ * Only a logged-in person can upload, and each person can only ever write
+ * their OWN photo (the Cloudinary file name is their uid), so uploading a new
+ * photo replaces the old one instead of piling up files.
+ */
+import { Router, type NextFunction, type Request, type Response } from 'express';
+import { getAuth } from 'firebase-admin/auth';
+import { v2 as cloudinary } from 'cloudinary';
+import multer from 'multer';
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
+});
+
+const MAX_BYTES = 2 * 1024 * 1024; // photos are compressed to ~50 KB in the browser; 2 MB is plenty
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_BYTES, files: 1 },
+});
+
+const fail = (res: Response, status: number, message: string) =>
+  res.status(status).json({ error: { message } });
+
+/** Same login check as the /api actions: Firebase ID token in the Authorization header. */
+async function requireLogin(req: Request, res: Response, next: NextFunction) {
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Bearer ')) return fail(res, 401, 'Please log in again.');
+  try {
+    const decoded = await getAuth().verifyIdToken(header.slice(7));
+    (req as Request & { uid?: string }).uid = decoded.uid;
+    next();
+  } catch {
+    fail(res, 401, 'Your login has expired. Please log in again.');
+  }
+}
+
+export const uploadRouter = Router();
+
+uploadRouter.post(
+  '/avatar',
+  requireLogin,
+  (req: Request, res: Response, next: NextFunction) => {
+    upload.single('file')(req, res, (err: unknown) => {
+      if (!err) return next();
+      const tooBig = (err as { code?: string }).code === 'LIMIT_FILE_SIZE';
+      fail(res, 400, tooBig ? 'That photo is too big. Choose a smaller one.' : 'Could not read the photo.');
+    });
+  },
+  (req: Request, res: Response) => {
+    const uid = (req as Request & { uid?: string }).uid!;
+    const file = req.file;
+
+    if (!file) return fail(res, 400, 'No photo was sent.');
+    if (!file.mimetype.startsWith('image/')) return fail(res, 400, 'Please choose a photo.');
+    if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+      console.error('Cloudinary is not configured (CLOUDINARY_CLOUD_NAME / _API_KEY / _API_SECRET missing).');
+      return fail(res, 500, 'Photo upload is not set up on the server yet.');
+    }
+
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        resource_type: 'image',
+        folder: 'cds-pass/avatars',
+        public_id: uid, // one photo per person: a new upload replaces the old one
+        overwrite: true,
+        invalidate: true,
+        transformation: [{ width: 512, height: 512, crop: 'limit', quality: 'auto' }],
+      },
+      (error, result) => {
+        if (error || !result) {
+          console.error('Cloudinary upload failed:', error);
+          return fail(res, 500, 'Could not upload your photo. Please try again.');
+        }
+        // secure_url contains a version number (…/v1731234567/…), so a replaced photo gets a new URL.
+        res.json({ url: result.secure_url });
+      },
+    );
+    stream.end(file.buffer);
+  },
+);
+```
+
+---
+
 ### `server/tsconfig.json`
 
 ```json
@@ -2051,9 +2494,27 @@ VITE_PAYSTACK_FEE_PERCENT=1.5
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#0B6B3A" />
     <meta name="description" content="CDS Pass: no more queueing for numbers at CDS. Independent tool for CDS groups." />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="CDS Pass" />
+    <meta property="og:title" content="CDS Pass — No more queueing for numbers at CDS" />
+    <meta property="og:description" content="Scan in, get your number, and know when it's your turn to thumbprint." />
+    <meta property="og:url" content="https://cdspass.name.ng/" />
+    <meta property="og:image" content="https://cdspass.name.ng/share-card-3d.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="CDS Pass helps CDS members check in, get a number, and know when it is their turn." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="CDS Pass — No more queueing for numbers at CDS" />
+    <meta name="twitter:description" content="Scan in, get your number, and know when it's your turn to thumbprint." />
+    <meta name="twitter:image" content="https://cdspass.name.ng/share-card-3d.png" />
+    <meta name="twitter:image:alt" content="CDS Pass helps CDS members check in, get a number, and know when it is their turn." />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="shortcut icon" href="/icon-192.png" type="image/png" />
+    <link rel="icon" href="/icon-192.png" type="image/png" sizes="192x192" />
     <link rel="apple-touch-icon" href="/icon-192.png" />
     <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="canonical" href="https://cdspass.name.ng/" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -2132,6 +2593,21 @@ export default {
     autoprefixer: {},
   },
 };
+```
+
+---
+
+### `web/public/.htaccess`
+
+```
+# Send React Router paths (for example /exco) back to the single-page app.
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteCond %{REQUEST_FILENAME} !-d
+  RewriteRule ^ index.html [L]
+</IfModule>
 ```
 
 ---
@@ -2271,10 +2747,194 @@ self.addEventListener('fetch', (event) => {
 
 ---
 
+### `web/scripts/generate-share-card.ps1`
+
+```powershell
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+
+$width = 1200
+$height = 630
+$bitmap = [System.Drawing.Bitmap]::new($width, $height)
+$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+$graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+$graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+$graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+$graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+
+function Draw-RoundedRect($graphics, [System.Drawing.RectangleF]$rect, [single]$radius, $brush, $pen = $null) {
+  $path = [System.Drawing.Drawing2D.GraphicsPath]::new()
+  $diameter = $radius * 2
+  $path.AddArc($rect.X, $rect.Y, $diameter, $diameter, 180, 90)
+  $path.AddArc($rect.Right - $diameter, $rect.Y, $diameter, $diameter, 270, 90)
+  $path.AddArc($rect.Right - $diameter, $rect.Bottom - $diameter, $diameter, $diameter, 0, 90)
+  $path.AddArc($rect.X, $rect.Bottom - $diameter, $diameter, $diameter, 90, 90)
+  $path.CloseFigure()
+  if ($brush) { $graphics.FillPath($brush, $path) }
+  if ($pen) { $graphics.DrawPath($pen, $path) }
+  $path.Dispose()
+}
+
+$background = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
+  [System.Drawing.Rectangle]::new(0, 0, $width, $height),
+  [System.Drawing.Color]::FromArgb(5, 37, 23),
+  [System.Drawing.Color]::FromArgb(8, 91, 49), 35
+)
+$graphics.FillRectangle($background, 0, 0, $width, $height)
+$background.Dispose()
+
+# Fine grid and glow pools echo the animated landing hero.
+$gridPen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(17, 205, 246, 215), 1)
+for ($x = 0; $x -lt $width; $x += 42) { $graphics.DrawLine($gridPen, $x, 0, $x, $height) }
+for ($y = 0; $y -lt $height; $y += 42) { $graphics.DrawLine($gridPen, 0, $y, $width, $y) }
+$gridPen.Dispose()
+foreach ($glow in @(@(920, 270, 330, 330, 46, 32, 170, 80), @(210, 540, 390, 220, 30, 14, 109, 64))) {
+  $path = [System.Drawing.Drawing2D.GraphicsPath]::new()
+  $path.AddEllipse([single]$glow[0], [single]$glow[1], [single]$glow[2], [single]$glow[3])
+  $brush = [System.Drawing.Drawing2D.PathGradientBrush]::new($path)
+  $brush.CenterColor = [System.Drawing.Color]::FromArgb([int]$glow[4], [int]$glow[5], [int]$glow[6], [int]$glow[7])
+  $brush.SurroundColors = @([System.Drawing.Color]::FromArgb(0, 0, 0, 0))
+  $graphics.FillPath($brush, $path)
+  $brush.Dispose()
+  $path.Dispose()
+}
+
+$lime = [System.Drawing.Color]::FromArgb(14, 220, 92)
+$gold = [System.Drawing.Color]::FromArgb(201, 183, 131)
+$white = [System.Drawing.Color]::White
+$mint = [System.Drawing.Color]::FromArgb(198, 232, 211)
+
+# Brand lockup.
+$iconBrush = [System.Drawing.SolidBrush]::new($lime)
+Draw-RoundedRect $graphics ([System.Drawing.RectangleF]::new(84, 58, 44, 44)) 12 $iconBrush
+$iconBrush.Dispose()
+$checkPen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(5, 52, 29), 4)
+$checkPen.StartCap = 'Round'
+$checkPen.EndCap = 'Round'
+$checkPoints = [System.Drawing.Point[]]@(
+  [System.Drawing.Point]::new(96, 80),
+  [System.Drawing.Point]::new(103, 87),
+  [System.Drawing.Point]::new(117, 69)
+)
+$graphics.DrawLines($checkPen, $checkPoints)
+$checkPen.Dispose()
+$fontBrand = [System.Drawing.Font]::new('Segoe UI', 22, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+$brandBrush = [System.Drawing.SolidBrush]::new($white)
+$graphics.DrawString('CDS PASS', $fontBrand, $brandBrush, 142, 62)
+[System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(170, 201, 183, 131), 3) | ForEach-Object { $graphics.DrawLine($_, 84, 119, 166, 119); $_.Dispose() }
+
+# Headline and supporting copy.
+$headline = [System.Drawing.Font]::new('Segoe UI', 54, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+$headlineAccent = [System.Drawing.Font]::new('Segoe UI', 61, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+$bodyFont = [System.Drawing.Font]::new('Segoe UI', 23, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+$smallBold = [System.Drawing.Font]::new('Segoe UI', 17, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+$whiteBrush = [System.Drawing.SolidBrush]::new($white)
+$limeBrush = [System.Drawing.SolidBrush]::new($lime)
+$mintBrush = [System.Drawing.SolidBrush]::new($mint)
+$goldBrush = [System.Drawing.SolidBrush]::new($gold)
+$graphics.DrawString('No more queueing', $headline, $whiteBrush, 82, 170)
+$graphics.DrawString('for CDS numbers.', $headlineAccent, $limeBrush, 82, 235)
+$graphics.DrawString('Check in. Get your number.', $bodyFont, $mintBrush, 86, 336)
+$graphics.DrawString("Know when it's your turn to thumbprint.", $bodyFont, $mintBrush, 86, 372)
+$chipBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(35, 255, 255, 255))
+$chipPen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(60, 255, 255, 255), 1)
+Draw-RoundedRect $graphics ([System.Drawing.RectangleF]::new(84, 445, 318, 44)) 18 $chipBrush $chipPen
+$graphics.DrawString('A simpler, fairer CDS check-in', $smallBold, $goldBrush, 103, 457)
+
+# Floating 3D tag: thick edge, tilted face, layered card, and lanyard clip.
+$state = $graphics.Save()
+$graphics.TranslateTransform(935, 309)
+$graphics.RotateTransform(-5)
+$graphics.TranslateTransform(-935, -309)
+$shadowBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(95, 0, 0, 0))
+Draw-RoundedRect $graphics ([System.Drawing.RectangleF]::new(756, 111, 366, 468)) 34 $shadowBrush
+$shadowBrush.Dispose()
+$edgeBrush = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
+  [System.Drawing.Rectangle]::new(1059, 93, 42, 484),
+  [System.Drawing.Color]::FromArgb(4, 55, 29), [System.Drawing.Color]::FromArgb(2, 25, 14), 0
+)
+Draw-RoundedRect $graphics ([System.Drawing.RectangleF]::new(760, 103, 366, 466)) 34 $edgeBrush
+$edgeBrush.Dispose()
+$cardBrush = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
+  [System.Drawing.Rectangle]::new(736, 83, 365, 466),
+  [System.Drawing.Color]::FromArgb(16, 139, 76), [System.Drawing.Color]::FromArgb(3, 66, 36), 42
+)
+$cardPen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(100, 215, 255, 228), 2)
+Draw-RoundedRect $graphics ([System.Drawing.RectangleF]::new(738, 84, 365, 466)) 34 $cardBrush $cardPen
+$cardBrush.Dispose()
+$cardPen.Dispose()
+$panelBrush = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
+  [System.Drawing.Rectangle]::new(770, 139, 302, 373),
+  [System.Drawing.Color]::FromArgb(250, 253, 248), [System.Drawing.Color]::FromArgb(222, 240, 228), 55
+)
+Draw-RoundedRect $graphics ([System.Drawing.RectangleF]::new(770, 139, 302, 373)) 23 $panelBrush
+$panelBrush.Dispose()
+$tagFont = [System.Drawing.Font]::new('Segoe UI', 19, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+$tinyFont = [System.Drawing.Font]::new('Segoe UI', 13, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+$numberFont = [System.Drawing.Font]::new('Segoe UI', 116, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+$turnFont = [System.Drawing.Font]::new('Segoe UI', 17, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+$darkBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(5, 48, 27))
+$greenBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(9, 112, 58))
+$mutedBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(75, 103, 84))
+$graphics.DrawString('CDS PASS', $tagFont, $darkBrush, 797, 158)
+$badgeBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(218, 238, 224))
+Draw-RoundedRect $graphics ([System.Drawing.RectangleF]::new(965, 154, 87, 30)) 14 $badgeBrush
+$graphics.DrawString('CDS TAG', $tinyFont, $greenBrush, 979, 162)
+$separatorPen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(100, 11, 107, 58), 2)
+$graphics.DrawLine($separatorPen, 798, 204, 1045, 204)
+$separatorPen.Dispose()
+$graphics.DrawString('YOUR NUMBER', $tinyFont, $mutedBrush, 839, 236)
+# Raised number shadow, then face.
+$numberShadow = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(70, 3, 55, 29))
+$graphics.DrawString('14', $numberFont, $numberShadow, 831, 268)
+$graphics.DrawString('14', $numberFont, $greenBrush, 824, 253)
+$numberShadow.Dispose()
+$turnBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(9, 112, 58))
+Draw-RoundedRect $graphics ([System.Drawing.RectangleF]::new(797, 421, 249, 57)) 17 $turnBrush
+$graphics.DrawString("YOU'RE UP NEXT", $turnFont, $whiteBrush, 842, 439)
+$graphics.DrawString('SCAN IN  |  GET CALLED  |  THUMBPRINT', $tinyFont, $mintBrush, 790, 522)
+$clipPen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(238, 201, 183, 131), 9)
+$graphics.DrawArc($clipPen, 879, 48, 78, 96, 190, 160)
+$graphics.DrawLine($clipPen, 897, 104, 897, 128)
+$graphics.DrawLine($clipPen, 939, 104, 939, 128)
+$clipPen.Dispose()
+$graphics.Restore($state)
+
+# Floating polished orbs mirror the landing hero.
+foreach ($orb in @(@(1112, 160, 32, 32, 14, 220, 92), @(694, 494, 26, 26, 201, 183, 131), @(1115, 445, 20, 20, 213, 241, 223))) {
+  $rect = [System.Drawing.Rectangle]::new([int]$orb[0], [int]$orb[1], [int]$orb[2], [int]$orb[3])
+  $orbBrush = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
+    $rect,
+    [System.Drawing.Color]::FromArgb(245, [int]$orb[4], [int]$orb[5], [int]$orb[6]),
+    [System.Drawing.Color]::FromArgb(100, 5, 48, 27), 45
+  )
+  $graphics.FillEllipse($orbBrush, $rect)
+  $orbBrush.Dispose()
+  $highlight = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(110, 255, 255, 255))
+  $graphics.FillEllipse($highlight, $rect.X + 5, $rect.Y + 4, 7, 7)
+  $highlight.Dispose()
+}
+
+# The simple journey remains readable in WhatsApp's small preview.
+$graphics.DrawString('SCAN IN', $smallBold, $mintBrush, 86, 548)
+$graphics.DrawString('>', $smallBold, $goldBrush, 169, 546)
+$graphics.DrawString('GET YOUR NUMBER', $smallBold, $mintBrush, 198, 548)
+$graphics.DrawString('>', $smallBold, $goldBrush, 374, 546)
+$graphics.DrawString('THUMBPRINT ON TIME', $smallBold, $mintBrush, 402, 548)
+
+$output = Join-Path (Get-Location) 'web/public/share-card-3d.png'
+$bitmap.Save($output, [System.Drawing.Imaging.ImageFormat]::Png)
+$graphics.Dispose()
+$bitmap.Dispose()
+Write-Output "Wrote $output at 1200x630."
+```
+
+---
+
 ### `web/src/App.tsx`
 
 ```tsx
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { Navigate, Outlet, Route, Routes } from 'react-router-dom';
 import { BottomNav } from './components/BottomNav';
 import { InstallGate } from './components/InstallGate';
@@ -2313,6 +2973,60 @@ function Splash() {
   );
 }
 
+function ProfileReadError({ message, onLogout }: { message: string; onLogout: () => void }) {
+  return (
+    <div className="grid min-h-[100dvh] place-items-center bg-paper px-6 text-ink">
+      <div className="w-full max-w-md space-y-4 rounded-3xl bg-card p-6 shadow-card">
+        <h1 className="text-xl font-extrabold">Couldn’t load your CDS profile</h1>
+        <p className="text-sm text-muted">
+          Your login worked, but CDS Pass could not check your saved registration. This can happen if the connection
+          failed or this website is connected to a different Firebase project. Your account has not been deleted.
+        </p>
+        <p className="break-words rounded-xl bg-line p-3 text-xs text-muted">{message}</p>
+        <button onClick={() => window.location.reload()} className="h-12 w-full rounded-2xl bg-green font-bold text-white">
+          Try again
+        </button>
+        <button onClick={onLogout} className="w-full py-2 text-sm font-bold text-muted">
+          Log out
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Approved, but this phone's login doesn't carry the new permissions yet. Never wait forever. */
+function WaitingForAccess() {
+  const { refreshClaims, logout } = useAuth();
+  const [slow, setSlow] = useState(false);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setSlow(true), 10000);
+    return () => clearTimeout(t);
+  }, []);
+  if (!slow) return <Splash />;
+  return (
+    <div className="grid min-h-[100dvh] place-items-center bg-paper px-6 text-ink">
+      <div className="w-full max-w-md space-y-4 rounded-3xl bg-card p-6 text-center shadow-card">
+        <h1 className="text-xl font-extrabold">Setting up your access…</h1>
+        <p className="text-sm text-muted">This is taking longer than usual. Check your internet, then try again.</p>
+        <button
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            void refreshClaims().finally(() => setBusy(false));
+          }}
+          className="h-12 w-full rounded-2xl bg-green font-bold text-white disabled:opacity-60"
+        >
+          {busy ? 'Checking…' : 'Try again'}
+        </button>
+        <button onClick={() => void logout()} className="w-full py-2 text-sm font-bold text-muted">
+          Log out and log in again
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /** Phone: one column + bottom bar. Laptop: sidebar + wider content. */
 function AppShell({ mode }: { mode: 'member' | 'exco' }) {
   return (
@@ -2337,12 +3051,20 @@ function ExcoLayout() {
 }
 
 export default function App() {
-  const { user, profile, ready } = useAuth();
+  const { user, profile, profileError, ready, logout } = useAuth();
   const lock = useSignupLock();
 
   useEffect(() => {
     if (ready) startOfflineSync();
   }, [ready]);
+
+  if (user && profileError) {
+    return (
+      <InstallGate>
+        <ProfileReadError message={profileError} onLogout={() => void logout()} />
+      </InstallGate>
+    );
+  }
 
   let routes: JSX.Element;
   if (user === undefined || (!lock && user && profile === undefined)) {
@@ -2376,7 +3098,11 @@ export default function App() {
       </Routes>
     );
   } else if (!ready) {
-    return <Splash />;
+    return (
+      <InstallGate>
+        <WaitingForAccess />
+      </InstallGate>
+    );
   } else {
     const homePath = profile?.role === 'exco' ? '/exco' : '/home';
     routes = (
@@ -2889,7 +3615,15 @@ import { compressPhoto } from '../lib/image';
 import { Icon } from './ui';
 
 /** Take a selfie or choose a photo. Returns a small, square JPEG. */
-export function PhotoPicker({ value, onChange }: { value: Blob | null; onChange: (b: Blob | null, err?: string) => void }) {
+export function PhotoPicker({
+  value,
+  currentPhotoURL,
+  onChange,
+}: {
+  value: Blob | null;
+  currentPhotoURL?: string | null;
+  onChange: (b: Blob | null, err?: string) => void;
+}) {
   const cam = useRef<HTMLInputElement>(null);
   const gallery = useRef<HTMLInputElement>(null);
   const [preview, setPreview] = useState<string | null>(null);
@@ -2917,8 +3651,8 @@ export function PhotoPicker({ value, onChange }: { value: Blob | null; onChange:
         animate={{ scale: 1, rotate: 0 }}
         className="relative h-40 w-40 overflow-hidden rounded-full bg-green-light shadow-lift ring-8 ring-white"
       >
-        {preview ? (
-          <img src={preview} alt="Your profile" className="h-full w-full object-cover" />
+        {preview || currentPhotoURL ? (
+          <img src={preview ?? currentPhotoURL ?? undefined} alt="Your profile" className="h-full w-full object-cover" />
         ) : (
           <div className="grid h-full w-full place-items-center text-green">
             <Icon name="user" size={64} />
@@ -2965,7 +3699,8 @@ export function QRScan({ onResult, paused = false, className = '' }: Props) {
   const cb = useRef(onResult);
   const pausedRef = useRef(paused);
   const last = useRef<{ text: string; at: number }>({ text: '', at: 0 });
-  const [state, setState] = useState<'starting' | 'on' | 'error'>('starting');
+  const scannerRef = useRef<QrScanner | null>(null);
+  const [state, setState] = useState<'idle' | 'starting' | 'on' | 'error'>('idle');
   const [error, setError] = useState('');
 
   cb.current = onResult;
@@ -2992,23 +3727,47 @@ export function QRScan({ onResult, paused = false, className = '' }: Props) {
         maxScansPerSecond: 6,
       },
     );
-    scanner
-      .start()
-      .then(() => setState('on'))
-      .catch((e: unknown) => {
-        setState('error');
-        const msg = String((e as Error)?.message ?? e);
-        setError(
-          /permission|denied|NotAllowed/i.test(msg)
-            ? 'Camera permission is blocked. Allow the camera in your browser settings, or type the code instead.'
-            : 'Could not open the camera on this phone. Type the code instead.',
-        );
-      });
+    scannerRef.current = scanner;
     return () => {
       scanner.stop();
       scanner.destroy();
+      scannerRef.current = null;
     };
   }, []);
+
+  async function startCamera() {
+    if (!window.isSecureContext) {
+      setState('error');
+      setError('Camera access requires HTTPS. Open the secure CDS Pass website, or type the door code.');
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setState('error');
+      setError(/WhatsApp|Instagram|FBAN|FBAV|; wv\)/i.test(navigator.userAgent)
+        ? 'This in-app browser does not provide camera access. Open CDS Pass in Chrome or Safari, then try again.'
+        : 'This browser does not support camera access. Open CDS Pass in an updated Chrome or Safari browser.');
+      return;
+    }
+    setState('starting');
+    setError('');
+    try {
+      await scannerRef.current?.start();
+      setState('on');
+    } catch (e) {
+      setState('error');
+      const err = e as { name?: string; message?: string };
+      const msg = `${err.name ?? ''} ${err.message ?? e}`;
+      setError(
+        /NotAllowed|permission|denied/i.test(msg)
+          ? 'Camera permission is blocked. Allow camera access for this website in your browser settings, then try again.'
+          : /NotFound/i.test(msg)
+            ? 'No camera was found on this device. Type the door code instead.'
+            : /NotReadable|TrackStart/i.test(msg)
+              ? 'The camera is busy in another app. Close that app and try again.'
+              : `Could not open the camera. Check this site’s camera permission and try again. ${err.message ?? ''}`.trim(),
+      );
+    }
+  }
 
   return (
     <div className={`relative mx-auto max-w-[480px] overflow-hidden rounded-3xl bg-green-deep ${className}`}>
@@ -3018,8 +3777,13 @@ export function QRScan({ onResult, paused = false, className = '' }: Props) {
           <Spinner light size={32} />
         </div>
       )}
-      {state === 'error' && (
-        <div className="absolute inset-0 grid place-items-center p-6 text-center text-sm font-semibold text-white">{error}</div>
+      {state !== 'on' && state !== 'starting' && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center text-sm font-semibold text-white">
+          <p>{state === 'error' ? error : 'Tap below to let CDS Pass open your camera.'}</p>
+          <button type="button" onClick={() => void startCamera()} className="rounded-xl bg-white px-5 py-3 font-bold text-green">
+            {state === 'error' ? 'Try camera again' : 'Open camera'}
+          </button>
+        </div>
       )}
     </div>
   );
@@ -3648,6 +4412,8 @@ interface AuthState {
   user: User | null | undefined;
   /** undefined = loading, null = account exists but registration not finished */
   profile: Profile | null | undefined;
+  /** A read failure is different from a profile that does not exist. */
+  profileError: string | null;
   claims: Claims;
   /** true when the login token already carries the approval (needed for reading group data) */
   ready: boolean;
@@ -3660,6 +4426,7 @@ const Ctx = createContext<AuthState | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null | undefined>(undefined);
   const [profile, setProfile] = useState<Profile | null | undefined>(undefined);
+  const [profileError, setProfileError] = useState<string | null>(null);
   const [claims, setClaims] = useState<Claims>({});
 
   const refreshClaims = useCallback(async () => {
@@ -3675,6 +4442,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setUser(u);
         if (!u) {
           setProfile(null);
+          setProfileError(null);
           setClaims({});
           return;
         }
@@ -3689,19 +4457,35 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             return;
           }
         }
-        const t = await u.getIdTokenResult();
-        setClaims({ gid: t.claims.gid as string, role: t.claims.role as Claims['role'], approved: t.claims.approved === true });
+        try {
+          const t = await u.getIdTokenResult();
+          setClaims({ gid: t.claims.gid as string, role: t.claims.role as Claims['role'], approved: t.claims.approved === true });
+        } catch (e) {
+          // Offline at start-up: the refresh below (or the "Try again" screen) picks the claims up later.
+          console.warn('Could not read login permissions yet.', e);
+        }
       }),
     [],
   );
 
   useEffect(() => {
-    if (!user) return;
+    if (!user) {
+      setProfileError(null);
+      return;
+    }
     setProfile(undefined);
+    setProfileError(null);
     return onSnapshot(
       doc(db, 'users', user.uid),
-      (snap) => setProfile(snap.exists() ? ({ uid: snap.id, ...snap.data() } as Profile) : null),
-      () => setProfile(null),
+      (snap) => {
+        setProfileError(null);
+        setProfile(snap.exists() ? ({ uid: snap.id, ...snap.data() } as Profile) : null);
+      },
+      (error) => {
+        console.error('Could not load the signed-in user profile:', error);
+        setProfile(undefined);
+        setProfileError(error.message || 'Could not read your CDS profile.');
+      },
     );
   }, [user]);
 
@@ -3721,9 +4505,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await signOut(auth);
   }, []);
 
-  return (
-    <Ctx.Provider value={{ user, profile, claims, ready, refreshClaims, logout }}>{children}</Ctx.Provider>
-  );
+  return <Ctx.Provider value={{ user, profile, profileError, claims, ready, refreshClaims, logout }}>{children}</Ctx.Provider>;
 }
 
 export function useAuth(): AuthState {
@@ -3780,9 +4562,7 @@ export function useExcoDay() {
 import {
   collection,
   doc,
-  limit,
   onSnapshot,
-  orderBy,
   query,
   where,
   type DocumentData,
@@ -3790,6 +4570,7 @@ import {
 } from 'firebase/firestore';
 import { useEffect, useMemo, useState } from 'react';
 import { db } from '../lib/firebase';
+import { api } from '../lib/api';
 import { lagosDate } from '../lib/rules';
 import type { Attendee, Dues, DuesStatus, Group, LogEntry, Payment, Profile, Session } from '../lib/types';
 
@@ -3877,11 +4658,23 @@ export function useGroupMembers(gid: string | undefined) {
 }
 
 export function useLogs(gid: string | undefined, max = 50) {
-  const q = useMemo(
-    () => (gid ? query(collection(db, `groups/${gid}/logs`), orderBy('at', 'desc'), limit(max)) : null),
-    [gid, max],
-  );
-  return useList<LogEntry>(q, `logs:${gid}:${max}`);
+  const [logs, setLogs] = useState<LogEntry[] | undefined>(undefined);
+  useEffect(() => {
+    if (!gid) {
+      setLogs([]);
+      return;
+    }
+    let active = true;
+    setLogs(undefined);
+    void api.getLogs({ limit: max }).then((entries) => {
+      if (active) setLogs(entries);
+    }).catch((error) => {
+      console.error('Could not load activity history.', error);
+      if (active) setLogs([]);
+    });
+    return () => { active = false; };
+  }, [gid, max]);
+  return logs;
 }
 
 export function useActiveDues(gid: string | undefined) {
@@ -3921,7 +4714,7 @@ export function useMyPayments(gid: string | undefined, uid: string | undefined) 
 ```ts
 import { useEffect, useRef } from 'react';
 import { isTurn, tagLabel } from '../lib/rules';
-import { toast } from '../lib/toast';
+import { batchTurnToast } from '../lib/toast';
 import { useMe } from './useAuth';
 import { useGroup, useMyAttendee, useSession } from './useLive';
 
@@ -3932,7 +4725,7 @@ export function useMyDay() {
   const session = useSession(me.groupId);
   const att = useMyAttendee(me.groupId, me.uid);
 
-  const turn = !!att && isTurn(att, session?.batch);
+  const turn = session?.status === 'open' && !!att && isTurn(att, session.batch);
   const status: 'none' | 'waiting' | 'turn' | 'done' = !att ? 'none' : att.status === 'done' ? 'done' : turn ? 'turn' : 'waiting';
 
   // Buzz the phone the moment my batch is called (works whenever the site is open).
@@ -3940,7 +4733,7 @@ export function useMyDay() {
   useEffect(() => {
     if (turn && !wasTurn.current) {
       navigator.vibrate?.([400, 150, 400, 150, 400]);
-      toast("It's your turn!", 'success', 'Go to the thumbprint table and show your tag.');
+      batchTurnToast("It's your turn!", 'Go to the thumbprint table and show your tag.');
     }
     wasTurn.current = turn;
   }, [turn]);
@@ -4104,7 +4897,7 @@ export function useMyDay() {
 
 ```ts
 import { callable } from './firebase';
-import type { Attendee, Batch, PublicMember, TableCheckResponse } from './types';
+import type { Attendee, Batch, LogEntry, PublicMember, TableCheckResponse } from './types';
 
 interface ProfileInput {
   stateCode: string;
@@ -4115,9 +4908,17 @@ interface ProfileInput {
 type Who = { uid?: string; stateCode?: string };
 
 export const api = {
+  getLogs: callable<{ limit: number }, LogEntry[]>('getLogs'),
   // accounts
-  registerMember: callable<ProfileInput & { joinCode: string }, { ok: true; status: string; groupName: string }>('registerMember'),
-  createGroup: callable<ProfileInput & { group: { name: string; lga: string; state: string } }, { ok: true; groupId: string; joinCode: string }>('createGroup'),
+  registerMember: callable<ProfileInput & { joinCode: string }, { ok: true; status: 'pending' | 'approved'; role: 'member' | 'exco'; groupName: string }>('registerMember'),
+  registerPlatformAdmin: callable<
+    ProfileInput & { group: { name: string; lga: string; state: string } },
+    { ok: true; status: 'approved'; role: 'exco'; groupName: string; joinCode: string }
+  >('registerPlatformAdmin'),
+  createManagedGroup: callable<
+    { group: { name: string; lga: string; state: string }; mainExcoStateCode: string },
+    { ok: true; groupId: string; joinCode: string; mainExcoStateCode: string }
+  >('createManagedGroup'),
   approveMember: callable<Who & { approve: boolean }, { ok: true }>('approveMember'),
   setRole: callable<Who & { role: 'member' | 'exco' }, { ok: true }>('setRole'),
   resetPin: callable<Who & { pin: string }, { ok: true }>('resetPin'),
@@ -4138,6 +4939,7 @@ export const api = {
   excoCheckIn: callable<Who & { method: 'card' | 'manual' }, { number: number; already: boolean; member: PublicMember }>('excoCheckIn'),
   setPriority: callable<Who, { ok: true; pNumber: number }>('setPriority'),
   callNext: callable<{ mode: 'priority' | 'next' }, { ok: true; batch: Batch; notified: number; inBatch: number }>('callNext'),
+  testNotification: callable<Record<string, never>, { sent: number; registered: number; members: number }>('testNotification'),
   tableCheck: callable<Who, TableCheckResponse>('tableCheck'),
   markDone: callable<Who, { ok: true }>('markDone'),
 
@@ -4153,6 +4955,34 @@ export const api = {
   respondCash: callable<{ duesId: string; confirm: boolean }, { ok: true }>('respondCash'),
   remindDues: callable<{ duesId: string }, { ok: true; owing: number; notified: number }>('remindDues'),
 };
+```
+
+---
+
+### `web/src/lib/appConfig.ts`
+
+```ts
+/** Public browser configuration for CDS Pass. These values are bundled into the frontend. */
+const liveFirebaseConfig = {"apiKey":"AIzaSyAsuZMiSs6Qgu2p6fpQCzPXrYR_a1q9K8E","authDomain":"cds-pass.firebaseapp.com","projectId":"cds-pass","storageBucket":"cds-pass.firebasestorage.app","messagingSenderId":"214017403181","appId":"1:214017403181:web:92cf6330c143c58b10cba4"};
+// Used to show the group-creation option. The server separately verifies the signed-in account.
+export const PLATFORM_ADMIN_STATE_CODE = 'LA/26B/2578';
+const LIVE_API_URL = 'https://cds-pass.onrender.com';
+export const VAPID_KEY = 'BAkiu3AGhJLUKS4KCKSO7sbohw_VPIBV4zN80yJjiyEHiESvtsQuldI_BAzyefepYlAo_-OACNwMkmGu_auIAl4';
+export const SERVICE_FEE_PERCENT = 3;
+export const PAYSTACK_FEE_PERCENT = 1.5;
+
+/**
+ * Safe local testing. Only when you run `npm run dev` AND web/.env has VITE_USE_EMULATORS=true,
+ * the site talks to the Firebase emulators and the server on your PC (no real data, no real money).
+ * A production build (`npm run build`) ALWAYS uses the live values above.
+ */
+export const USE_EMULATORS = import.meta.env.DEV && import.meta.env.VITE_USE_EMULATORS === 'true';
+
+export const firebaseConfig = USE_EMULATORS
+  ? { ...liveFirebaseConfig, apiKey: 'demo-key', projectId: 'demo-cds-pass', authDomain: 'demo-cds-pass.firebaseapp.com' }
+  : liveFirebaseConfig;
+
+export const API_URL = USE_EMULATORS ? 'http://localhost:8787' : LIVE_API_URL;
 ```
 
 ---
@@ -4202,18 +5032,10 @@ import {
   persistentLocalCache,
   persistentMultipleTabManager,
 } from 'firebase/firestore';
-import { connectStorageEmulator, getStorage } from 'firebase/storage';
 
-const env = import.meta.env;
+import { API_URL, USE_EMULATORS, firebaseConfig } from './appConfig';
 
-export const firebaseConfig = {
-  apiKey: env.VITE_FB_API_KEY as string,
-  authDomain: env.VITE_FB_AUTH_DOMAIN as string,
-  projectId: env.VITE_FB_PROJECT_ID as string,
-  storageBucket: env.VITE_FB_STORAGE_BUCKET as string,
-  messagingSenderId: env.VITE_FB_MESSAGING_SENDER_ID as string,
-  appId: env.VITE_FB_APP_ID as string,
-};
+export { firebaseConfig, API_URL } from './appConfig';
 
 export const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
@@ -4223,15 +5045,18 @@ export const db = initializeFirestore(app, {
   localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
 });
 
-export const storage = getStorage(app);
-
-/** The CDS Pass API server (Express on Render). */
-export const API_URL = ((env.VITE_API_URL as string) || 'http://localhost:8787').replace(/\/$/, '');
-
-if (env.VITE_USE_EMULATORS === 'true') {
+if (USE_EMULATORS) {
   connectAuthEmulator(auth, 'http://localhost:9099', { disableWarnings: true });
   connectFirestoreEmulator(db, 'localhost', 8080);
-  connectStorageEmulator(storage, 'localhost', 9199);
+  console.info('CDS Pass: using local emulators and http://localhost:8787 (test mode).');
+}
+
+/** Render's free server sleeps; poke it as soon as someone opens sign-up or login so it's awake in time. */
+let woken = false;
+export function wakeServer() {
+  if (woken) return;
+  woken = true;
+  void fetch(`${API_URL}/health`, { cache: 'no-store' }).catch(() => undefined);
 }
 
 let wakeNoticeShown = false;
@@ -4249,17 +5074,26 @@ export function callable<Req = unknown, Res = unknown>(name: string) {
       wakeNoticeShown = true;
       void import('./toast').then(({ toast }) => toast('Server is waking up…', 'info', 'This can take up to a minute the first time. Please wait.'));
     }, 6000);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 90_000);
     let res: Response;
     try {
       res = await fetch(`${API_URL}/api/${name}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
         body: JSON.stringify({ data }),
+        signal: controller.signal,
       });
     } catch {
+      if (controller.signal.aborted) {
+        throw Object.assign(new Error('The server took too long to respond. Your account may already have been created. Please try signing in, or continue signup to finish your profile.'), {
+          code: 'functions/deadline-exceeded',
+        });
+      }
       throw Object.assign(new Error('No internet connection.'), { code: 'functions/unavailable' });
     } finally {
       clearTimeout(slow);
+      clearTimeout(timeout);
     }
     const json = (await res.json().catch(() => ({}))) as { result?: Res; error?: { status?: string; message?: string } };
     if (!res.ok) {
@@ -4287,7 +5121,7 @@ export function errorText(e: unknown): string {
     case 'functions/unavailable':
       return 'No internet connection. Check your data and try again.';
     case 'functions/deadline-exceeded':
-      return 'The server did not respond. Please try again in a moment.';
+      return err.message ?? 'The server did not respond. Please try again in a moment.';
   }
   const msg = err?.message ?? 'Something went wrong.';
   return msg.replace(/^Firebase:\s*/, '').replace(/\s*\(.*\)\.?$/, '');
@@ -4427,18 +5261,23 @@ export function useInstallState() {
 import { arrayUnion, doc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { getMessaging, getToken, isSupported, onMessage } from 'firebase/messaging';
 import { app, db } from './firebase';
+import { VAPID_KEY } from './appConfig';
 import { registerServiceWorker } from './sw';
-import { toast } from './toast';
+import { batchTurnToast, toast } from './toast';
 
-export type PushState = 'unsupported' | 'default' | 'granted' | 'denied';
+export type PushState = 'unsupported' | 'default' | 'granted' | 'enabled' | 'denied';
 
-export async function pushState(): Promise<PushState> {
+export async function pushState(uid?: string): Promise<PushState> {
   if (!('Notification' in window) || !(await isSupported())) return 'unsupported';
+  if (Notification.permission === 'granted' && uid && localStorage.getItem(`cdspass:push:${uid}`) === 'on') return 'enabled';
   return Notification.permission as PushState;
 }
 
 /** Asks permission, gets an FCM token and saves it on the member's profile. */
 export async function enableNotifications(uid: string): Promise<void> {
+  if (!VAPID_KEY.trim()) {
+    throw new Error('Push alerts are not configured yet. The site owner must add the Firebase Web Push key before alerts can work.');
+  }
   if (!(await isSupported())) {
     throw new Error(
       /iPhone|iPad/.test(navigator.userAgent)
@@ -4452,12 +5291,12 @@ export async function enableNotifications(uid: string): Promise<void> {
   const reg = await registerServiceWorker();
   if (!reg) throw new Error('Could not set up notifications on this browser.');
   const token = await getToken(getMessaging(app), {
-    vapidKey: import.meta.env.VITE_FB_VAPID_KEY as string,
+    vapidKey: VAPID_KEY,
     serviceWorkerRegistration: reg,
   });
   if (!token) throw new Error('Could not set up notifications. Try again.');
   await updateDoc(doc(db, 'users', uid), { fcmTokens: arrayUnion(token), updatedAt: serverTimestamp() });
-  localStorage.setItem('cdspass:push', 'on');
+  localStorage.setItem(`cdspass:push:${uid}`, 'on');
 }
 
 /** When the site is open, show incoming pushes as an in-app toast instead. */
@@ -4466,7 +5305,8 @@ export async function listenForegroundPush() {
   onMessage(getMessaging(app), (payload) => {
     const d = payload.data ?? {};
     navigator.vibrate?.([300, 120, 300]);
-    toast(d.title ?? 'CDS Pass', 'success', d.body);
+    if (d.kind === 'batch-call') batchTurnToast(d.title ?? "It's your turn!", d.body);
+    else toast(d.title ?? 'CDS Pass', 'success', d.body);
   });
 }
 ```
@@ -4476,13 +5316,12 @@ export async function listenForegroundPush() {
 ### `web/src/lib/money.ts`
 
 ```ts
+import { PAYSTACK_FEE_PERCENT, SERVICE_FEE_PERCENT } from './appConfig';
+
 export const naira = (kobo: number) =>
   `₦${(kobo / 100).toLocaleString('en-NG', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
 
 /** Same maths as duesCharges on the server: dues + 3% service + Paystack's exact charge, rounded up to the naira. */
-const SERVICE_FEE_PERCENT = Number(import.meta.env.VITE_SERVICE_FEE_PERCENT ?? 3);
-const PAYSTACK_FEE_PERCENT = Number(import.meta.env.VITE_PAYSTACK_FEE_PERCENT ?? 1.5);
-
 export function duesCharges(amountKobo: number) {
   const servicePercent = SERVICE_FEE_PERCENT;
   const paystackPercent = PAYSTACK_FEE_PERCENT;
@@ -4986,6 +5825,7 @@ type Listener = (items: ToastItem[]) => void;
 let items: ToastItem[] = [];
 const listeners = new Set<Listener>();
 let nextId = 1;
+let lastBatchTurnToastAt = 0;
 
 function emit() {
   listeners.forEach((l) => l(items));
@@ -4996,6 +5836,14 @@ export function toast(title: string, kind: ToastKind = 'info', body?: string) {
   items = [...items, { id, title, body, kind }].slice(-3);
   emit();
   setTimeout(() => dismiss(id), kind === 'error' ? 6000 : 4000);
+}
+
+/** Firestore turn updates and foreground FCM can report the same batch call. */
+export function batchTurnToast(title: string, body?: string) {
+  const now = Date.now();
+  if (now - lastBatchTurnToastAt < 5000) return;
+  lastBatchTurnToastAt = now;
+  toast(title, 'success', body);
 }
 
 export function dismiss(id: number) {
@@ -5037,6 +5885,9 @@ export interface Profile {
 
 export interface Group {
   id: string;
+  createdBy: string;
+  mainExcoUid?: string | null;
+  mainExcoStateCode?: string | null;
   name: string;
   lga: string;
   state: string;
@@ -5093,8 +5944,8 @@ export type Batch =
 export interface Session {
   id: string;
   status: 'open' | 'closed';
-  nextNumber: number;
-  nextPriority: number;
+  nextNumber?: number;
+  nextPriority?: number;
   lastTo: number;
   batchSeq: number;
   batch: Batch | null;
@@ -5138,6 +5989,7 @@ export interface TableCheckResponse {
 export interface LogEntry {
   id: string;
   at?: Timestamp;
+  atMs?: number | null;
   by: string;
   action: string;
   target?: string;
@@ -5151,14 +6003,46 @@ export interface LogEntry {
 ### `web/src/lib/upload.ts`
 
 ```ts
-import { getDownloadURL, ref, uploadBytes } from 'firebase/storage';
-import { storage } from './firebase';
+import { API_URL, auth } from './firebase';
 
-/** Uploads a compressed profile picture and returns its public URL. */
-export async function uploadAvatar(uid: string, blob: Blob): Promise<string> {
-  const r = ref(storage, `avatars/${uid}/${Date.now()}.jpg`);
-  await uploadBytes(r, blob, { contentType: 'image/jpeg', cacheControl: 'public,max-age=31536000' });
-  return getDownloadURL(r);
+/**
+ * Uploads a compressed profile picture to Cloudinary (through our API server)
+ * and returns its public URL. Only this URL is saved in the database.
+ *
+ * Signature is unchanged (uid, blob), so Signup.tsx and Profile.tsx need no edits.
+ * The server uses the login token to know who the photo belongs to.
+ */
+export async function uploadAvatar(_uid: string, blob: Blob): Promise<string> {
+  const token = await auth.currentUser?.getIdToken();
+  if (!token) throw new Error('Please log in again.');
+
+  const form = new FormData();
+  form.append('file', blob, 'avatar.jpg');
+
+  let res: Response;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
+  try {
+    res = await fetch(`${API_URL}/upload/avatar`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` }, // no Content-Type: the browser sets it for FormData
+      body: form,
+      signal: controller.signal,
+    });
+  } catch {
+    if (controller.signal.aborted) {
+      throw Object.assign(new Error('Photo upload took too long. Check your connection and try again.'), { code: 'functions/deadline-exceeded' });
+    }
+    throw Object.assign(new Error('No internet connection.'), { code: 'functions/unavailable' });
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const json = (await res.json().catch(() => ({}))) as { url?: string; error?: { message?: string } };
+  if (!res.ok || !json.url) {
+    throw new Error(json.error?.message ?? 'Could not upload your photo. Please try again.');
+  }
+  return json.url;
 }
 ```
 
@@ -5204,10 +6088,10 @@ createRoot(document.getElementById('root')!).render(
 ```tsx
 import { signInWithEmailAndPassword } from 'firebase/auth';
 import { motion } from 'framer-motion';
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { Button, ErrorBox, Field, TopBar } from '../components/ui';
-import { auth, errorText } from '../lib/firebase';
+import { auth, errorText, wakeServer } from '../lib/firebase';
 import { normalizeStateCode, stateCodeToEmail } from '../lib/rules';
 
 export default function Login() {
@@ -5215,6 +6099,9 @@ export default function Login() {
   const [pin, setPin] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+
+  // Wake the free Render server early so the first screen after login loads quickly.
+  useEffect(() => wakeServer(), []);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -5393,19 +6280,18 @@ export default function Pending() {
 ```tsx
 import { createUserWithEmailAndPassword } from 'firebase/auth';
 import { motion } from 'framer-motion';
-import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import { PhotoPicker } from '../components/PhotoPicker';
 import { Button, ErrorBox, Field, TopBar } from '../components/ui';
 import { useAuth } from '../hooks/useAuth';
 import { api } from '../lib/api';
-import { auth, errorText } from '../lib/firebase';
+import { auth, errorText, wakeServer } from '../lib/firebase';
+import { PLATFORM_ADMIN_STATE_CODE } from '../lib/appConfig';
 import { normalizePhone, normalizeStateCode, stateCodeToEmail } from '../lib/rules';
 import { setSignupLock } from '../lib/signupLock';
 import { toast } from '../lib/toast';
 import { uploadAvatar } from '../lib/upload';
-
-type Mode = 'join' | 'create';
 
 /** State code is recoverable from the hidden login email (la26b1142@cdspass.app). */
 function stateCodeFromCurrentUser(): string {
@@ -5414,7 +6300,8 @@ function stateCodeFromCurrentUser(): string {
 }
 
 export default function Signup({ finish = false }: { finish?: boolean }) {
-  const { refreshClaims, logout } = useAuth();
+  const { logout, profile: savedProfile, claims } = useAuth();
+  const navigate = useNavigate();
   const steps = finish ? ['Details', 'Photo', 'CDS group'] : ['Details', 'Photo', 'CDS group', 'PIN'];
   const [rawStep, setStep] = useState(0);
   // If sign-up switches to "finish" mode (fewer steps), never point past the last step.
@@ -5425,15 +6312,44 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
   const [fullName, setFullName] = useState('');
   const [phone, setPhone] = useState('');
   const [photo, setPhoto] = useState<Blob | null>(null);
-  const [mode, setMode] = useState<Mode>('join');
   const [joinCode, setJoinCode] = useState('');
+  // Only the platform admin may start a brand-new group while signing up (first-time setup).
+  const [startGroup, setStartGroup] = useState(false);
   const [group, setGroup] = useState({ name: '', lga: '', state: '' });
+  const isPlatformAdmin = normalizeStateCode(stateCode) === PLATFORM_ADMIN_STATE_CODE;
+  const creatingGroup = isPlatformAdmin && startGroup;
+  /** Set once the server has saved everything; we then wait for the profile to arrive before leaving. */
+  const [doneTo, setDoneTo] = useState<string | null>(null);
   const [pin, setPin] = useState('');
   const [pin2, setPin2] = useState('');
   const [consent, setConsent] = useState(false);
 
   const [error, setError] = useState('');
   const [busy, setBusy] = useState('');
+
+  // Wake the free Render server now, so it is ready by the time the form is submitted.
+  useEffect(() => wakeServer(), []);
+
+  // Never leave the sign-up lock on if this screen goes away (e.g. log out).
+  useEffect(() => () => setSignupLock(false), []);
+
+  // Leave only when the saved profile (and, for excos, the new permissions) has reached this phone.
+  // Leaving earlier made the app flash back to "Finish signing up".
+  useEffect(() => {
+    if (!doneTo) return;
+    const profileReady = !!savedProfile;
+    const excoReady = savedProfile?.status !== 'approved' || (claims.approved === true && claims.role === savedProfile.role);
+    const go = () => {
+      setSignupLock(false);
+      navigate(doneTo, { replace: true });
+    };
+    if (profileReady && excoReady) {
+      go();
+      return;
+    }
+    const t = setTimeout(go, 12000); // safety net: never stay stuck on this screen
+    return () => clearTimeout(t);
+  }, [doneTo, savedProfile, claims.approved, claims.role, navigate]);
 
   function validate(i: number): string {
     if (i === 0) {
@@ -5443,9 +6359,10 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
     }
     if (i === 1 && !photo) return 'Add a profile picture.';
     if (i === 2) {
-      if (mode === 'join' && joinCode.trim().length !== 6) return 'Enter the 6-character CDS group code from your exco.';
-      if (mode === 'create' && (group.name.trim().length < 3 || group.lga.trim().length < 2 || group.state.trim().length < 2))
-        return 'Fill in the CDS group name, LGA and state.';
+      if (creatingGroup) {
+        if (group.name.trim().length < 3 || group.lga.trim().length < 2 || group.state.trim().length < 2)
+          return 'Fill in the CDS group name, LGA and state.';
+      } else if (joinCode.trim().length !== 6) return 'Enter the 6-character CDS group code from your exco.';
     }
     if (i === 3) {
       if (!/^\d{6}$/.test(pin)) return 'Your PIN must be 6 digits.';
@@ -5475,33 +6392,45 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
 
   async function submit() {
     const sc = normalizeStateCode(stateCode)!;
+    setError('');
     setSignupLock(finish ? 'finish' : 'signup');
     try {
       let uid = auth.currentUser?.uid;
-      if (!finish) {
+      if (!uid) {
         setBusy('Creating your account…');
         uid = (await createUserWithEmailAndPassword(auth, stateCodeToEmail(sc), pin)).user.uid;
       }
-      if (!uid) throw new Error('Please log in again.');
 
       setBusy('Uploading your photo…');
       const photoURL = await uploadAvatar(uid, photo!);
 
       setBusy('Saving your details…');
       const profile = { stateCode: sc, fullName: fullName.trim(), phone: normalizePhone(phone)!, photoURL };
-      if (mode === 'join') {
-        const r = await api.registerMember({ ...profile, joinCode: joinCode.trim().toUpperCase() });
-        toast(`Joined ${r.groupName}`, 'success', 'An exco will approve you at your next CDS.');
-      } else {
-        const r = await api.createGroup({ ...profile, group });
-        toast('CDS group created', 'success', `Share this group code with your members: ${r.joinCode}`);
+      let to = '/pending';
+      try {
+        const r = creatingGroup
+          ? await api.registerPlatformAdmin({ ...profile, group })
+          : await api.registerMember({ ...profile, joinCode: joinCode.trim().toUpperCase() });
+        if (r.status === 'approved' && r.role === 'exco') {
+          to = '/exco';
+          if ('joinCode' in r) toast(`${r.groupName} is ready`, 'success', `Share group code ${r.joinCode} with your members.`);
+          else toast(`You are the main exco for ${r.groupName}`, 'success', 'You can now set up the group and promote other members.');
+        } else {
+          toast(`Joined ${r.groupName}`, 'success', 'An exco will approve you at your next CDS.');
+        }
+      } catch (e) {
+        // A slow first try may have finished on the server after the phone gave up. Then the profile
+        // already exists, and that is a success, not an error.
+        if ((e as { code?: string }).code !== 'functions/already-exists' || !/already registered/i.test(String((e as Error).message))) throw e;
       }
-      await refreshClaims();
+      setBusy('Opening your account…');
+      setDoneTo(to);
     } catch (e) {
+      // The login may exist now even though the profile doesn't. Keep everything typed so far and
+      // let them press the button again; it continues from where it stopped.
+      setSignupLock(auth.currentUser ? 'finish' : false);
       setError(errorText(e));
       setBusy('');
-    } finally {
-      setSignupLock(false);
     }
   }
 
@@ -5592,19 +6521,30 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
                   <h2 className="text-2xl font-extrabold">Your CDS group</h2>
                   <p className="text-muted">Ask your CDS exco for the group code.</p>
                 </div>
-                <div className="grid grid-cols-2 gap-2 rounded-2xl bg-line p-1.5">
-                  {(['join', 'create'] as Mode[]).map((m) => (
-                    <button
-                      key={m}
-                      type="button"
-                      onClick={() => setMode(m)}
-                      className={`h-12 rounded-xl text-sm font-bold transition-colors ${mode === m ? 'bg-green text-white shadow-card' : 'text-muted'}`}
-                    >
-                      {m === 'join' ? 'Join with code' : "I'm an exco"}
-                    </button>
-                  ))}
-                </div>
-                {mode === 'join' ? (
+                {isPlatformAdmin && (
+                  <div className="grid grid-cols-2 gap-2 rounded-2xl bg-line p-1.5">
+                    {[false, true].map((m) => (
+                      <button
+                        key={String(m)}
+                        type="button"
+                        onClick={() => setStartGroup(m)}
+                        className={`h-12 rounded-xl text-sm font-bold transition-colors ${startGroup === m ? 'bg-green text-white shadow-card' : 'text-muted'}`}
+                      >
+                        {m ? 'Start my CDS group' : 'Join with code'}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {creatingGroup ? (
+                  <>
+                    <Field label="CDS group name" placeholder="Digital Skills CDS" value={group.name} onChange={(e) => setGroup({ ...group, name: e.target.value })} />
+                    <Field label="LGA" placeholder="Ikorodu" value={group.lga} onChange={(e) => setGroup({ ...group, lga: e.target.value })} />
+                    <Field label="State" placeholder="Lagos" value={group.state} onChange={(e) => setGroup({ ...group, state: e.target.value })} />
+                    <p className="rounded-2xl bg-warn-bg px-4 py-3 text-sm text-warn">
+                      Platform admin setup: you become this group's main exco. Create other groups later in Exco → Settings.
+                    </p>
+                  </>
+                ) : (
                   <Field
                     label="CDS group code"
                     placeholder="K7Q2MX"
@@ -5614,20 +6554,6 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
                     value={joinCode}
                     onChange={(e) => setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))}
                   />
-                ) : (
-                  <>
-                    <Field
-                      label="CDS group name"
-                      placeholder="Digital Skills CDS"
-                      value={group.name}
-                      onChange={(e) => setGroup({ ...group, name: e.target.value })}
-                    />
-                    <Field label="LGA" placeholder="Ikorodu" value={group.lga} onChange={(e) => setGroup({ ...group, lga: e.target.value })} />
-                    <Field label="State" placeholder="Lagos" value={group.state} onChange={(e) => setGroup({ ...group, state: e.target.value })} />
-                    <p className="rounded-2xl bg-warn-bg px-4 py-3 text-sm text-warn">
-                      You'll be the first exco of this group and can add other excos later.
-                    </p>
-                  </>
                 )}
               </>
             )}
@@ -5825,7 +6751,7 @@ export default function CallBatch() {
   const batch = session?.batch ?? null;
   const size = group?.batchSize ?? 20;
   const nextFrom = (session?.lastTo ?? 0) + 1;
-  const lastNumber = (session?.nextNumber ?? 1) - 1;
+  const lastNumber = Math.max((session?.nextNumber ?? 1) - 1, ...(attendees ?? []).map((a) => a.number), 0);
 
   const inCurrent =
     batch?.kind === 'regular'
@@ -5865,7 +6791,7 @@ export default function CallBatch() {
               className="relative text-6xl font-extrabold"
               style={{ textShadow: '0 4px 0 #064726, 0 12px 24px rgba(0,0,0,.3)' }}
             >
-              {batchLabel(batch)}
+              {open ? batchLabel(batch) : session?.status === 'closed' ? 'STOPPED' : '—'}
             </motion.p>
           </AnimatePresence>
           {batch && (
@@ -5876,6 +6802,9 @@ export default function CallBatch() {
         </div>
 
         {!open && <ErrorBox>Today's meeting is not open.</ErrorBox>}
+        {!open && session?.status === 'closed' && (
+          <p className="text-center text-sm text-muted">Batch calls and member turn alerts are paused until an exco opens the meeting again.</p>
+        )}
 
         <div className="card space-y-3">
           <div className="flex items-center justify-between">
@@ -6576,7 +7505,9 @@ function DuesDetail({ dues }: { dues: Dues }) {
 
 export default function DuesAdmin() {
   const me = useMe();
+  const group = useGroup(me.groupId);
   const dues = useActiveDues(me.groupId);
+  const isMainExco = (group?.mainExcoUid ?? group?.createdBy) === me.uid;
   const [creating, setCreating] = useState(false);
 
   return (
@@ -6584,13 +7515,22 @@ export default function DuesAdmin() {
       <ExcoHeader title="Dues" sub="Online and cash payments" />
       <Page className="space-y-4">
         <PayoutAccount />
-        {creating ? (
+        {isMainExco && (creating ? (
           <NewDues onDone={() => setCreating(false)} />
         ) : (
           <Button onClick={() => setCreating(true)}>+ New dues</Button>
+        ))}
+        {group && !isMainExco && (
+          <p className="rounded-2xl bg-line px-4 py-3 text-sm text-muted">
+            Only the main exco who created this CDS group can create new dues. You can still manage existing dues here.
+          </p>
         )}
         {dues?.map((d) => <DuesDetail key={d.id} dues={d} />)}
-        {dues && dues.length === 0 && !creating && <p className="text-center text-sm text-muted">No open dues. Create one above.</p>}
+        {dues && dues.length === 0 && !creating && (
+          <p className="text-center text-sm text-muted">
+            {isMainExco ? 'No open dues. Create one above.' : 'No open dues. Ask the main exco to create one.'}
+          </p>
+        )}
         <p className="text-center text-xs text-muted">
           Cash only counts after the member confirms it on their phone. Every cash record is in the activity log.
         </p>
@@ -6614,7 +7554,7 @@ import { MemberCard } from '../../components/MemberCard';
 import { QRScan } from '../../components/QRScan';
 import { Button, ErrorBox, Icon, Page, Pill } from '../../components/ui';
 import { useMe } from '../../hooks/useAuth';
-import { useGroupMembers } from '../../hooks/useLive';
+import { useGroup, useGroupMembers } from '../../hooks/useLive';
 import { api } from '../../lib/api';
 import { errorText } from '../../lib/firebase';
 import { parseQR } from '../../lib/rules';
@@ -6625,7 +7565,9 @@ type Filter = 'pending' | 'approved' | 'excos';
 
 export default function Members() {
   const me = useMe();
+  const group = useGroup(me.groupId);
   const members = useGroupMembers(me.groupId);
+  const isMainExco = (group?.mainExcoUid ?? group?.createdBy) === me.uid;
   const [filter, setFilter] = useState<Filter>('pending');
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<Profile | null>(null);
@@ -6706,7 +7648,7 @@ export default function Members() {
                     </Button>
                   </>
                 )}
-                {selected.status === 'approved' && selected.uid !== me.uid && (
+                {selected.status === 'approved' && selected.uid !== me.uid && isMainExco && (
                   <Button
                     variant="outline"
                     loading={busy === 'role'}
@@ -6720,6 +7662,11 @@ export default function Members() {
                   >
                     {selected.role === 'exco' ? 'Remove as exco' : 'Make exco'}
                   </Button>
+                )}
+                {selected.status === 'approved' && selected.uid !== me.uid && group && !isMainExco && (
+                  <p className="rounded-xl bg-line px-3 py-2 text-sm text-muted">
+                    Only the main exco who created this CDS group can change exco roles.
+                  </p>
                 )}
                 {selected.status === 'approved' && (
                   <Button variant="ghost" loading={busy === 'pin'} onClick={resetPin}>
@@ -6870,6 +7817,8 @@ import { api } from '../../lib/api';
 import { getPosition } from '../../lib/device';
 import { errorText } from '../../lib/firebase';
 import { toast } from '../../lib/toast';
+import { normalizeStateCode } from '../../lib/rules';
+import { PLATFORM_ADMIN_STATE_CODE } from '../../lib/appConfig';
 
 const actionText: Record<string, string> = {
   group_created: 'Created the group',
@@ -6881,6 +7830,7 @@ const actionText: Record<string, string> = {
   settings_changed: 'Changed settings',
   session_opened: 'Opened the meeting',
   session_closed: 'Closed the meeting',
+  notification_test: 'Tested push notifications',
   manual_checkin: 'Manual check-in',
   priority_given: 'Gave a priority tag',
   batch_called: 'Called a batch',
@@ -6903,6 +7853,8 @@ export default function Settings() {
   const [radius, setRadius] = useState('300');
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
+  const [newGroup, setNewGroup] = useState({ name: '', lga: '', state: '', mainExcoStateCode: '' });
+  const [createdGroup, setCreatedGroup] = useState<{ joinCode: string; mainExcoStateCode: string } | null>(null);
 
   async function run(label: string, fn: () => Promise<unknown>, ok: string) {
     setError('');
@@ -6923,6 +7875,45 @@ export default function Settings() {
     setBusy('');
     if (!pos) return setError('Could not get your location. Turn on location and try again.');
     await run('venue', () => api.updateGroupSettings({ venue: { ...pos, radiusM: Number(radius) || 300 } }), 'Venue saved. Members must be within range to scan in.');
+  }
+
+  async function testNotification() {
+    setError('');
+    setBusy('notification');
+    try {
+      const result = await api.testNotification({});
+      if (!result.registered) {
+        setError(`No approved members have alerts registered yet (${result.members} members in the group). Members need to turn on alerts in their Profile.`);
+      } else if (!result.sent) {
+        setError(`Firebase delivered 0 of ${result.registered} registered member devices. Members should re-enable alerts; check the server logs if this continues.`);
+      } else {
+        toast('Test notification sent', 'success', `${result.sent} devices notified across ${result.members} approved members.`);
+      }
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function createGroup() {
+    setError('');
+    const mainExcoStateCode = normalizeStateCode(newGroup.mainExcoStateCode);
+    if (!mainExcoStateCode) return setError('Enter a valid state code for the new group’s main exco.');
+    setBusy('create-group');
+    try {
+      const result = await api.createManagedGroup({
+        group: { name: newGroup.name, lga: newGroup.lga, state: newGroup.state },
+        mainExcoStateCode,
+      });
+      setCreatedGroup({ joinCode: result.joinCode, mainExcoStateCode: result.mainExcoStateCode });
+      setNewGroup({ name: '', lga: '', state: '', mainExcoStateCode: '' });
+      toast('CDS group created', 'success', `Share code ${result.joinCode} with the appointed main exco.`);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy('');
+    }
   }
 
   return (
@@ -6979,6 +7970,54 @@ export default function Settings() {
           <ThemeToggle />
         </div>
 
+        <div className="card space-y-3">
+          <p className="font-bold">Test notifications</p>
+          <p className="text-sm text-muted">The main exco can send a test alert to every approved CDS member who has enabled notifications.</p>
+          {(group?.mainExcoUid ?? group?.createdBy) === me.uid ? (
+            <Button variant="ghost" loading={busy === 'notification'} onClick={testNotification}>
+              Send test notification to all members
+            </Button>
+          ) : (
+            <p className="text-sm font-semibold text-muted">Only the main exco can send the group test notification.</p>
+          )}
+        </div>
+
+        {me.stateCode === PLATFORM_ADMIN_STATE_CODE && (
+          <div className="card space-y-3">
+            <p className="font-bold">Create another CDS group</p>
+            <p className="text-sm text-muted">Choose the member who will own this group as its main exco. Your current group membership will stay as it is.</p>
+            <Field label="New CDS group name" placeholder="Digital Skills CDS" value={newGroup.name} onChange={(e) => setNewGroup({ ...newGroup, name: e.target.value })} />
+            <Field label="LGA" placeholder="Ikorodu" value={newGroup.lga} onChange={(e) => setNewGroup({ ...newGroup, lga: e.target.value })} />
+            <Field label="State" placeholder="Lagos" value={newGroup.state} onChange={(e) => setNewGroup({ ...newGroup, state: e.target.value })} />
+            <Field
+              label="Main exco state code"
+              placeholder="LA/26B/1142"
+              autoCapitalize="characters"
+              value={newGroup.mainExcoStateCode}
+              onChange={(e) => setNewGroup({ ...newGroup, mainExcoStateCode: e.target.value })}
+            />
+            <Button loading={busy === 'create-group'} onClick={createGroup}>Create CDS group</Button>
+            {createdGroup && (
+              <div className="rounded-2xl bg-green-light p-4 text-center">
+                <p className="text-sm font-semibold text-muted">Give this group code to {createdGroup.mainExcoStateCode}</p>
+                <p className="my-2 text-3xl font-extrabold tracking-[0.3em] text-green">{createdGroup.joinCode}</p>
+                <p className="text-xs text-muted">They join with this code and their state code. CDS Pass will make them the approved main exco automatically.</p>
+                <Button
+                  className="mt-3"
+                  variant="ghost"
+                  onClick={() => {
+                    const text = `You are the main exco for a CDS Pass group. Open ${location.origin}, sign up with state code ${createdGroup.mainExcoStateCode}, and join using group code ${createdGroup.joinCode}.`;
+                    if (navigator.share) void navigator.share({ text }).catch(() => undefined);
+                    else void navigator.clipboard?.writeText(text).then(() => toast('Instructions copied', 'success'));
+                  }}
+                >
+                  Share setup instructions
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+
         <ErrorBox>{error}</ErrorBox>
 
         <div className="card !p-0">
@@ -6993,7 +8032,7 @@ export default function Settings() {
                   {l.stateCode ? ` · ${l.stateCode}` : ''}
                   {typeof l.reason === 'string' ? ` · ${String(l.reason).replace(/_/g, ' ')}` : ''}
                 </p>
-                <p className="text-xs text-muted">{l.at?.toDate().toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' })}</p>
+                <p className="text-xs text-muted">{l.atMs ? new Date(l.atMs).toLocaleString('en-NG', { dateStyle: 'medium', timeStyle: 'short' }) : 'Time unavailable'}</p>
               </li>
             ))}
           </ul>
@@ -7412,8 +8451,14 @@ export default function Home() {
 
           {att && (
             <>
-              <Pill tone={status === 'turn' ? 'green' : status === 'done' ? 'green' : 'warn'}>
-                {status === 'turn' ? "It's your turn" : status === 'done' ? 'Thumbprinted ✓' : 'Checked in'}
+              <Pill tone={session?.status === 'closed' ? 'muted' : status === 'turn' ? 'green' : status === 'done' ? 'green' : 'warn'}>
+                {session?.status === 'closed'
+                  ? 'Meeting ended'
+                  : status === 'turn'
+                    ? "It's your turn"
+                    : status === 'done'
+                      ? 'Thumbprinted ✓'
+                      : 'Checked in'}
               </Pill>
               <span className="text-xs font-bold tracking-[0.3em] text-muted">YOUR NUMBER</span>
               <motion.span
@@ -7569,7 +8614,7 @@ export default function MyTag() {
           </Button>
         </div>
 
-        {att ? (
+        {att && session?.status !== 'closed' ? (
           <motion.div className="grid grid-cols-2 gap-3">
             <div className="card !p-4">
               <p className="text-xs font-semibold text-muted">Now calling</p>
@@ -7586,15 +8631,20 @@ export default function MyTag() {
               </p>
             </div>
           </motion.div>
+        ) : att ? (
+          <div className="card text-center">
+            <p className="font-extrabold">Today's meeting has ended</p>
+            <p className="mt-1 text-sm text-muted">Your attendance record is saved. Check back when your exco opens another meeting.</p>
+          </div>
         ) : (
           <Link to="/scan" className="block rounded-2xl bg-green py-4 text-center font-bold text-white">
             Scan in to get your number
           </Link>
         )}
 
-        <p className={`text-center text-sm ${status === 'turn' ? 'text-white' : 'text-muted'}`}>
+        {session?.status !== 'closed' && <p className={`text-center text-sm ${status === 'turn' ? 'text-white' : 'text-muted'}`}>
           At the table, tap the card to show your QR. The exco scans it and checks your NYSC ID card.
-        </p>
+        </p>}
       </Page>
     </div>
   );
@@ -7630,15 +8680,15 @@ export default function Profile() {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    void pushState().then(setPush);
-  }, []);
+    void pushState(me.uid).then(setPush);
+  }, [me.uid]);
 
   async function turnOnPush() {
     setError('');
     setBusy('push');
     try {
       await enableNotifications(me.uid);
-      setPush('granted');
+      setPush('enabled');
       toast('Notifications on', 'success', "We'll buzz you when your batch is called.");
     } catch (e) {
       setError(errorText(e));
@@ -7670,7 +8720,7 @@ export default function Profile() {
       <TopBar title="Profile" sub={group?.name} />
       <Page className="space-y-4">
         <div className="card">
-          <PhotoPicker value={photo} onChange={(b, err) => (setPhoto(b), setError(err ?? ''))} />
+          <PhotoPicker value={photo} currentPhotoURL={me.photoURL} onChange={(b, err) => (setPhoto(b), setError(err ?? ''))} />
           {!photo && me.photoURL && (
             <p className="mt-3 text-center text-xs text-muted">Your current photo is shown on your tag. Pick a new one to replace it.</p>
           )}
@@ -7699,8 +8749,10 @@ export default function Profile() {
             <div className="flex-1">
               <p className="font-bold">Batch alerts</p>
               <p className="text-sm text-muted">
-                {push === 'granted'
-                  ? 'On. Your phone buzzes when your batch is called.'
+                {push === 'enabled'
+                  ? 'Enabled on this device. Your phone can buzz when your batch is called.'
+                  : push === 'granted'
+                    ? 'Browser permission is allowed. Connect this device to turn on batch alerts.'
                   : push === 'denied'
                     ? 'Blocked. Allow notifications in your browser settings.'
                     : push === 'unsupported'
@@ -7709,7 +8761,7 @@ export default function Profile() {
               </p>
             </div>
           </div>
-          {push !== 'granted' && push !== 'denied' && (
+          {push !== 'enabled' && push !== 'denied' && push !== 'unsupported' && (
             <Button variant="ghost" loading={busy === 'push'} onClick={turnOnPush}>
               Turn on alerts
             </Button>

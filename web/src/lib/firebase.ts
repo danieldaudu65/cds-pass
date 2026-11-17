@@ -1,12 +1,13 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth } from 'firebase/auth';
+import { connectAuthEmulator, getAuth } from 'firebase/auth';
 import {
+  connectFirestoreEmulator,
   initializeFirestore,
   persistentLocalCache,
   persistentMultipleTabManager,
 } from 'firebase/firestore';
 
-import { API_URL, firebaseConfig } from './appConfig';
+import { API_URL, USE_EMULATORS, firebaseConfig } from './appConfig';
 
 export { firebaseConfig, API_URL } from './appConfig';
 
@@ -17,6 +18,20 @@ export const auth = getAuth(app);
 export const db = initializeFirestore(app, {
   localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
 });
+
+if (USE_EMULATORS) {
+  connectAuthEmulator(auth, 'http://localhost:9099', { disableWarnings: true });
+  connectFirestoreEmulator(db, 'localhost', 8080);
+  console.info('CDS Pass: using local emulators and http://localhost:8787 (test mode).');
+}
+
+/** Render's free server sleeps; poke it as soon as someone opens sign-up or login so it's awake in time. */
+let woken = false;
+export function wakeServer() {
+  if (woken) return;
+  woken = true;
+  void fetch(`${API_URL}/health`, { cache: 'no-store' }).catch(() => undefined);
+}
 
 let wakeNoticeShown = false;
 

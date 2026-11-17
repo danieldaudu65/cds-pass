@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { Navigate, Outlet, Route, Routes } from 'react-router-dom';
 import { BottomNav } from './components/BottomNav';
 import { InstallGate } from './components/InstallGate';
@@ -52,6 +52,39 @@ function ProfileReadError({ message, onLogout }: { message: string; onLogout: ()
         </button>
         <button onClick={onLogout} className="w-full py-2 text-sm font-bold text-muted">
           Log out
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Approved, but this phone's login doesn't carry the new permissions yet. Never wait forever. */
+function WaitingForAccess() {
+  const { refreshClaims, logout } = useAuth();
+  const [slow, setSlow] = useState(false);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setSlow(true), 10000);
+    return () => clearTimeout(t);
+  }, []);
+  if (!slow) return <Splash />;
+  return (
+    <div className="grid min-h-[100dvh] place-items-center bg-paper px-6 text-ink">
+      <div className="w-full max-w-md space-y-4 rounded-3xl bg-card p-6 text-center shadow-card">
+        <h1 className="text-xl font-extrabold">Setting up your access…</h1>
+        <p className="text-sm text-muted">This is taking longer than usual. Check your internet, then try again.</p>
+        <button
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            void refreshClaims().finally(() => setBusy(false));
+          }}
+          className="h-12 w-full rounded-2xl bg-green font-bold text-white disabled:opacity-60"
+        >
+          {busy ? 'Checking…' : 'Try again'}
+        </button>
+        <button onClick={() => void logout()} className="w-full py-2 text-sm font-bold text-muted">
+          Log out and log in again
         </button>
       </div>
     </div>
@@ -129,7 +162,11 @@ export default function App() {
       </Routes>
     );
   } else if (!ready) {
-    return <Splash />;
+    return (
+      <InstallGate>
+        <WaitingForAccess />
+      </InstallGate>
+    );
   } else {
     const homePath = profile?.role === 'exco' ? '/exco' : '/home';
     routes = (

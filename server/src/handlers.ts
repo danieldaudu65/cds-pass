@@ -472,6 +472,62 @@ export const createGroup = onCall(async () => {
   throw fail('failed-precondition', 'Create groups from Exco → Settings using the platform admin account.');
 });
 
+/**
+ * First-time setup for the platform admin: signs up AND starts their own CDS group in one step,
+ * becoming its approved main exco. Without this the admin could never reach Exco → Settings on a
+ * fresh database, because every other sign-up needs a group code.
+ */
+export const registerPlatformAdmin = onCall(async (req: CallableRequest) => {
+  const { uid, adminStateCode } = await platformAdmin(req);
+  const p = await validateProfile(uid, req.data);
+  if (p.stateCode !== adminStateCode) throw fail('permission-denied', 'Only the CDS Pass platform administrator can do this.');
+  const name = text(req.data?.group?.name, 'CDS group name', 3, 60);
+  const lga = text(req.data?.group?.lga, 'LGA', 2, 60);
+  const state = text(req.data?.group?.state, 'State', 2, 40);
+
+  let joinCode = newJoinCode();
+  let uniqueCode = false;
+  for (let i = 0; i < 10; i++) {
+    const clash = await db.collection('groups').where('joinCode', '==', joinCode).limit(1).get();
+    if (clash.empty) { uniqueCode = true; break; }
+    joinCode = newJoinCode();
+  }
+  if (!uniqueCode) throw fail('resource-exhausted', 'Could not create a unique group code. Please try again.');
+
+  const gRef = db.collection('groups').doc();
+  await db.runTransaction(async (tx) => {
+    const existing = await tx.get(userRef(uid));
+    if (existing.exists) throw fail('already-exists', 'This account is already registered.');
+    tx.create(gRef, {
+      name,
+      lga,
+      state,
+      joinCode,
+      batchSize: DEFAULT_BATCH_SIZE,
+      venue: null,
+      createdBy: uid,
+      mainExcoUid: uid,
+      mainExcoStateCode: p.stateCode,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    tx.create(keysRef(gRef.id), { doorSecret: randomBytes(32).toString('hex') });
+    tx.create(userRef(uid), {
+      ...p,
+      groupId: gRef.id,
+      role: 'exco',
+      status: 'approved',
+      fcmTokens: [],
+      createdAt: FieldValue.serverTimestamp(),
+      approvedAt: FieldValue.serverTimestamp(),
+      approvedBy: uid,
+    });
+  });
+  await auth.setCustomUserClaims(uid, { gid: gRef.id, role: 'exco', approved: true });
+  await log(gRef.id, uid, 'group_created', { name });
+  return { ok: true, status: 'approved', role: 'exco', groupName: name, joinCode };
+});
+
+
 /** Exco approves (after checking the NYSC ID card) or rejects a pending member. */
 export const approveMember = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
@@ -770,7 +826,7 @@ export const callNext = onCall(async (req: CallableRequest) => {
   return { ok: true, batch, notified: sent, inBatch: targets.length };
 });
 
-/** Sends a test push only to the signed-in exco's own registered devices. */
+/** Main exco only: sends a test push to every approved member of the group who has alerts turned on. */
 export const testNotification = onCall(async (req: CallableRequest) => {
   const e = await mainExco(req);
   const members = await db.collection('users').where('groupId', '==', e.gid).get();

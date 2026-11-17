@@ -1,9 +1,9 @@
 import { signInWithEmailAndPassword } from 'firebase/auth';
 import { motion } from 'framer-motion';
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { Button, ErrorBox, Field, TopBar } from '../components/ui';
-import { auth, errorText } from '../lib/firebase';
+import { auth, errorText, wakeServer } from '../lib/firebase';
 import { normalizeStateCode, stateCodeToEmail } from '../lib/rules';
 
 export default function Login() {
@@ -11,6 +11,9 @@ export default function Login() {
   const [pin, setPin] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+
+  // Wake the free Render server early so the first screen after login loads quickly.
+  useEffect(() => wakeServer(), []);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
