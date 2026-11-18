@@ -45,7 +45,32 @@
     </script>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <!-- Shown until the app's code has downloaded (React replaces it). Slow networks no longer see a blank page. -->
+      <div id="boot" style="min-height:100dvh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;font-family:system-ui,sans-serif;background:#0B6B3A;color:#fff;text-align:center;padding:24px">
+        <div style="width:72px;height:72px;border-radius:22px;background:#fff;color:#0B6B3A;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:22px">CDS</div>
+        <div style="font-size:20px;font-weight:800">CDS Pass</div>
+        <div id="boot-msg" style="font-size:14px;opacity:.85">Loading…</div>
+        <button id="boot-retry" onclick="location.reload()" style="display:none;height:44px;padding:0 22px;border:0;border-radius:14px;background:#fff;color:#0B6B3A;font-weight:800;font-size:15px">Try again</button>
+      </div>
+    </div>
+    <script>
+      // If the code is slow or fails to download, say so instead of staying blank.
+      (function () {
+        function show(msg, retry) {
+          var m = document.getElementById('boot-msg'), b = document.getElementById('boot-retry');
+          if (!m) return; // app already started
+          m.textContent = msg;
+          if (retry && b) b.style.display = 'inline-block';
+        }
+        setTimeout(function () { show('Still loading… your network seems slow. Please wait a little.'); }, 8000);
+        setTimeout(function () { show('This is taking too long. Check your data or network, then try again.', true); }, 30000);
+        window.addEventListener('error', function (e) {
+          var t = e && e.target;
+          if (t && (t.tagName === 'SCRIPT' || t.tagName === 'LINK')) show('Could not load the app. Check your network and try again.', true);
+        }, true);
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
