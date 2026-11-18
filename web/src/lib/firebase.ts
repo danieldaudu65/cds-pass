@@ -88,7 +88,7 @@ export function errorText(e: unknown): string {
     case 'auth/user-not-found':
       return 'Wrong state code or PIN.';
     case 'auth/email-already-in-use':
-      return 'This state code is already registered. Log in instead.';
+      return 'This state code already has an account. Tap Log in, use the same PIN, and you will continue where you stopped.';
     case 'auth/too-many-requests':
       return 'Too many tries. Wait a few minutes and try again.';
     case 'auth/network-request-failed':

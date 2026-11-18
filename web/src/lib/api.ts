@@ -5,7 +5,7 @@ interface ProfileInput {
   stateCode: string;
   fullName: string;
   phone: string;
-  photoURL: string;
+  photoURL: string | null;
 }
 type Who = { uid?: string; stateCode?: string };
 

@@ -213,10 +213,13 @@ async function validateProfile(uid: string, data: any) {
   const phone = normalizePhone(data?.phone);
   if (!phone) throw fail('invalid-argument', 'Enter a valid Nigerian phone number.');
 
-  const photoURL = data?.photoURL;
-  if (typeof photoURL !== 'string' || !/^https?:\/\//.test(photoURL) || photoURL.length > 2000) {
-    throw fail('invalid-argument', 'A profile picture is required.');
+  // The photo may come later: on slow networks the upload can fail, and that must not block sign-up.
+  // Members without a photo are asked to add one on the "Under review" screen.
+  const rawPhoto = data?.photoURL ?? null;
+  if (rawPhoto !== null && (typeof rawPhoto !== 'string' || !/^https:\/\//.test(rawPhoto) || rawPhoto.length > 2000)) {
+    throw fail('invalid-argument', 'That profile picture link is not valid. Please choose the photo again.');
   }
+  const photoURL: string | null = rawPhoto;
 
   if ((await userRef(uid).get()).exists) {
     throw fail('already-exists', 'This account is already registered.');

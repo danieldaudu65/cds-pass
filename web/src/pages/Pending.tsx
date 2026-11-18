@@ -1,7 +1,55 @@
+import { doc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { motion } from 'framer-motion';
+import { useState } from 'react';
 import { Avatar } from '../components/Avatar';
-import { Button } from '../components/ui';
+import { PhotoPicker } from '../components/PhotoPicker';
+import { Button, ErrorBox } from '../components/ui';
 import { useAuth } from '../hooks/useAuth';
+import { db, errorText } from '../lib/firebase';
+import { toast } from '../lib/toast';
+import { uploadAvatar } from '../lib/upload';
+
+/** Shown when the photo didn't upload during sign-up (slow network). The exco needs it to approve. */
+function AddPhoto({ uid }: { uid: string }) {
+  const [photo, setPhoto] = useState<Blob | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  async function save() {
+    if (!photo) return setError('Take or choose a clear photo of your face first.');
+    setBusy(true);
+    setError('');
+    try {
+      const photoURL = await uploadAvatar(uid, photo);
+      await updateDoc(doc(db, 'users', uid), { photoURL, updatedAt: serverTimestamp() });
+      toast('Photo saved', 'success', 'The exco can now review your account.');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-6 w-full space-y-4 rounded-3xl bg-card p-6 text-left text-ink shadow-lift">
+      <div>
+        <p className="text-lg font-extrabold">Add your photo</p>
+        <p className="text-sm text-muted">Your photo didn't upload during sign-up. The exco needs it to approve you.</p>
+      </div>
+      <PhotoPicker
+        value={photo}
+        onChange={(b, err) => {
+          setPhoto(b);
+          setError(err ?? '');
+        }}
+      />
+      {error && <ErrorBox>{error}</ErrorBox>}
+      <Button onClick={save} disabled={busy || !photo}>
+        {busy ? 'Uploading…' : 'Save photo'}
+      </Button>
+    </div>
+  );
+}
 
 const steps = [
   { t: 'Account created', d: 'Your details and photo are saved.' },
@@ -30,6 +78,8 @@ export default function Pending() {
         </motion.div>
         <h1 className="mt-6 text-2xl font-extrabold">{profile.fullName}</h1>
         <p className="font-semibold text-green-mid">{profile.stateCode}</p>
+
+        {!rejected && !profile.photoURL && <AddPhoto uid={profile.uid} />}
 
         <motion.div
           initial={{ y: 20, opacity: 0 }}

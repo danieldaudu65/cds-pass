@@ -145,7 +145,14 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
       }
 
       setBusy('Uploading your photo…');
-      const photoURL = await uploadAvatar(uid, photo!);
+      let photoURL: string | null = null;
+      try {
+        photoURL = await uploadAvatar(uid, photo!);
+      } catch (e) {
+        // Don't let a slow photo upload block the whole sign-up. They add it on the next screen.
+        if ((e as Error).message === 'Please log in again.') throw e;
+        toast("Your photo didn't upload", 'error', "Your account is still being created. You'll add the photo on the next screen.");
+      }
 
       setBusy('Saving your details…');
       const profile = { stateCode: sc, fullName: fullName.trim(), phone: normalizePhone(phone)!, photoURL };

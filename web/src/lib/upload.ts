@@ -8,6 +8,17 @@ import { API_URL, auth } from './firebase';
  * The server uses the login token to know who the photo belongs to.
  */
 export async function uploadAvatar(_uid: string, blob: Blob): Promise<string> {
+  // Slow networks: give each try 40 s, and try a second time automatically before giving up.
+  try {
+    return await uploadOnce(blob, 40_000);
+  } catch (e) {
+    const code = (e as { code?: string }).code;
+    if (code !== 'functions/deadline-exceeded' && code !== 'functions/unavailable' && code !== 'functions/internal') throw e;
+    return await uploadOnce(blob, 40_000);
+  }
+}
+
+async function uploadOnce(blob: Blob, timeoutMs: number): Promise<string> {
   const token = await auth.currentUser?.getIdToken();
   if (!token) throw new Error('Please log in again.');
 
@@ -16,7 +27,7 @@ export async function uploadAvatar(_uid: string, blob: Blob): Promise<string> {
 
   let res: Response;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60_000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     res = await fetch(`${API_URL}/upload/avatar`, {
       method: 'POST',
@@ -35,7 +46,9 @@ export async function uploadAvatar(_uid: string, blob: Blob): Promise<string> {
 
   const json = (await res.json().catch(() => ({}))) as { url?: string; error?: { message?: string } };
   if (!res.ok || !json.url) {
-    throw new Error(json.error?.message ?? 'Could not upload your photo. Please try again.');
+    throw Object.assign(new Error(json.error?.message ?? 'Could not upload your photo. Please try again.'), {
+      code: res.status >= 500 ? 'functions/internal' : 'functions/invalid-argument',
+    });
   }
   return json.url;
 }

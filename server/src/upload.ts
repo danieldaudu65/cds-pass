@@ -69,16 +69,30 @@ uploadRouter.post(
       return fail(res, 500, 'Photo upload is not set up on the server yet.');
     }
 
+    const started = Date.now();
+    let answered = false;
+    // Never leave the phone waiting: if Cloudinary hasn't answered in 30 s, say so.
+    const guard = setTimeout(() => {
+      if (answered) return;
+      answered = true;
+      console.error(`Cloudinary upload timed out after 30s (uid ${uid}, ${file.size} bytes)`);
+      fail(res, 504, 'Photo upload is slow right now. Please try again.');
+    }, 30_000);
+
     const stream = cloudinary.uploader.upload_stream(
       {
+        timeout: 30_000,
         resource_type: 'image',
         folder: 'cds-pass/avatars',
         public_id: uid, // one photo per person: a new upload replaces the old one
         overwrite: true,
-        invalidate: true,
         transformation: [{ width: 512, height: 512, crop: 'limit', quality: 'auto' }],
       },
       (error, result) => {
+        clearTimeout(guard);
+        if (answered) return;
+        answered = true;
+        console.log(`avatar upload ${error ? 'FAILED' : 'ok'} in ${Date.now() - started}ms (${file.size} bytes)`);
         if (error || !result) {
           console.error('Cloudinary upload failed:', error);
           return fail(res, 500, 'Could not upload your photo. Please try again.');
