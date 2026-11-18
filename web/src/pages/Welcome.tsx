@@ -1,6 +1,7 @@
 import { motion } from 'framer-motion';
-import { lazy, Suspense, useMemo } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { lazy, Suspense, useMemo, useState } from 'react';
+import { Navigate, useNavigate } from 'react-router-dom';
+import { loadDraft } from '../lib/signupDraft';
 import { Button } from '../components/ui';
 import { canUse3D } from '../lib/device';
 
@@ -33,6 +34,9 @@ const points = [
 export default function Welcome() {
   const nav = useNavigate();
   const use3D = useMemo(canUse3D, []);
+  // The phone closed the app while the camera was open during sign-up: go straight back there.
+  const [resume] = useState(() => !!loadDraft()?.pickerOpen);
+  if (resume) return <Navigate to="/signup" replace />;
 
   return (
     <div className="screen bg-green-dark text-white lg:max-w-6xl lg:flex-row">

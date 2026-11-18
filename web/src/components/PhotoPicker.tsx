@@ -8,10 +8,13 @@ export function PhotoPicker({
   value,
   currentPhotoURL,
   onChange,
+  onPickerOpen,
 }: {
   value: Blob | null;
   currentPhotoURL?: string | null;
   onChange: (b: Blob | null, err?: string) => void;
+  /** Called just before the camera/gallery opens (true) and when we're back (false). */
+  onPickerOpen?: (open: boolean) => void;
 }) {
   const cam = useRef<HTMLInputElement>(null);
   const gallery = useRef<HTMLInputElement>(null);
@@ -24,12 +27,29 @@ export function PhotoPicker({
     return () => URL.revokeObjectURL(url);
   }, [value]);
 
+  const [working, setWorking] = useState(false);
+
+  function open(input: HTMLInputElement | null) {
+    onPickerOpen?.(true);
+    // If they cancel the camera/gallery no file arrives, but the page gets focus back.
+    const back = () => {
+      window.removeEventListener('focus', back);
+      setTimeout(() => onPickerOpen?.(false), 500);
+    };
+    window.addEventListener('focus', back);
+    input?.click();
+  }
+
   async function pick(f: File | undefined) {
+    onPickerOpen?.(false);
     if (!f) return;
+    setWorking(true);
     try {
       onChange(await compressPhoto(f));
     } catch (e) {
       onChange(null, (e as Error).message);
+    } finally {
+      setWorking(false);
     }
   }
 
@@ -40,7 +60,9 @@ export function PhotoPicker({
         animate={{ scale: 1, rotate: 0 }}
         className="relative h-40 w-40 overflow-hidden rounded-full bg-green-light shadow-lift ring-8 ring-white"
       >
-        {preview || currentPhotoURL ? (
+        {working ? (
+          <div className="grid h-full w-full place-items-center text-sm font-bold text-green">Preparing…</div>
+        ) : preview || currentPhotoURL ? (
           <img src={preview ?? currentPhotoURL ?? undefined} alt="Your profile" className="h-full w-full object-cover" />
         ) : (
           <div className="grid h-full w-full place-items-center text-green">
@@ -52,10 +74,10 @@ export function PhotoPicker({
         Use a clear photo of your face. The exco compares it with your NYSC ID card.
       </p>
       <div className="grid w-full grid-cols-2 gap-3">
-        <button type="button" onClick={() => cam.current?.click()} className="flex h-14 items-center justify-center gap-2 rounded-2xl bg-green font-bold text-white">
+        <button type="button" onClick={() => open(cam.current)} disabled={working} className="flex h-14 items-center justify-center gap-2 rounded-2xl bg-green font-bold text-white">
           <Icon name="camera" /> Take photo
         </button>
-        <button type="button" onClick={() => gallery.current?.click()} className="flex h-14 items-center justify-center gap-2 rounded-2xl border-2 border-green bg-card font-bold text-green">
+        <button type="button" onClick={() => open(gallery.current)} disabled={working} className="flex h-14 items-center justify-center gap-2 rounded-2xl border-2 border-green bg-card font-bold text-green">
           Choose photo
         </button>
       </div>

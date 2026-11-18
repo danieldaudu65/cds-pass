@@ -1,4 +1,5 @@
 import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
+import { clearDraft } from '../lib/signupDraft';
 import { doc, onSnapshot } from 'firebase/firestore';
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
 import { auth, db } from '../lib/firebase';
@@ -105,6 +106,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     !!profile && profile.status === 'approved' && claims.approved === true && claims.role === profile.role;
 
   const logout = useCallback(async () => {
+    clearDraft();
     await signOut(auth);
   }, []);
 

@@ -10,6 +10,7 @@ import { auth, errorText, wakeServer } from '../lib/firebase';
 import { PLATFORM_ADMIN_STATE_CODE } from '../lib/appConfig';
 import { normalizePhone, normalizeStateCode, stateCodeToEmail } from '../lib/rules';
 import { setSignupLock } from '../lib/signupLock';
+import { blobToDataUrl, clearDraft, dataUrlToBlob, loadDraft, markPickerOpen, saveDraft } from '../lib/signupDraft';
 import { toast } from '../lib/toast';
 import { uploadAvatar } from '../lib/upload';
 
@@ -22,20 +23,27 @@ function stateCodeFromCurrentUser(): string {
 export default function Signup({ finish = false }: { finish?: boolean }) {
   const { logout, profile: savedProfile, claims } = useAuth();
   const navigate = useNavigate();
+  // Anything typed before the phone closed the app (see lib/signupDraft.ts). Read once.
+  const [draft] = useState(() => {
+    const d = loadDraft();
+    // In "finish" mode the login already exists: only reuse a draft for the same state code.
+    if (d && finish && normalizeStateCode(d.stateCode) !== stateCodeFromCurrentUser()) return null;
+    return d;
+  });
   const steps = finish ? ['Details', 'Photo', 'CDS group'] : ['Details', 'Photo', 'CDS group', 'PIN'];
-  const [rawStep, setStep] = useState(0);
+  const [rawStep, setStep] = useState(draft?.step ?? 0);
   // If sign-up switches to "finish" mode (fewer steps), never point past the last step.
   const step = Math.min(rawStep, steps.length - 1);
   const [dir, setDir] = useState(1);
 
-  const [stateCode, setStateCode] = useState(finish ? stateCodeFromCurrentUser() : '');
-  const [fullName, setFullName] = useState('');
-  const [phone, setPhone] = useState('');
+  const [stateCode, setStateCode] = useState(finish ? stateCodeFromCurrentUser() : draft?.stateCode ?? '');
+  const [fullName, setFullName] = useState(draft?.fullName ?? '');
+  const [phone, setPhone] = useState(draft?.phone ?? '');
   const [photo, setPhoto] = useState<Blob | null>(null);
-  const [joinCode, setJoinCode] = useState('');
+  const [joinCode, setJoinCode] = useState(draft?.joinCode ?? '');
   // Only the platform admin may start a brand-new group while signing up (first-time setup).
-  const [startGroup, setStartGroup] = useState(false);
-  const [group, setGroup] = useState({ name: '', lga: '', state: '' });
+  const [startGroup, setStartGroup] = useState(draft?.startGroup ?? false);
+  const [group, setGroup] = useState(draft?.group ?? { name: '', lga: '', state: '' });
   const isPlatformAdmin = normalizeStateCode(stateCode) === PLATFORM_ADMIN_STATE_CODE;
   const creatingGroup = isPlatformAdmin && startGroup;
   /** Set once the server has saved everything; we then wait for the profile to arrive before leaving. */
@@ -46,6 +54,20 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
 
   const [error, setError] = useState('');
   const [busy, setBusy] = useState('');
+  /** The phone closed the app while the camera/gallery was open. */
+  const [wasClosed] = useState(() => !!draft?.pickerOpen);
+  const [photoData, setPhotoData] = useState<string | null>(draft?.photo ?? null);
+
+  // Bring back a photo that was already chosen before the app was closed.
+  useEffect(() => {
+    if (draft?.photo) void dataUrlToBlob(draft.photo).then(setPhoto).catch(() => setPhotoData(null));
+  }, [draft]);
+
+  // Save progress on every change (never the PIN).
+  useEffect(() => {
+    if (doneTo) return;
+    saveDraft({ step: rawStep, stateCode, fullName, phone, joinCode, startGroup, group, photo: photoData, pickerOpen: false });
+  }, [rawStep, stateCode, fullName, phone, joinCode, startGroup, group, photoData, doneTo]);
 
   // Wake the free Render server now, so it is ready by the time the form is submitted.
   useEffect(() => wakeServer(), []);
@@ -60,6 +82,7 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
     const profileReady = !!savedProfile;
     const excoReady = savedProfile?.status !== 'approved' || (claims.approved === true && claims.role === savedProfile.role);
     const go = () => {
+      clearDraft();
       setSignupLock(false);
       navigate(doneTo, { replace: true });
     };
@@ -225,11 +248,20 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
                   <h2 className="text-2xl font-extrabold">Profile picture</h2>
                   <p className="text-muted">This shows on the exco's screen when you thumbprint.</p>
                 </div>
+                {wasClosed && !photo && (
+                  <p className="rounded-2xl bg-warn-bg px-4 py-3 text-sm text-warn">
+                    Your phone closed the app while the camera was open, but your details are saved. Try
+                    <b> Choose photo</b> and pick a selfie from your gallery: it uses less memory.
+                  </p>
+                )}
                 <PhotoPicker
                   value={photo}
+                  onPickerOpen={markPickerOpen}
                   onChange={(b, err) => {
                     setPhoto(b);
                     setError(err ?? '');
+                    if (b) void blobToDataUrl(b).then(setPhotoData).catch(() => setPhotoData(null));
+                    else setPhotoData(null);
                   }}
                 />
               </>
