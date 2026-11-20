@@ -1540,7 +1540,8 @@ export const adminOverview = onCall(async (req: CallableRequest) => {
   const earnedKobo = new Array(DAYS).fill(0);
 
   const [groupsSnap, usersSnap] = await Promise.all([db.collection('groups').get(), db.collection('users').get()]);
-  const users = usersSnap.docs.map((d) => ({ id: d.id, ...(d.data() as Record<string, any>) }));
+  // Typed loosely on purpose: user docs are plain data here.
+  const users: Array<Record<string, any> & { id: string }> = usersSnap.docs.map((d: any) => Object.assign({ id: d.id as string }, d.data()));
   for (const u of users) {
     const t = u.createdAt?.toMillis?.();
     if (t) {
