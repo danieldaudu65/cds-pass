@@ -15,7 +15,8 @@ import type { Attendee, PublicMember } from '../../lib/types';
 
 type Tab = 'code' | 'scan' | 'manual';
 
-function DoorCode() {
+/** `epoch` changes when the main exco gives someone a number by hand: fetch a new code at once. */
+function DoorCode({ epoch }: { epoch: number }) {
   const [code, setCode] = useState<{ code: string; gid: string; expiresAt: number } | null>(null);
   const [left, setLeft] = useState(30);
   const [error, setError] = useState('');
@@ -32,7 +33,7 @@ function DoorCode() {
 
   useEffect(() => {
     void refresh();
-  }, [refresh]);
+  }, [refresh, epoch]);
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -108,7 +109,8 @@ function AssistedCheckIn({ mode }: { mode: 'scan' | 'manual' }) {
     if (!found) return;
     setBusy('admit');
     try {
-      const r = await api.excoCheckIn({ uid: found.uid, method: mode === 'scan' ? 'card' : 'manual' });
+      // Typed state code = main exco only; it also changes the door code straight away.
+      const r = mode === 'scan' ? await api.excoCheckIn({ uid: found.uid, method: 'card' }) : await api.giveNextNumber({ uid: found.uid });
       toast(r.already ? `Already No. ${r.number}` : `Checked in · No. ${r.number}`, 'success', found.member.fullName);
       await lookup({ uid: found.uid });
     } catch (e) {
@@ -157,7 +159,7 @@ function AssistedCheckIn({ mode }: { mode: 'scan' | 'manual' }) {
           <Button loading={busy === 'lookup'} onClick={() => lookup({ stateCode })}>
             Find member
           </Button>
-          <p className="text-xs text-muted">Manual check-ins are logged with your name.</p>
+          <p className="text-xs text-muted">Main exco only. Logged with your name, and the door code changes straight after.</p>
         </div>
       )}
 
@@ -197,18 +199,19 @@ function AssistedCheckIn({ mode }: { mode: 'scan' | 'manual' }) {
 }
 
 export default function Door() {
-  const { open, stats } = useExcoDay();
+  const { me, group, session, open, stats } = useExcoDay();
+  const isMainExco = (group?.mainExcoUid ?? group?.createdBy) === me.uid;
   const [tab, setTab] = useState<Tab>('code');
   const tabs: { id: Tab; label: string }[] = [
     { id: 'code', label: 'Door code' },
     { id: 'scan', label: 'Scan card' },
-    { id: 'manual', label: 'State code' },
+    ...(isMainExco ? [{ id: 'manual' as Tab, label: 'State code' }] : []),
   ];
 
   return (
     <>
       <ExcoHeader title="Door check-in" sub={`${stats.present} checked in so far`}>
-        <div className="grid grid-cols-3 gap-1 rounded-2xl bg-white/10 p-1">
+        <div className={`grid gap-1 rounded-2xl bg-white/10 p-1 ${tabs.length === 3 ? 'grid-cols-3' : 'grid-cols-2'}`}>
           {tabs.map((t) => (
             <button key={t.id} onClick={() => setTab(t.id)} className={`relative h-11 rounded-xl text-sm font-bold ${tab === t.id ? 'text-brand' : 'text-white'}`}>
               {tab === t.id && <motion.span layoutId="door-tab" className="absolute inset-0 rounded-xl bg-white" />}
@@ -226,7 +229,7 @@ export default function Door() {
             </Link>
           </div>
         ) : tab === 'code' ? (
-          <DoorCode />
+          <DoorCode epoch={session?.doorEpoch ?? 0} />
         ) : (
           <AssistedCheckIn key={tab} mode={tab} />
         )}

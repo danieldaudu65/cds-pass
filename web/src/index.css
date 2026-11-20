@@ -18,6 +18,8 @@
   --bad-text: 180 35 24;
   --bad-bg: 253 231 229;
   --shadow: 11 107 58;
+  --gold-bg: 247 240 218;
+  --gold-text: 107 82 0;
   color-scheme: light;
 }
 
@@ -35,6 +37,8 @@
   --bad-text: 252 129 120;
   --bad-bg: 61 23 20;
   --shadow: 0 0 0;
+  --gold-bg: 52 45 22;
+  --gold-text: 230 211 154;
   color-scheme: dark;
 }
 
@@ -52,10 +56,19 @@
   --warn-bg: 255 244 214;
   --bad-text: 180 35 24;
   --bad-bg: 253 231 229;
+  --gold-bg: 247 240 218;
+  --gold-text: 107 82 0;
   color-scheme: light;
 }
 
 @layer base {
+  h1,
+  h2,
+  h3,
+  .font-display {
+    font-family: 'Poppins', 'Plus Jakarta Sans', system-ui, sans-serif;
+    letter-spacing: -0.01em;
+  }
   html,
   body,
   #root {
@@ -91,10 +104,35 @@
   .input {
     @apply h-14 w-full rounded-2xl border-2 border-line bg-card px-4 text-base text-ink outline-none transition focus:border-green;
   }
+  /* Our green header: deep NYSC green with a soft gold glow in the corner and faint dots. */
+  .hero-green {
+    background-color: #064726;
+    background-image: radial-gradient(circle at 92% -10%, rgba(217, 197, 138, 0.38), transparent 42%),
+      radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px),
+      linear-gradient(155deg, #053d20 0%, #0b6b3a 62%, #0e7f47 100%);
+    background-size: 100% 100%, 18px 18px, 100% 100%;
+  }
+  /* Big green "your number" card */
+  .number-card {
+    background-image: radial-gradient(circle at 100% 0%, rgba(255, 255, 255, 0.12), transparent 45%),
+      linear-gradient(150deg, #10854a 0%, #0b6b3a 60%, #075230 100%);
+    box-shadow: 0 22px 44px -20px rgba(11, 107, 58, 0.75);
+  }
   .grid-bg {
     background-image: radial-gradient(rgba(255, 255, 255, 0.09) 1px, transparent 1px);
     background-size: 18px 18px;
   }
+}
+
+@keyframes turn-glow {
+  0%, 100% { box-shadow: 0 22px 44px -20px rgba(11, 107, 58, 0.75), 0 0 0 0 rgba(217, 197, 138, 0.0); }
+  50% { box-shadow: 0 22px 44px -20px rgba(11, 107, 58, 0.75), 0 0 0 10px rgba(217, 197, 138, 0.35); }
+}
+.turn-glow {
+  animation: turn-glow 1.8s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-glow { animation: none; }
 }
 
 /* Text colours that need a lighter shade on dark backgrounds. */

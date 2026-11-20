@@ -2,7 +2,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { useEffect, useMemo, useState } from 'react';
 import { Avatar } from '../../components/Avatar';
 import { ExcoHeader } from '../../components/ExcoHeader';
-import { Button, ErrorBox, Field, Icon, Page, Pill, Stat } from '../../components/ui';
+import { Button, Checkbox, ErrorBox, Field, Icon, Page, Pill, Select, Stat } from '../../components/ui';
 import { useMe } from '../../hooks/useAuth';
 import { useActiveDues, useDuesStatuses, useGroup, useGroupMembers } from '../../hooks/useLive';
 import { api } from '../../lib/api';
@@ -83,19 +83,15 @@ function PayoutAccount() {
       <AnimatePresence>
         {editing && (
           <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="space-y-3 overflow-hidden">
-            <div>
-              <label htmlFor="bank" className="label">
-                Bank
-              </label>
-              <select id="bank" className="input" value={bankCode} onChange={(e) => setBankCode(e.target.value)}>
-                <option value="">{banks ? 'Choose bank' : 'Loading banks…'}</option>
-                {banks?.map((b) => (
-                  <option key={b.code} value={b.code}>
-                    {b.name}
-                  </option>
-                ))}
-              </select>
-            </div>
+            <Select
+              inline
+              label="Bank"
+              value={bankCode}
+              onChange={setBankCode}
+              disabled={!banks}
+              placeholder={banks ? 'Choose bank' : 'Loading banks…'}
+              options={(banks ?? []).map((b) => ({ value: b.code, label: b.name }))}
+            />
             <Field
               label="Account number"
               inputMode="numeric"
@@ -125,15 +121,18 @@ function NewDues({ onDone }: { onDone: () => void }) {
   const [title, setTitle] = useState('');
   const [amount, setAmount] = useState('');
   const [dueDate, setDueDate] = useState('');
+  const [required, setRequired] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Lagos' });
 
   async function create() {
     setError('');
+    if (required && !dueDate) return setError('Choose the collection date first.');
     setBusy(true);
     try {
-      await api.createDues({ title, amountNaira: Number(amount), dueDate: dueDate || undefined });
-      toast('Dues created', 'success', 'Members can pay now.');
+      await api.createDues({ title, amountNaira: Number(amount), dueDate: dueDate || undefined, requiredForCheckIn: required });
+      toast('Dues created', 'success', 'Everyone has been told. Reminders go out the evening before and that morning.');
       onDone();
     } catch (e) {
       setError(errorText(e));
@@ -147,7 +146,15 @@ function NewDues({ onDone }: { onDone: () => void }) {
       <p className="font-bold">New dues</p>
       <Field label="Title" placeholder="November dues" value={title} onChange={(e) => setTitle(e.target.value)} />
       <Field label="Amount (₦)" inputMode="numeric" placeholder="1000" value={amount} onChange={(e) => setAmount(e.target.value.replace(/\D/g, ''))} />
-      <Field label="Due date (optional)" type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
+      <Field label={required ? 'Collection date' : 'Collection date (optional)'} type="date" min={today} value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
+      <Checkbox checked={required} onChange={setRequired} className="rounded-2xl bg-green-light p-4 text-sm text-green">
+        <span className="font-bold">Must pay before getting a number</span>
+        <span className="block text-xs opacity-80">
+          From the collection date, members who haven't paid see a red “Please pay your dues” screen when they scan, until they pay
+          online or you mark their cash as paid.
+        </span>
+      </Checkbox>
+      <p className="text-xs text-muted">Members are told now, then reminded automatically the evening before and that morning.</p>
       <ErrorBox>{error}</ErrorBox>
       <div className="flex gap-2">
         <Button variant="outline" full={false} className="w-28" onClick={onDone}>
@@ -167,17 +174,28 @@ function DuesDetail({ dues }: { dues: Dues }) {
   const statuses = useDuesStatuses(me.groupId, dues.id);
   const [tab, setTab] = useState<'owing' | 'paid'>('owing');
   const [search, setSearch] = useState('');
+  const [batch, setBatch] = useState('all');
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
 
   const rows = useMemo(() => {
     const byUid = new Map((statuses ?? []).map((s) => [s.uid, s]));
     const approved = (members ?? []).filter((m) => m.status === 'approved');
-    const q = search.trim().toLowerCase();
+    const q = search.trim().toLowerCase().replace(/[\s/-]/g, '');
     return approved
       .map((m) => ({ m, s: byUid.get(m.uid) }))
-      .filter((r) => !q || r.m.fullName.toLowerCase().includes(q) || r.m.stateCode.toLowerCase().includes(q));
-  }, [members, statuses, search]);
+      .filter((r) => batch === 'all' || r.m.stateCode.split('/')[1] === batch)
+      .filter((r) => !q || r.m.fullName.toLowerCase().replace(/\s/g, '').includes(q) || r.m.stateCode.toLowerCase().replace(/[\s/-]/g, '').includes(q));
+  }, [members, statuses, search, batch]);
+
+  const batches = useMemo(
+    () => [...new Set((members ?? []).filter((m) => m.status === 'approved').map((m) => m.stateCode.split('/')[1]).filter(Boolean))].sort(),
+    [members],
+  );
+  const disputedCount = rows.filter((r) => r.s?.status === 'disputed').length;
+  const collection = dues.dueDate
+    ? new Date(`${dues.dueDate}T12:00:00`).toLocaleDateString('en-NG', { weekday: 'short', day: 'numeric', month: 'short' })
+    : null;
 
   const paid = rows.filter((r) => r.s?.status === 'paid');
   const owing = rows.filter((r) => r.s?.status !== 'paid');
@@ -203,7 +221,10 @@ function DuesDetail({ dues }: { dues: Dues }) {
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="text-lg font-extrabold">{dues.title}</p>
-          <p className="text-sm text-muted">{naira(dues.amountKobo)} per member</p>
+          <p className="text-sm text-muted">
+            {naira(dues.amountKobo)} per member{collection ? ` · collection ${collection}` : ''}
+          </p>
+          {dues.requiredForCheckIn && <Pill tone="gold">Pay before getting a number</Pill>}
         </div>
         <button
           onClick={() => confirm(`Close "${dues.title}"? Members won't be able to pay it any more.`) && run('close', () => api.closeDues({ duesId: dues.id }), 'Dues closed')}
@@ -228,6 +249,24 @@ function DuesDetail({ dues }: { dues: Dues }) {
       </div>
 
       <input className="input" placeholder="Search name or state code" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search members" />
+      {batches.length > 1 && (
+        <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
+          {['all', ...batches].map((b) => (
+            <button
+              key={b}
+              onClick={() => setBatch(b)}
+              className={`h-9 shrink-0 rounded-full px-4 text-sm font-bold ${batch === b ? 'bg-green text-white' : 'bg-green-light text-green'}`}
+            >
+              {b === 'all' ? 'All batches' : `Batch ${b}`}
+            </button>
+          ))}
+        </div>
+      )}
+      {disputedCount > 0 && (
+        <p className="rounded-2xl bg-bad-bg px-4 py-3 text-sm font-semibold text-bad">
+          {disputedCount} cash {disputedCount === 1 ? 'record was' : 'records were'} reported as wrong by the member. Check with the exco who recorded it.
+        </p>
+      )}
 
       <ul className="divide-y divide-line">
         {list.map(({ m, s }) => (
@@ -242,16 +281,19 @@ function DuesDetail({ dues }: { dues: Dues }) {
             ) : s?.status === 'cash_pending' ? (
               <Pill tone="warn">Awaiting member</Pill>
             ) : (
-              <button
-                onClick={() =>
-                  confirm(`Record ${naira(dues.amountKobo)} cash from ${m.fullName}? They will be asked to confirm it.`) &&
-                  run(`cash:${m.uid}`, () => api.recordCash({ uid: m.uid, duesId: dues.id }), 'Cash recorded. Waiting for the member to confirm.')
-                }
-                disabled={busy === `cash:${m.uid}`}
-                className="flex h-10 items-center gap-1.5 rounded-xl bg-green-light px-3 text-sm font-bold text-green disabled:opacity-50"
-              >
-                <Icon name="cash" size={18} /> Cash
-              </button>
+              <div className="flex items-center gap-2">
+                {s?.status === 'disputed' && <Pill tone="bad">Disputed</Pill>}
+                <button
+                  onClick={() =>
+                    confirm(`Mark ${m.fullName} as PAID: ${naira(dues.amountKobo)} cash?\n\nOnly do this after you have received the money. It counts straight away and ${m.fullName.split(' ')[0]} will be told you recorded it.`) &&
+                    run(`cash:${m.uid}`, () => api.recordCash({ uid: m.uid, duesId: dues.id }), `${m.fullName.split(' ')[0]} is now paid. They can scan in.`)
+                  }
+                  disabled={busy === `cash:${m.uid}`}
+                  className="flex h-10 items-center gap-1.5 rounded-xl bg-green px-3 text-sm font-bold text-white disabled:opacity-50"
+                >
+                  <Icon name="cash" size={18} /> Paid (cash)
+                </button>
+              </div>
             )}
           </li>
         ))}
@@ -301,7 +343,7 @@ export default function DuesAdmin() {
           </p>
         )}
         <p className="text-center text-xs text-muted">
-          Cash only counts after the member confirms it on their phone. Every cash record is in the activity log.
+          “Paid (cash)” counts immediately. The member is told who recorded it and can tap “This is wrong”. Every cash record is in the activity log.
         </p>
       </Page>
     </>

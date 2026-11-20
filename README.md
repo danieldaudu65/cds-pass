@@ -121,6 +121,23 @@ Upload the contents of `web/dist` to the site's document root. Keep SPA rewrites
 
 ---
 
+## Dues: collection date, reminders, pay before getting a number
+
+- When the main exco creates dues they set a **collection date** and can tick **Must pay before getting a number**.
+- From that date, a member who hasn't paid gets a red **"Please pay your dues"** screen when they scan, and no number,
+  until they pay online or an exco taps **Paid (cash)** on their name (counts immediately; the member is told who
+  recorded it and can tap **This is wrong**, which alerts the main exco).
+- **Automatic reminders** to members who haven't paid: the evening before and on the morning of the collection date.
+  Set `CRON_SECRET` on Render (any long random text), then create two jobs on cron-job.org:
+  `https://<render-app>.onrender.com/cron/reminders?key=<CRON_SECRET>` at **07:00** and **18:00** (Africa/Lagos).
+  Each reminder is sent once, so extra calls are harmless.
+
+## Main exco tools
+- **Send a message** (Exco → Settings or Dashboard): custom push to everyone, people who haven't paid, people waiting
+  for approval, or excos only. Templates included. Max 5 a day per CDS group.
+- **Give a number**: search a registered member whose phone is off and give them the next number. The door code
+  changes straight after. Typing a state code at the door is main-exco only; scanning a printed card works for any exco.
+
 ## Dues (online + cash)
 **How the money moves:** one Paystack account (yours). Each CDS group's bank account becomes a
 Paystack *subaccount*. A member pays dues + 3% service fee + Paystack's exact charge. Paystack sends

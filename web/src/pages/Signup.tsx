@@ -3,7 +3,7 @@ import { motion } from 'framer-motion';
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { PhotoPicker } from '../components/PhotoPicker';
-import { Button, ErrorBox, Field, TopBar } from '../components/ui';
+import { Button, Checkbox, ErrorBox, Field, TopBar } from '../components/ui';
 import { useAuth } from '../hooks/useAuth';
 import { api } from '../lib/api';
 import { auth, errorText, wakeServer } from '../lib/firebase';
@@ -343,18 +343,10 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
                   value={pin2}
                   onChange={(e) => setPin2(e.target.value.replace(/\D/g, ''))}
                 />
-                <label className="flex gap-3 rounded-2xl bg-card p-4 text-sm shadow-card">
-                  <input
-                    type="checkbox"
-                    className="mt-0.5 h-5 w-5 shrink-0 accent-green"
-                    checked={consent}
-                    onChange={(e) => setConsent(e.target.checked)}
-                  />
-                  <span>
-                    I agree that my name, state code, phone number and photo are stored by CDS Pass and shown to my
-                    CDS excos for attendance only. CDS Pass is an independent tool, not run by NYSC.
-                  </span>
-                </label>
+                <Checkbox checked={consent} onChange={setConsent} className="rounded-2xl bg-card p-4 text-sm shadow-card">
+                  I agree that my name, state code, phone number and photo are stored by CDS Pass and shown to my
+                  CDS excos for attendance only. CDS Pass is an independent tool, not run by NYSC.
+                </Checkbox>
               </>
             )}
           </motion.div>

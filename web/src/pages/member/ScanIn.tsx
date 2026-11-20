@@ -18,6 +18,8 @@ export default function ScanIn() {
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  /** Set when the server refuses because dues are not paid: shows the red "pay first" screen. */
+  const [unpaid, setUnpaid] = useState('');
 
   async function send(c: string, gid?: string) {
     if (busy) return;
@@ -45,6 +47,9 @@ export default function ScanIn() {
         savePending({ ...payload, scannedAt });
         toast('Scan saved', 'info', "We'll send it when your connection is back.");
         nav('/home');
+      } else if (/^Dues not paid/i.test(msg)) {
+        navigator.vibrate?.([200, 100, 200]);
+        setUnpaid(msg.replace(/^Dues not paid:\s*/i, ''));
       } else {
         setError(msg);
       }
@@ -57,6 +62,38 @@ export default function ScanIn() {
     const q = parseQR(text);
     if (q?.type === 'door') void send(q.code, q.gid);
     else setError('That is not a CDS Pass door code. Scan the code on the exco’s screen.');
+  }
+
+  if (unpaid) {
+    return (
+      <>
+        <TopBar title="Scan in" back="/home" />
+        <Page className="space-y-4">
+          <motion.div
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="rounded-[30px] bg-bad p-6 text-center text-white shadow-lift"
+          >
+            <span className="mx-auto grid h-16 w-16 place-items-center rounded-2xl bg-white/15">
+              <Icon name="card" size={32} />
+            </span>
+            <p className="mt-4 font-display text-2xl font-extrabold">Please pay your dues</p>
+            <p className="mt-2 text-sm text-white/90">{unpaid}</p>
+            <p className="mt-3 text-xs font-semibold text-white/80">No number has been given yet.</p>
+          </motion.div>
+          <Button variant="gold" onClick={() => nav('/dues')}>
+            <Icon name="card" /> Pay online now
+          </Button>
+          <div className="card text-sm">
+            <p className="font-bold">Paying cash?</p>
+            <p className="text-muted">Give the cash to an exco. Once they tap “Paid (cash)” on your name, scan the door code again.</p>
+          </div>
+          <Button variant="outline" onClick={() => setUnpaid('')}>
+            I've paid, scan again
+          </Button>
+        </Page>
+      </>
+    );
   }
 
   if (att) {

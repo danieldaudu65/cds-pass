@@ -32,7 +32,7 @@ export const api = {
   // CDS day
   startSession: callable<Record<string, never>, { ok: true; sessionId: string }>('startSession'),
   endSession: callable<Record<string, never>, { ok: true }>('endSession'),
-  getDoorCode: callable<Record<string, never>, { code: string; gid: string; sessionId: string; expiresAt: number }>('getDoorCode'),
+  getDoorCode: callable<Record<string, never>, { code: string; gid: string; sessionId: string; epoch?: number; expiresAt: number }>('getDoorCode'),
   checkIn: callable<
     { code: string; gid?: string; lat?: number; lng?: number; scannedAt?: number },
     { number: number; already: boolean; sessionId: string }
@@ -41,6 +41,18 @@ export const api = {
   excoCheckIn: callable<Who & { method: 'card' | 'manual' }, { number: number; already: boolean; member: PublicMember }>('excoCheckIn'),
   setPriority: callable<Who, { ok: true; pNumber: number }>('setPriority'),
   callNext: callable<{ mode: 'priority' | 'next' }, { ok: true; batch: Batch; notified: number; inBatch: number }>('callNext'),
+  giveNextNumber: callable<Who, { number: number; already: boolean; member: PublicMember }>('giveNextNumber'),
+  sendGroupMessage: callable<
+    { title: string; body: string; audience: 'all' | 'unpaid' | 'pending' | 'excos'; link: string },
+    { ok: true; recipients: number; delivered: number; left: number }
+  >('sendGroupMessage'),
+  listGroupMessages: callable<
+    Record<string, never>,
+    {
+      left: number;
+      messages: { id: string; title: string; body: string; audience: string; recipients: number; delivered: number; sentByName: string; sentAt: number | null }[];
+    }
+  >('listGroupMessages'),
   testNotification: callable<Record<string, never>, { sent: number; registered: number; members: number }>('testNotification'),
   tableCheck: callable<Who, TableCheckResponse>('tableCheck'),
   markDone: callable<Who, { ok: true }>('markDone'),
@@ -49,7 +61,7 @@ export const api = {
   listBanks: callable<Record<string, never>, { name: string; code: string }[]>('listBanks'),
   resolveAccount: callable<{ bankCode: string; accountNumber: string }, { accountName: string }>('resolveAccount'),
   setPayoutAccount: callable<{ bankCode: string; bankName: string; accountNumber: string }, { ok: true; accountName: string }>('setPayoutAccount'),
-  createDues: callable<{ title: string; amountNaira: number; dueDate?: string }, { ok: true; duesId: string }>('createDues'),
+  createDues: callable<{ title: string; amountNaira: number; dueDate?: string; requiredForCheckIn?: boolean }, { ok: true; duesId: string }>('createDues'),
   closeDues: callable<{ duesId: string }, { ok: true }>('closeDues'),
   startPayment: callable<{ duesId: string; returnUrl: string }, { authorizationUrl: string; reference: string; totalKobo: number }>('startPayment'),
   verifyPayment: callable<{ reference: string }, { status: string }>('verifyPayment'),

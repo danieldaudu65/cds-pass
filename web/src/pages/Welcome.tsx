@@ -39,8 +39,8 @@ export default function Welcome() {
   if (resume) return <Navigate to="/signup" replace />;
 
   return (
-    <div className="screen bg-green-dark text-white lg:max-w-6xl lg:flex-row">
-      <div className="grid-bg relative h-[46dvh] min-h-[320px] lg:h-auto lg:w-1/2">
+    <div className="screen hero-green text-white lg:max-w-6xl lg:flex-row">
+      <div className="relative h-[46dvh] min-h-[320px] lg:h-auto lg:w-1/2">
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_40%,rgba(14,127,70,.8),transparent_65%)]" />
         <div className="relative h-full">
           {use3D ? (
@@ -64,17 +64,24 @@ export default function Welcome() {
           <br />
           <span className="text-green">for numbers at CDS.</span>
         </h1>
+        <span className="mt-3 block h-1.5 w-16 rounded-full bg-gold" />
 
-        <ul className="mt-6 space-y-4">
+        <ul className="mt-5 space-y-2.5">
           {points.map((p, i) => (
             <motion.li
               key={p.t}
               initial={{ x: -20, opacity: 0 }}
               animate={{ x: 0, opacity: 1 }}
               transition={{ delay: 0.15 + i * 0.1 }}
-              className="flex gap-3"
+              className={`flex gap-3 rounded-2xl p-3 ${i === 0 ? 'bg-green-light' : i === 1 ? 'bg-card shadow-card' : 'bg-gold-bg'}`}
             >
-              <span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-green text-sm font-extrabold text-white">{i + 1}</span>
+              <span
+                className={`grid h-9 w-9 shrink-0 place-items-center rounded-xl font-display text-sm font-extrabold ${
+                  i === 0 ? 'bg-green text-white' : i === 1 ? 'bg-green-light text-green' : 'bg-gold-bg text-gold-text'
+                }`}
+              >
+                {i + 1}
+              </span>
               <div>
                 <p className="font-bold">{p.t}</p>
                 <p className="text-sm text-muted">{p.d}</p>
@@ -84,7 +91,9 @@ export default function Welcome() {
         </ul>
 
         <div className="mt-auto space-y-3 pt-8 lg:mt-10 lg:max-w-sm">
-          <Button onClick={() => nav('/signup')}>Get started</Button>
+          <Button variant="gold" onClick={() => nav('/signup')}>
+            Get started
+          </Button>
           <Button variant="outline" onClick={() => nav('/login')}>
             I already have an account
           </Button>

@@ -5,7 +5,7 @@ import { Avatar } from '../../components/Avatar';
 import { ExcoHeader } from '../../components/ExcoHeader';
 import { Button, ErrorBox, Icon, Page, Pill, Stat } from '../../components/ui';
 import { useExcoDay } from '../../hooks/useExco';
-import { useGroupMembers } from '../../hooks/useLive';
+import { usePendingMembers } from '../../hooks/useLive';
 import { api } from '../../lib/api';
 import { errorText } from '../../lib/firebase';
 import { batchLabel, tagLabel } from '../../lib/rules';
@@ -13,8 +13,9 @@ import { toast } from '../../lib/toast';
 
 export default function Dashboard() {
   const { me, group, session, attendees, stats, open } = useExcoDay();
-  const members = useGroupMembers(me.groupId);
-  const pendingCount = members?.filter((m) => m.status === 'pending').length ?? 0;
+  const isMainExco = (group?.mainExcoUid ?? group?.createdBy) === me.uid;
+  // Dashboard only needs the waiting count, so it reads just those members (not the whole group).
+  const pendingCount = usePendingMembers(me.groupId)?.length ?? 0;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -45,7 +46,7 @@ export default function Dashboard() {
         <div className="grid grid-cols-3 gap-2">
           <Stat value={stats.present} label="Present" />
           <Stat value={stats.done} label="Thumbprinted" />
-          <Stat value={stats.waiting} label="Waiting" />
+          <Stat value={stats.waiting} label="Waiting" tone="gold" />
         </div>
       </ExcoHeader>
 
@@ -56,7 +57,7 @@ export default function Dashboard() {
               <p className="font-bold">Today's meeting</p>
               <p className="text-sm text-muted">{open ? 'Open. Members can scan in.' : session ? 'Closed' : 'Not opened yet'}</p>
             </div>
-            <Pill tone={open ? 'green' : 'muted'}>{open ? 'Live' : 'Off'}</Pill>
+            <Pill tone={open ? 'green' : 'gold'}>{open ? '● Live' : 'Off'}</Pill>
           </div>
           <Button variant={open ? 'outline' : 'primary'} loading={busy} onClick={toggleSession}>
             {open ? 'End meeting' : "Open today's meeting"}
@@ -67,24 +68,53 @@ export default function Dashboard() {
         {open && (
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
             {[
-              { to: '/exco/door', icon: 'door', t: 'Door code', d: 'Members scan in' },
-              { to: '/exco/call', icon: 'megaphone', t: 'Call batch', d: `Now: ${batchLabel(session?.batch)}` },
-              { to: '/exco/table', icon: 'finger', t: 'Table check', d: 'Green or red' },
-              { to: '/exco/members', icon: 'users', t: 'Members', d: pendingCount ? `${pendingCount} to approve` : 'All approved' },
-            ].map((c) => (
-              <Link key={c.to} to={c.to} className="card !p-4 transition active:scale-[0.98]">
-                <span className="grid h-11 w-11 place-items-center rounded-xl bg-green-light text-green">
-                  <Icon name={c.icon} />
-                </span>
-                <p className="mt-3 font-bold">{c.t}</p>
-                <p className="text-xs text-muted">{c.d}</p>
-              </Link>
+              { to: '/exco/door', icon: 'door', t: 'Door code', d: 'Members scan in', tone: 'solid' },
+              { to: '/exco/call', icon: 'megaphone', t: 'Call batch', d: `Now: ${batchLabel(session?.batch)}`, tone: 'gold' },
+              { to: '/exco/table', icon: 'finger', t: 'Table check', d: 'Green or red', tone: 'light' },
+              { to: '/exco/members', icon: 'users', t: 'Members', d: pendingCount ? `${pendingCount} to approve` : 'All approved', tone: 'gold' },
+            ].map((c, i) => (
+              <motion.div key={c.to} initial={{ y: 14, opacity: 0 }} animate={{ y: 0, opacity: 1 }} transition={{ delay: i * 0.06 }}>
+                <Link
+                  to={c.to}
+                  className={`block rounded-3xl p-4 shadow-card transition active:scale-[0.98] ${
+                    c.tone === 'solid' ? 'number-card text-white' : c.tone === 'gold' ? 'bg-gold-bg text-gold-text' : 'bg-green-light text-green'
+                  }`}
+                >
+                  <span className={`grid h-11 w-11 place-items-center rounded-xl ${c.tone === 'solid' ? 'bg-white/15' : 'bg-card shadow-card'}`}>
+                    <Icon name={c.icon as Parameters<typeof Icon>[0]['name']} />
+                  </span>
+                  <p className="mt-3 font-display font-bold">{c.t}</p>
+                  <p className={`text-xs ${c.tone === 'solid' ? 'text-green-mid' : 'opacity-80'}`}>{c.d}</p>
+                </Link>
+              </motion.div>
             ))}
           </div>
         )}
 
+        {isMainExco && (
+          <div className="grid grid-cols-2 gap-3">
+            <Link to="/exco/messages" className="flex flex-col gap-2 rounded-3xl bg-gold-bg p-4 text-gold-text shadow-card active:scale-[0.98]">
+              <span className="grid h-11 w-11 place-items-center rounded-xl bg-card shadow-card">
+                <Icon name="bell" />
+              </span>
+              <span className="font-display font-bold">Send a message</span>
+              <span className="text-xs opacity-80">To everyone or a group</span>
+            </Link>
+            <Link
+              to="/exco/give-number"
+              className={`flex flex-col gap-2 rounded-3xl bg-green-light p-4 text-green shadow-card active:scale-[0.98] ${open ? '' : 'opacity-60'}`}
+            >
+              <span className="grid h-11 w-11 place-items-center rounded-xl bg-card shadow-card">
+                <Icon name="users" />
+              </span>
+              <span className="font-display font-bold">Give a number</span>
+              <span className="text-xs opacity-80">{open ? 'Phone off? Find them' : 'When the meeting is open'}</span>
+            </Link>
+          </div>
+        )}
+
         <Link to="/exco/dues" className="card flex items-center gap-3 !p-4">
-          <span className="grid h-11 w-11 place-items-center rounded-xl bg-green-light text-green">
+          <span className="grid h-11 w-11 place-items-center rounded-xl bg-gold-bg text-gold-text">
             <Icon name="card" />
           </span>
           <div className="flex-1">

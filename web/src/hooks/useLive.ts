@@ -96,6 +96,15 @@ export function useGroupMembers(gid: string | undefined) {
   return useMemo(() => list?.slice().sort((a, b) => a.fullName.localeCompare(b.fullName)), [list]);
 }
 
+/** Only the members waiting for approval: far fewer reads than loading the whole group. */
+export function usePendingMembers(gid: string | undefined) {
+  const q = useMemo(
+    () => (gid ? query(collection(db, 'users'), where('groupId', '==', gid), where('status', '==', 'pending')) : null),
+    [gid],
+  );
+  return useList<Profile>(q, `pending:${gid}`);
+}
+
 export function useLogs(gid: string | undefined, max = 50) {
   const [logs, setLogs] = useState<LogEntry[] | undefined>(undefined);
   useEffect(() => {

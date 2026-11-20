@@ -64,8 +64,8 @@ export default function Pending() {
   const rejected = profile.status === 'rejected';
 
   return (
-    <div className="screen bg-green-dark text-white">
-      <div className="grid-bg flex flex-1 flex-col items-center px-6 pb-8 pt-[max(2.5rem,env(safe-area-inset-top))] text-center">
+    <div className="screen hero-green text-white">
+      <div className="flex flex-1 flex-col items-center px-6 pb-8 pt-[max(2.5rem,env(safe-area-inset-top))] text-center">
         <motion.div initial={{ scale: 0.8, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="relative">
           {!rejected && (
             <motion.span

@@ -47,6 +47,7 @@ export function BottomNav({ mode }: { mode: 'member' | 'exco' }) {
                   <Icon name={t.icon} size={21} />
                 </span>
                 <span className="relative">{t.label}</span>
+                {isActive && <span className="absolute bottom-1 h-1 w-1 rounded-full bg-gold" />}
               </>
             )}
           </NavLink>

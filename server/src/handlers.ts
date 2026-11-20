@@ -180,8 +180,12 @@ function text(v: unknown, label: string, min: number, max: number): string {
   return s;
 }
 
-function doorCode(secret: string, gid: string, sid: string, window: number): string {
-  const h = createHmac('sha256', secret).update(`${gid}|${sid}|${window}`).digest();
+/**
+ * 6-digit door code for a 30-second window. `epoch` goes up each time the main exco gives someone a
+ * number by hand, which makes the code on the door screen change straight away (old one stops working).
+ */
+function doorCode(secret: string, gid: string, sid: string, window: number, epoch = 0): string {
+  const h = createHmac('sha256', secret).update(epoch ? `${gid}|${sid}|${window}|${epoch}` : `${gid}|${sid}|${window}`).digest();
   const n = h.readUInt32BE(0) % 1_000_000;
   return n.toString().padStart(6, '0');
 }
@@ -257,6 +261,28 @@ function publicMember(uid: string, u: FirebaseFirestore.DocumentData) {
   };
 }
 
+/**
+ * "Pay before you get a number": dues marked requiredForCheckIn block check-in from their collection
+ * date onwards until the member has paid (online, or cash recorded by an exco).
+ * Throws a message that starts with "Dues not paid" so the app can show the red pay screen.
+ */
+async function assertDuesPaid(gid: string, uid: string, fullName: string, forExco: boolean) {
+  const today = lagosDate();
+  const open = await db.collection(`groups/${gid}/dues`).where('active', '==', true).get();
+  const gating = open.docs.filter((d) => d.data().requiredForCheckIn === true && (!d.data().dueDate || d.data().dueDate <= today));
+  if (!gating.length) return;
+  const statuses = await db.getAll(...gating.map((d) => duesStatusRef(gid, d.id, uid)));
+  const unpaid = gating.filter((_, i) => statuses[i].data()?.status !== 'paid');
+  if (!unpaid.length) return;
+  const what = unpaid.map((d) => `${d.data().title} (${naira(d.data().amountKobo)})`).join(', ');
+  throw fail(
+    'failed-precondition',
+    forExco
+      ? `Dues not paid: ${fullName} still owes ${what}. Record their cash payment in Dues first, then check them in.`
+      : `Dues not paid: please pay ${what} before you can get a number. Pay online in the app, or pay cash to an exco and scan again.`,
+  );
+}
+
 /** Gives a person the next number in today's queue (once). */
 async function admit(
   gid: string,
@@ -268,6 +294,9 @@ async function admit(
 ) {
   const u = (await userRef(uid).get()).data();
   if (!u || u.status !== 'approved') throw fail('failed-precondition', 'This member is not approved yet.');
+  // Already in today's queue? Then they keep their number, paid or not.
+  const existing = await attendeeRef(gid, sid, uid).get();
+  if (!existing.exists) await assertDuesPaid(gid, uid, u.fullName, by !== uid);
 
   return db.runTransaction(async (tx) => {
     const sRef = sessionRef(gid, sid);
@@ -678,9 +707,10 @@ export const getDoorCode = onCall(async (req: CallableRequest) => {
     throw fail('failed-precondition', "Open today's CDS meeting first.");
   }
   const secret = (await keysRef(e.gid).get()).data()?.doorSecret as string;
+  const epoch = Number(s.data()!.doorEpoch ?? 0);
   const now = Date.now();
   const w = Math.floor(now / WINDOW_MS);
-  return { code: doorCode(secret, e.gid, sid, w), gid: e.gid, sessionId: sid, expiresAt: (w + 1) * WINDOW_MS };
+  return { code: doorCode(secret, e.gid, sid, w, epoch), gid: e.gid, sessionId: sid, epoch, expiresAt: (w + 1) * WINDOW_MS };
 });
 
 /**
@@ -707,12 +737,15 @@ export const checkIn = onCall(async (req: CallableRequest) => {
   }
   const sid = lagosDate(at);
 
-  const [g, keys] = await Promise.all([groupRef(gid).get(), keysRef(gid).get()]);
+  const [g, keys, sess] = await Promise.all([groupRef(gid).get(), keysRef(gid).get(), sessionRef(gid, sid).get()]);
   const secret = keys.data()?.doorSecret as string | undefined;
   if (!secret) throw fail('internal', 'Group is not set up correctly.');
 
   const w = Math.floor(at / WINDOW_MS);
-  if (![w, w - 1].some((x) => doorCode(secret, gid, sid, x) === code)) {
+  const epoch = Number(sess.data()?.doorEpoch ?? 0);
+  // Live scans must match the current door code. Saved (offline) scans may be from before a reset.
+  const epochs = offline ? Array.from({ length: Math.min(epoch, 20) + 1 }, (_, i) => epoch - i) : [epoch];
+  if (!epochs.some((ep) => [w, w - 1].some((x) => doorCode(secret, gid, sid, x, ep) === code))) {
     throw fail('invalid-argument', 'That code has expired. Scan the code on the exco screen again.');
   }
 
@@ -742,12 +775,30 @@ export const lookupMember = onCall(async (req: CallableRequest) => {
 
 /** Exco checks in someone without a working phone (printed card, or manual by state code). */
 export const excoCheckIn = onCall(async (req: CallableRequest) => {
-  const e = await exco(req);
-  const { uid, user } = await findMember(e.gid, req.data);
   const method = req.data?.method === 'card' ? 'card' : 'manual';
+  // Printed cards: any exco at the door. Typing a state code by hand: main exco only (use giveNextNumber).
+  const e = method === 'card' ? await exco(req) : await mainExco(req);
+  const { uid, user } = await findMember(e.gid, req.data);
   const r = await admit(e.gid, lagosDate(), uid, method, e.uid, Date.now());
   if (!r.already && method === 'manual') {
     await log(e.gid, e.uid, 'manual_checkin', { target: uid, stateCode: user.stateCode, number: r.number });
+  }
+  return { ...r, member: publicMember(uid, user) };
+});
+
+/**
+ * Main exco gives a registered member the next number by hand (phone off, flat battery …).
+ * Afterwards the door code changes immediately, so nobody can reuse the code that was on screen.
+ */
+export const giveNextNumber = onCall(async (req: CallableRequest) => {
+  const e = await mainExco(req);
+  const { uid, user } = await findMember(e.gid, req.data);
+  const sid = lagosDate();
+  const r = await admit(e.gid, sid, uid, 'manual', e.uid, Date.now());
+  await sessionRef(e.gid, sid).update({ doorEpoch: FieldValue.increment(1), doorResetAt: FieldValue.serverTimestamp() });
+  if (!r.already) {
+    await log(e.gid, e.uid, 'manual_checkin', { target: uid, stateCode: user.stateCode, number: r.number });
+    await notify([uid], `Your number is ${r.number}`, `${e.name} checked you in at the door. Your number is ${r.number}.`, '/tag', 'checkin');
   }
   return { ...r, member: publicMember(uid, user) };
 });
@@ -847,6 +898,72 @@ export const testNotification = onCall(async (req: CallableRequest) => {
   );
   await log(e.gid, e.uid, 'notification_test', { notified: sent, targetMembers: targets.length });
   return { sent, registered: targets.length, members: registered };
+});
+
+const MESSAGES_PER_DAY = 5;
+const MESSAGE_LINKS = new Set(['/home', '/dues', '/tag', '/scan']);
+type Audience = 'all' | 'unpaid' | 'pending' | 'excos';
+
+/**
+ * Main exco sends their own push message ("Good morning corpers", "Job alert" …) to a chosen group of
+ * members. Limited to 5 a day per CDS group so people don't switch notifications off.
+ */
+export const sendGroupMessage = onCall(async (req: CallableRequest) => {
+  const e = await mainExco(req);
+  const title = text(req.data?.title, 'Title', 3, 60);
+  const body = text(req.data?.body, 'Message', 3, 300);
+  const audience: Audience = ['all', 'unpaid', 'pending', 'excos'].includes(req.data?.audience) ? req.data.audience : 'all';
+  const link = MESSAGE_LINKS.has(req.data?.link) ? (req.data.link as string) : '/home';
+
+  const day = lagosDate();
+  const counterRef = db.doc(`groups/${e.gid}/private/messages-${day}`);
+  const used = Number((await counterRef.get()).data()?.count ?? 0);
+  if (used >= MESSAGES_PER_DAY) {
+    throw fail('resource-exhausted', `You can send ${MESSAGES_PER_DAY} messages a day. Try again tomorrow.`);
+  }
+
+  const members = await db.collection('users').where('groupId', '==', e.gid).get();
+  let targets = members.docs.filter((d) => (audience === 'pending' ? d.data().status === 'pending' : d.data().status === 'approved'));
+  if (audience === 'excos') targets = targets.filter((d) => d.data().role === 'exco');
+  if (audience === 'unpaid') {
+    const open = await db.collection(`groups/${e.gid}/dues`).where('active', '==', true).get();
+    if (open.empty) throw fail('failed-precondition', 'There are no open dues, so nobody is "not paid".');
+    const owing = new Set<string>();
+    for (const d of open.docs) (await owingMembers(e.gid, d.id)).forEach((u) => owing.add(u));
+    targets = targets.filter((d) => owing.has(d.id));
+  }
+  const uids = targets.map((d) => d.id);
+  if (!uids.length) throw fail('failed-precondition', 'Nobody matches that choice right now.');
+
+  const sent = await notify(uids, title, body, link, 'message');
+  await counterRef.set({ count: FieldValue.increment(1) }, { merge: true });
+  await db.collection(`groups/${e.gid}/messages`).add({
+    title,
+    body,
+    audience,
+    link,
+    recipients: uids.length,
+    delivered: sent,
+    sentBy: e.uid,
+    sentByName: e.name,
+    sentAt: FieldValue.serverTimestamp(),
+  });
+  await log(e.gid, e.uid, 'message_sent', { label: title, notified: sent });
+  return { ok: true, recipients: uids.length, delivered: sent, left: MESSAGES_PER_DAY - used - 1 };
+});
+
+/** History of sent messages (main exco). */
+export const listGroupMessages = onCall(async (req: CallableRequest) => {
+  const e = await mainExco(req);
+  const snap = await db.collection(`groups/${e.gid}/messages`).orderBy('sentAt', 'desc').limit(30).get();
+  const used = Number((await db.doc(`groups/${e.gid}/private/messages-${lagosDate()}`).get()).data()?.count ?? 0);
+  return {
+    left: Math.max(0, MESSAGES_PER_DAY - used),
+    messages: snap.docs.map((d) => {
+      const m = d.data();
+      return { id: d.id, title: m.title, body: m.body, audience: m.audience, recipients: m.recipients, delivered: m.delivered, sentByName: m.sentByName, sentAt: m.sentAt?.toMillis?.() ?? null };
+    }),
+  };
 });
 
 /** Exco scans a tag at the thumbprint table. Green = thumbprint, red = wait. */
@@ -1018,11 +1135,16 @@ export const createDues = onCall(async (req: CallableRequest) => {
   const amount = Number(req.data?.amountNaira);
   if (!Number.isFinite(amount) || amount < 50 || amount > 100_000) throw fail('invalid-argument', 'Amount must be ₦50 – ₦100,000.');
   const dueDate = typeof req.data?.dueDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.data.dueDate) ? req.data.dueDate : null;
+  const requiredForCheckIn = req.data?.requiredForCheckIn === true;
+  if (requiredForCheckIn && !dueDate) throw fail('invalid-argument', 'Choose the collection date, so members know when they must pay.');
+  if (dueDate && dueDate < lagosDate()) throw fail('invalid-argument', 'The collection date cannot be in the past.');
   const ref = db.collection(`groups/${e.gid}/dues`).doc();
   await ref.set({
     title,
     amountKobo: Math.round(amount * 100),
     dueDate,
+    requiredForCheckIn,
+    remindersSent: {},
     active: true,
     createdBy: e.uid,
     createdAt: FieldValue.serverTimestamp(),
@@ -1031,7 +1153,9 @@ export const createDues = onCall(async (req: CallableRequest) => {
   await notifyApprovedGroup(
     e.gid,
     `New CDS dues: ${title}`,
-    `${naira(Math.round(amount * 100))}${dueDate ? ` · due ${dueDate}` : ''}. Open CDS Pass to view or pay.`,
+    `${naira(Math.round(amount * 100))}${dueDate ? ` · collection on ${prettyDate(dueDate)}` : ''}.${
+      requiredForCheckIn ? ' You must pay before you can get a number that day.' : ''
+    } Pay online in CDS Pass or pay cash to an exco.`,
     '/dues',
   );
   return { ok: true, duesId: ref.id };
@@ -1155,9 +1279,12 @@ export const recordCash = onCall(async (req: CallableRequest) => {
   const st = await duesStatusRef(e.gid, duesId, uid).get();
   if (st.data()?.status === 'paid') throw fail('already-exists', `${user.fullName} has already paid.`);
 
+  // Cash counts straight away (so they can get a number at the door). The member is told who recorded
+  // it and can tap "This is wrong"; every record is in the activity log.
   const reference = `cash-${e.gid}-${randomBytes(6).toString('hex')}`;
   const amountKobo = d.data()!.amountKobo as number;
-  await paymentRef(e.gid, reference).set({
+  const batch = db.batch();
+  batch.set(paymentRef(e.gid, reference), {
     reference,
     uid,
     duesId,
@@ -1166,16 +1293,17 @@ export const recordCash = onCall(async (req: CallableRequest) => {
     feeKobo: 0,
     totalKobo: amountKobo,
     method: 'cash',
-    status: 'awaiting_member',
+    status: 'paid',
     recordedBy: e.uid,
     recordedByName: e.name,
     fullName: user.fullName,
     stateCode: user.stateCode,
     createdAt: FieldValue.serverTimestamp(),
+    paidAt: FieldValue.serverTimestamp(),
   });
-  await duesStatusRef(e.gid, duesId, uid).set({
+  batch.set(duesStatusRef(e.gid, duesId, uid), {
     uid,
-    status: 'cash_pending',
+    status: 'paid',
     method: 'cash',
     amountKobo,
     reference,
@@ -1184,33 +1312,109 @@ export const recordCash = onCall(async (req: CallableRequest) => {
     fullName: user.fullName,
     stateCode: user.stateCode,
     recordedAt: FieldValue.serverTimestamp(),
+    paidAt: FieldValue.serverTimestamp(),
   });
-  await log(e.gid, e.uid, 'cash_recorded', { target: uid, stateCode: user.stateCode, label: naira(amountKobo) });
-  await notify([uid], 'Confirm your cash payment', `${e.name} recorded ${naira(amountKobo)} cash for ${d.data()!.title}. Open CDS Pass to confirm.`, '/dues');
+  await batch.commit();
+  await log(e.gid, e.uid, 'cash_recorded', { target: uid, stateCode: user.stateCode, label: `${d.data()!.title} · ${naira(amountKobo)}` });
+  const time = new Date().toLocaleTimeString('en-NG', { hour: 'numeric', minute: '2-digit', timeZone: 'Africa/Lagos' });
+  await notify(
+    [uid],
+    `${naira(amountKobo)} cash recorded`,
+    `${e.name} recorded your cash payment for ${d.data()!.title} at ${time}. If this is wrong, open Dues and tap "This is wrong".`,
+    '/dues',
+    'cash',
+  );
   return { ok: true };
 });
 
-/** Member confirms (or disputes) cash the treasurer recorded. */
+/**
+ * Member flags a cash record as wrong ("I didn't pay this"). It stops counting as paid, the main exco
+ * is alerted, and it goes in the activity log. (confirm:true is still accepted from older app versions.)
+ */
 export const respondCash = onCall(async (req: CallableRequest) => {
   const { uid, gid } = approvedMember(req);
   const duesId = String(req.data?.duesId ?? '');
   const confirm = req.data?.confirm === true;
   const sRef = duesStatusRef(gid, duesId, uid);
   const st = await sRef.get();
-  if (st.data()?.status !== 'cash_pending') throw fail('failed-precondition', 'There is no cash payment waiting for you.');
-  const reference = st.data()!.reference as string;
+  const s0 = st.data();
+  if (!s0 || s0.method !== 'cash' || (s0.status !== 'cash_pending' && s0.status !== 'paid')) {
+    throw fail('failed-precondition', 'There is no cash record to respond to.');
+  }
+  const reference = s0.reference as string;
   const batch = db.batch();
   if (confirm) {
     batch.update(sRef, { status: 'paid', paidAt: FieldValue.serverTimestamp() });
     batch.update(paymentRef(gid, reference), { status: 'paid', paidAt: FieldValue.serverTimestamp() });
   } else {
-    batch.delete(sRef);
+    batch.update(sRef, { status: 'disputed', disputedAt: FieldValue.serverTimestamp() });
     batch.update(paymentRef(gid, reference), { status: 'disputed', disputedAt: FieldValue.serverTimestamp() });
   }
   await batch.commit();
-  await log(gid, uid, confirm ? 'cash_confirmed' : 'cash_disputed', { target: uid, reference });
+  await log(gid, uid, confirm ? 'cash_confirmed' : 'cash_disputed', { target: uid, reference, label: s0.recordedByName });
+  if (!confirm) {
+    const g = (await groupRef(gid).get()).data();
+    const main = (g?.mainExcoUid ?? g?.createdBy) as string | undefined;
+    const who = (await userRef(uid).get()).data();
+    if (main) {
+      await notify(
+        [main],
+        'Cash record disputed',
+        `${who?.fullName ?? 'A member'} says they did not pay the cash ${s0.recordedByName ?? 'an exco'} recorded. Check Dues.`,
+        '/exco/dues',
+        'dispute',
+      );
+    }
+  }
   return { ok: true };
 });
+
+/** Approved members of a group who haven't paid these dues. */
+async function owingMembers(gid: string, duesId: string) {
+  const [members, statuses] = await Promise.all([
+    db.collection('users').where('groupId', '==', gid).get(),
+    db.collection(`groups/${gid}/dues/${duesId}/status`).get(),
+  ]);
+  const paid = new Set(statuses.docs.filter((s) => s.data().status === 'paid').map((s) => s.id));
+  return members.docs.filter((m) => m.data().status === 'approved' && !paid.has(m.id)).map((m) => m.id);
+}
+
+const prettyDate = (ymd: string) =>
+  new Date(`${ymd}T12:00:00+01:00`).toLocaleDateString('en-NG', { weekday: 'long', day: 'numeric', month: 'short', timeZone: 'Africa/Lagos' });
+
+/**
+ * Automatic dues reminders. Called by cron-job.org (GET /cron/reminders?key=CRON_SECRET), e.g. at 18:00
+ * and 07:00 Lagos time. Evening run: dues collected TOMORROW. Morning run: dues collected TODAY.
+ * Each reminder is sent once per dues per slot, so extra calls are harmless.
+ */
+export async function runDuesReminders(now = Date.now()) {
+  const today = lagosDate(now);
+  const tomorrow = lagosDate(now + 24 * 3600_000);
+  const hour = Number(new Date(now).toLocaleString('en-GB', { hour: '2-digit', hour12: false, timeZone: 'Africa/Lagos' }));
+  const evening = hour >= 12;
+  const target = evening ? tomorrow : today;
+  const slot = `${target}:${evening ? 'eve' : 'morning'}`;
+  let reminded = 0;
+  const groups = await db.collection('groups').get();
+  for (const g of groups.docs) {
+    const open = await db.collection(`groups/${g.id}/dues`).where('active', '==', true).get();
+    for (const d of open.docs) {
+      const dues = d.data();
+      if (dues.dueDate !== target || dues.remindersSent?.[slot]) continue;
+      const owing = await owingMembers(g.id, d.id);
+      const amount = naira(dues.amountKobo);
+      const title = evening ? `Dues collection tomorrow: ${amount}` : `Dues collection today: ${amount}`;
+      const body = `${dues.title}. ${
+        dues.requiredForCheckIn ? 'You must pay before you can get a number. ' : ''
+      }Pay online in CDS Pass now, or pay cash to an exco.`;
+      const sent = await notify(owing, title, body, '/dues', 'dues-reminder');
+      await d.ref.update({ [`remindersSent.${slot}`]: FieldValue.serverTimestamp() });
+      await log(g.id, 'system', 'dues_reminder', { label: `${dues.title} (${evening ? 'evening before' : 'morning'})`, notified: sent });
+      reminded += owing.length;
+    }
+  }
+  return { slot, reminded };
+}
 
 /** Buzz everyone who hasn't paid yet. */
 export const remindDues = onCall(async (req: CallableRequest) => {
@@ -1218,12 +1422,7 @@ export const remindDues = onCall(async (req: CallableRequest) => {
   const duesId = String(req.data?.duesId ?? '');
   const d = await duesRef(e.gid, duesId).get();
   if (!d.exists) throw fail('not-found', 'Dues not found.');
-  const [members, statuses] = await Promise.all([
-    db.collection('users').where('groupId', '==', e.gid).get(),
-    db.collection(`groups/${e.gid}/dues/${duesId}/status`).get(),
-  ]);
-  const paid = new Set(statuses.docs.filter((s) => s.data().status === 'paid').map((s) => s.id));
-  const owing = members.docs.filter((m) => m.data().status === 'approved' && !paid.has(m.id)).map((m) => m.id);
+  const owing = await owingMembers(e.gid, duesId);
   const sent = await notify(owing, `${d.data()!.title}: ${naira(d.data()!.amountKobo)}`, 'Tap to pay your CDS dues in CDS Pass.', '/dues');
   await log(e.gid, e.uid, 'dues_reminder', { label: d.data()!.title, notified: sent });
   return { ok: true, owing: owing.length, notified: sent };

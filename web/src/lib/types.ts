@@ -34,7 +34,10 @@ export interface Dues {
   id: string;
   title: string;
   amountKobo: number;
+  /** Collection date (YYYY-MM-DD). */
   dueDate: string | null;
+  /** Members must pay before they can get a number, from the collection date. */
+  requiredForCheckIn?: boolean;
   active: boolean;
   createdAt?: Timestamp;
 }
@@ -42,7 +45,7 @@ export interface Dues {
 /** groups/{gid}/dues/{duesId}/status/{uid} */
 export interface DuesStatus {
   uid: string;
-  status: 'paid' | 'cash_pending';
+  status: 'paid' | 'cash_pending' | 'disputed';
   method: 'online' | 'cash';
   amountKobo: number;
   reference: string;
@@ -82,6 +85,8 @@ export interface Session {
   lastTo: number;
   batchSeq: number;
   batch: Batch | null;
+  /** Goes up when the main exco gives a number by hand; the door screen fetches a new code. */
+  doorEpoch?: number;
 }
 
 export interface Attendee {

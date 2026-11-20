@@ -5,7 +5,7 @@ import { Avatar } from '../../components/Avatar';
 import { ExcoHeader } from '../../components/ExcoHeader';
 import { MemberCard } from '../../components/MemberCard';
 import { QRScan } from '../../components/QRScan';
-import { Button, ErrorBox, Icon, Page, Pill } from '../../components/ui';
+import { Button, ErrorBox, Icon, Page, Pill, Select } from '../../components/ui';
 import { useMe } from '../../hooks/useAuth';
 import { useGroup, useGroupMembers } from '../../hooks/useLive';
 import { api } from '../../lib/api';
@@ -239,16 +239,17 @@ export default function Members() {
                     </button>
                   )}
                 </span>
-                <select
-                  aria-label="Sort members"
+                <Select<Sort>
+                  size="sm"
+                  className="w-40"
                   value={sort}
-                  onChange={(e) => setSort(e.target.value as Sort)}
-                  className="h-10 rounded-xl border border-line bg-card px-3 font-bold text-ink"
-                >
-                  <option value="name">Name A–Z</option>
-                  <option value="code">State code</option>
-                  <option value="newest">Newest first</option>
-                </select>
+                  onChange={setSort}
+                  options={[
+                    { value: 'name', label: 'Name A–Z' },
+                    { value: 'code', label: 'State code' },
+                    { value: 'newest', label: 'Newest first' },
+                  ]}
+                />
               </div>
 
               {members === undefined ? (

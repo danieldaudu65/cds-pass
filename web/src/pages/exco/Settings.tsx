@@ -1,6 +1,7 @@
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { ThemeToggle } from '../../components/ThemeToggle';
-import { Button, ErrorBox, Field, Page, TopBar } from '../../components/ui';
+import { Button, ErrorBox, Field, Icon, Page, TopBar } from '../../components/ui';
 import { useMe } from '../../hooks/useAuth';
 import { useGroup, useLogs } from '../../hooks/useLive';
 import { api } from '../../lib/api';
@@ -161,14 +162,31 @@ export default function Settings() {
         </div>
 
         <div className="card space-y-3">
-          <p className="font-bold">Test notifications</p>
-          <p className="text-sm text-muted">The main exco can send a test alert to every approved CDS member who has enabled notifications.</p>
+          <p className="font-bold">Main exco tools</p>
           {(group?.mainExcoUid ?? group?.createdBy) === me.uid ? (
-            <Button variant="ghost" loading={busy === 'notification'} onClick={testNotification}>
-              Send test notification to all members
-            </Button>
+            <>
+              <Link to="/exco/messages" className="flex items-center gap-3 rounded-2xl bg-gold-bg p-4 text-gold-text">
+                <Icon name="bell" />
+                <span className="flex-1">
+                  <span className="block font-bold">Send a message</span>
+                  <span className="block text-xs opacity-80">Good morning, job alerts, dues reminders… to everyone or a chosen group</span>
+                </span>
+                →
+              </Link>
+              <Link to="/exco/give-number" className="flex items-center gap-3 rounded-2xl bg-green-light p-4 text-green">
+                <Icon name="users" />
+                <span className="flex-1">
+                  <span className="block font-bold">Give a number</span>
+                  <span className="block text-xs opacity-80">For a registered member whose phone is off. The door code changes after.</span>
+                </span>
+                →
+              </Link>
+              <Button variant="ghost" loading={busy === 'notification'} onClick={testNotification}>
+                Send a test notification
+              </Button>
+            </>
           ) : (
-            <p className="text-sm font-semibold text-muted">Only the main exco can send the group test notification.</p>
+            <p className="text-sm font-semibold text-muted">Only the main exco can send messages and give numbers by hand.</p>
           )}
         </div>
 

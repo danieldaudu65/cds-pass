@@ -65,6 +65,24 @@ const STATUS: Record<string, number> = {
   'deadline-exceeded': 504,
 };
 
+/**
+ * Automatic dues reminders. cron-job.org calls this twice a day (e.g. 07:00 and 18:00 Lagos):
+ *   GET /cron/reminders?key=<CRON_SECRET>
+ */
+app.get('/cron/reminders', async (req: Request, res: Response) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret || req.query.key !== secret) {
+    res.status(403).json({ error: 'forbidden' });
+    return;
+  }
+  try {
+    res.json(await handlers.runDuesReminders());
+  } catch (e) {
+    console.error('[cron/reminders]', e);
+    res.status(500).json({ error: 'failed' });
+  }
+});
+
 const actions = handlers as unknown as Record<string, Callable | RawEndpoint | undefined>;
 
 app.post('/api/:name', async (req: Request, res: Response) => {

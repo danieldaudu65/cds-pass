@@ -18,6 +18,10 @@ function DuesCard({ dues, hasAccount }: { dues: DuesItem; hasAccount: boolean })
   const [error, setError] = useState('');
   const paid = status?.status === 'paid';
   const cashPending = status?.status === 'cash_pending';
+  const disputed = status?.status === 'disputed';
+  const collection = dues.dueDate
+    ? new Date(`${dues.dueDate}T12:00:00`).toLocaleDateString('en-NG', { weekday: 'long', day: 'numeric', month: 'short' })
+    : null;
 
   async function pay() {
     setError('');
@@ -36,7 +40,7 @@ function DuesCard({ dues, hasAccount }: { dues: DuesItem; hasAccount: boolean })
     setBusy(confirm ? 'yes' : 'no');
     try {
       await api.respondCash({ duesId: dues.id, confirm });
-      toast(confirm ? 'Cash payment confirmed' : 'Reported to your excos', confirm ? 'success' : 'info');
+      toast(confirm ? 'Cash payment confirmed' : 'Reported to your main exco', confirm ? 'success' : 'info');
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -49,10 +53,9 @@ function DuesCard({ dues, hasAccount }: { dues: DuesItem; hasAccount: boolean })
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="text-lg font-extrabold">{dues.title}</p>
-          {dues.dueDate && (
-            <p className="text-sm text-muted">
-              Due {new Date(`${dues.dueDate}T12:00:00`).toLocaleDateString('en-NG', { day: 'numeric', month: 'short' })}
-            </p>
+          {collection && <p className="text-sm text-muted">Collection on {collection}</p>}
+          {dues.requiredForCheckIn && !paid && (
+            <p className="mt-1 inline-flex rounded-full bg-bad-bg px-2.5 py-1 text-xs font-bold text-bad">Pay before you can get a number</p>
           )}
         </div>
         <p className="text-2xl font-extrabold text-green">{naira(dues.amountKobo)}</p>
@@ -66,10 +69,29 @@ function DuesCard({ dues, hasAccount }: { dues: DuesItem; hasAccount: boolean })
           <div>
             <p className="font-extrabold">Paid</p>
             <p className="text-xs">
-              {status.method === 'cash' ? 'Cash, confirmed by you' : 'Online'} ·{' '}
-              {status.paidAt?.toDate().toLocaleDateString('en-NG', { day: 'numeric', month: 'short' })}
+              {status.method === 'cash' ? `Cash, recorded by ${status.recordedByName ?? 'an exco'}` : 'Online'} ·{' '}
+              {(status.paidAt ?? status.recordedAt)?.toDate().toLocaleString('en-NG', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })}
             </p>
           </div>
+          {status.method === 'cash' && (
+            <button
+              disabled={busy === 'no'}
+              onClick={() =>
+                confirm(`Report that you did NOT pay this ${naira(status.amountKobo)} cash? Your main exco will be told.`) && respond(false)
+              }
+              className="ml-auto rounded-xl px-2 py-1 text-xs font-bold text-bad underline disabled:opacity-50"
+            >
+              This is wrong
+            </button>
+          )}
+        </div>
+      ) : disputed ? (
+        <div className="rounded-2xl bg-bad-bg p-4 text-sm text-bad">
+          <p className="font-bold">You reported a cash record as wrong.</p>
+          <p>Your main exco has been told and will sort it out. Until then this counts as not paid.</p>
+          <Button className="mt-3" loading={busy === 'pay'} disabled={!hasAccount} onClick={pay}>
+            <Icon name="card" /> Pay {naira(duesCharges(dues.amountKobo).totalKobo)} online
+          </Button>
         </div>
       ) : cashPending ? (
         <div className="space-y-3 rounded-2xl bg-warn-bg p-4 text-warn">

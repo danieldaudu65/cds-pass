@@ -28,8 +28,8 @@ export function InstallGate({ children }: { children: ReactNode }) {
   if (!needed || standalone) return <>{children}</>;
 
   return (
-    <div className="screen bg-green-dark text-white">
-      <div className="grid-bg flex flex-1 flex-col px-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] pt-[max(2.5rem,env(safe-area-inset-top))]">
+    <div className="screen hero-green text-white">
+      <div className="flex flex-1 flex-col px-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] pt-[max(2.5rem,env(safe-area-inset-top))]">
         <motion.div
           initial={{ y: 20, opacity: 0, rotate: -6 }}
           animate={{ y: 0, opacity: 1, rotate: 0 }}

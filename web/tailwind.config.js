@@ -25,11 +25,14 @@ export default {
         muted: v('muted'),
         line: v('line'),
         khaki: '#C9B783',
+        // Soft gold accent: small touches only (badges, one tile, avatar ring).
+        gold: { DEFAULT: '#D9C58A', bg: v('gold-bg'), text: v('gold-text') },
         warn: { DEFAULT: v('warn'), bg: v('warn-bg') },
         bad: { DEFAULT: '#B42318', bg: v('bad-bg') },
       },
       fontFamily: {
         sans: ['"Plus Jakarta Sans"', 'system-ui', 'sans-serif'],
+        display: ['Poppins', '"Plus Jakarta Sans"', 'system-ui', 'sans-serif'],
       },
       boxShadow: {
         card: '0 10px 30px rgb(var(--shadow) / 0.12)',

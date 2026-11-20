@@ -21,6 +21,8 @@ services:
         sync: false
       - key: PLATFORM_ADMIN_STATE_CODE
         value: LA/26B/2578
+      - key: CRON_SECRET # any long random text; cron-job.org calls /cron/reminders?key=<this>
+        sync: false
       - key: FIREBASE_SERVICE_ACCOUNT # service-account JSON (or base64 of it)
         sync: false
       - key: FIREBASE_STORAGE_BUCKET # e.g. your-id.firebasestorage.app

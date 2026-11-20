@@ -21,6 +21,8 @@ import DuesAdmin from './pages/exco/DuesAdmin';
 import CallBatch from './pages/exco/CallBatch';
 import Dashboard from './pages/exco/Dashboard';
 import Door from './pages/exco/Door';
+import GiveNumber from './pages/exco/GiveNumber';
+import Messages from './pages/exco/Messages';
 import Members from './pages/exco/Members';
 import PrintCards from './pages/exco/PrintCards';
 import Settings from './pages/exco/Settings';
@@ -28,7 +30,7 @@ import Table from './pages/exco/Table';
 
 function Splash() {
   return (
-    <div className="grid min-h-[100dvh] place-items-center bg-green-dark">
+    <div className="hero-green grid min-h-[100dvh] place-items-center">
       <div className="flex flex-col items-center gap-4 text-white">
         <img src="/icon.svg" alt="" className="h-20 w-20 rounded-3xl shadow-lift" />
         <Spinner light />
@@ -186,6 +188,8 @@ export default function App() {
           <Route path="members" element={<Members />} />
           <Route path="dues" element={<DuesAdmin />} />
           <Route path="settings" element={<Settings />} />
+          <Route path="give-number" element={<GiveNumber />} />
+          <Route path="messages" element={<Messages />} />
         </Route>
         <Route path="/exco/cards" element={profile?.role === 'exco' ? <PrintCards /> : <Navigate to="/home" replace />} />
         <Route path="*" element={<Navigate to={homePath} replace />} />
