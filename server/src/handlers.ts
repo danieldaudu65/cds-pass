@@ -10,7 +10,7 @@
  */
 import { onCall, onRequest, HttpsError, CallableRequest, setGlobalOptions, defineSecret } from './compat';
 import { initAdmin } from './admin';
-import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
+import { getFirestore, FieldPath, FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { getAuth } from 'firebase-admin/auth';
 import { getMessaging } from 'firebase-admin/messaging';
 import { mongoCollection, mongoConfigured } from './mongo';
@@ -164,6 +164,9 @@ async function mainExco(req: CallableRequest) {
 async function platformAdmin(req: CallableRequest) {
   const { uid } = signedIn(req);
   const adminStateCode = normalizeStateCode(process.env.PLATFORM_ADMIN_STATE_CODE);
+  // Admin-team members may create groups too (registerPlatformAdmin below still checks the owner's state code).
+  const r = await roleForEmail((req.auth?.token?.email as string | undefined) ?? (await auth.getUser(uid)).email);
+  if (r && (r.role === 'owner' || r.role === 'admin')) return { uid, adminStateCode: adminStateCode ?? r.stateCode };
   const account = await auth.getUser(uid);
   if (!adminStateCode || account.email?.toLowerCase() !== stateCodeToEmail(adminStateCode).toLowerCase()) {
     throw fail('permission-denied', 'Only the CDS Pass platform administrator can create CDS groups.');
@@ -296,7 +299,10 @@ async function admit(
   if (!u || u.status !== 'approved') throw fail('failed-precondition', 'This member is not approved yet.');
   // Already in today's queue? Then they keep their number, paid or not.
   const existing = await attendeeRef(gid, sid, uid).get();
-  if (!existing.exists) await assertDuesPaid(gid, uid, u.fullName, by !== uid);
+  if (!existing.exists) {
+    await assertGroupActive(gid);
+    await assertDuesPaid(gid, uid, u.fullName, by !== uid);
+  }
 
   return db.runTransaction(async (tx) => {
     const sRef = sessionRef(gid, sid);
@@ -383,6 +389,7 @@ async function notifyApprovedGroup(gid: string, title: string, body: string, lin
 
 /** New corps member joins a CDS group with the group's join code. Starts as "pending". */
 export const registerMember = onCall(async (req: CallableRequest) => {
+  if ((await platformConfig()).signupsPaused) throw fail('unavailable', 'New sign-ups are paused for a short while. Please try again later.');
   const { uid } = signedIn(req);
   const p = await validateProfile(uid, req.data);
   const joinCode = String(req.data?.joinCode ?? '').trim().toUpperCase();
@@ -653,6 +660,7 @@ export const updateGroupSettings = onCall(async (req: CallableRequest) => {
 // ---------------------------------------------------------------- CDS day
 
 export const startSession = onCall(async (req: CallableRequest) => {
+  await assertGroupActive((req.auth?.token?.gid as string) ?? '');
   const e = await exco(req);
   const sid = lagosDate();
   const ref = sessionRef(e.gid, sid);
@@ -1175,6 +1183,8 @@ export const closeDues = onCall(async (req: CallableRequest) => {
 
 /** Member starts an online payment. Returns the Paystack checkout link. */
 export const startPayment = onCall({ secrets: [paystackSecret] }, async (req: CallableRequest) => {
+  if ((await platformConfig()).paymentsPaused) throw fail('unavailable', 'Online payments are paused for a short while. You can pay cash to an exco.');
+  await assertGroupActive((req.auth?.token?.gid as string) ?? '');
   const { uid, gid } = approvedMember(req);
   const duesId = String(req.data?.duesId ?? '');
   const returnUrl = String(req.data?.returnUrl ?? '');
@@ -1426,4 +1436,293 @@ export const remindDues = onCall(async (req: CallableRequest) => {
   const sent = await notify(owing, `${d.data()!.title}: ${naira(d.data()!.amountKobo)}`, 'Tap to pay your CDS dues in CDS Pass.', '/dues');
   await log(e.gid, e.uid, 'dues_reminder', { label: d.data()!.title, notified: sent });
   return { ok: true, owing: owing.length, notified: sent };
+});
+
+/* ======================================================================================
+ * PLATFORM ADMIN MODE (Derik + team)
+ * --------------------------------------------------------------------------------------
+ * Owner  = PLATFORM_ADMIN_STATE_CODE on Render. Can do everything, and manage the team.
+ * Team   = platform/config.team { "LA/26B/1234": "admin" | "viewer" } (owner adds/removes).
+ *          viewer: sees charts and all groups.  admin: also switches, broadcasts, creates groups.
+ * Config = platform/config { signupsPaused, paymentsPaused, maintenance, banner, team }.
+ *          Server-only document (clients can't read it); the app gets public bits via appStatus.
+ * ====================================================================================== */
+
+type PlatformRole = 'owner' | 'admin' | 'viewer';
+interface PlatformConfig {
+  signupsPaused?: boolean;
+  paymentsPaused?: boolean;
+  maintenance?: string | null;
+  banner?: string | null;
+  team?: Record<string, 'admin' | 'viewer'>;
+}
+
+const platformRef = () => db.doc('platform/config');
+let configCache: { at: number; value: PlatformConfig } | null = null;
+
+async function platformConfig(fresh = false): Promise<PlatformConfig> {
+  if (!fresh && configCache && Date.now() - configCache.at < 30_000) return configCache.value;
+  const value = ((await platformRef().get()).data() ?? {}) as PlatformConfig;
+  configCache = { at: Date.now(), value };
+  return value;
+}
+
+/** Works out the platform role from the login email (state code). */
+async function roleForEmail(email: string | undefined | null): Promise<{ role: PlatformRole; stateCode: string } | null> {
+  if (!email) return null;
+  const e = email.toLowerCase();
+  const owner = normalizeStateCode(process.env.PLATFORM_ADMIN_STATE_CODE);
+  if (owner && stateCodeToEmail(owner).toLowerCase() === e) return { role: 'owner', stateCode: owner };
+  const team = (await platformConfig()).team ?? {};
+  for (const [sc, role] of Object.entries(team)) {
+    if (stateCodeToEmail(sc).toLowerCase() === e) return { role, stateCode: sc };
+  }
+  return null;
+}
+
+async function platformMember(req: CallableRequest, need: PlatformRole = 'viewer') {
+  const { uid } = signedIn(req);
+  const email = (req.auth?.token?.email as string | undefined) ?? (await auth.getUser(uid)).email;
+  const r = await roleForEmail(email);
+  const rank = { viewer: 1, admin: 2, owner: 3 };
+  if (!r || rank[r.role] < rank[need]) {
+    throw fail('permission-denied', need === 'owner' ? 'Only the CDS Pass owner can do this.' : 'This is for the CDS Pass admin team only.');
+  }
+  const me = (await userRef(uid).get()).data();
+  return { uid, ...r, name: (me?.fullName as string) ?? r.stateCode };
+}
+
+/** Used by main.ts: while maintenance is on, only the admin team can use the app. */
+export async function maintenanceGate(action: string, email: string | undefined): Promise<string | null> {
+  if (action.startsWith('admin') || action === 'appStatus') return null;
+  const msg = (await platformConfig()).maintenance;
+  if (!msg) return null;
+  return (await roleForEmail(email)) ? null : msg;
+}
+
+/** Group switched off by the platform admin. */
+async function assertGroupActive(gid: string) {
+  const g = (await groupRef(gid).get()).data();
+  if (g?.paused) throw fail('failed-precondition', 'This CDS group is paused on CDS Pass. Please contact your main exco.');
+}
+
+/** Public: banner + maintenance message (no login needed). */
+export const appStatus = onCall(async () => {
+  const c = await platformConfig();
+  return { banner: c.banner ?? null, maintenance: c.maintenance ?? null, signupsPaused: !!c.signupsPaused, paymentsPaused: !!c.paymentsPaused };
+});
+
+/** Tells the app whether this login is on the admin team (shows the mode switch). */
+export const adminWhoAmI = onCall(async (req: CallableRequest) => {
+  if (!req.auth) return { role: null };
+  const email = (req.auth.token?.email as string | undefined) ?? null;
+  const r = await roleForEmail(email);
+  return { role: r?.role ?? null };
+});
+
+/* ---------- overview: totals, charts, every group ---------- */
+
+let overviewCache: { at: number; value: unknown } | null = null;
+
+export const adminOverview = onCall(async (req: CallableRequest) => {
+  await platformMember(req, 'viewer');
+  // Cached for 5 minutes so opening the admin page doesn't burn database reads.
+  if (!req.data?.refresh && overviewCache && Date.now() - overviewCache.at < 5 * 60_000) return overviewCache.value;
+
+  const DAYS = 30;
+  const days: string[] = [];
+  for (let i = DAYS - 1; i >= 0; i--) days.push(lagosDate(Date.now() - i * 86_400_000));
+  const since = days[0];
+  const idx = new Map(days.map((d, i) => [d, i]));
+  const signups = new Array(DAYS).fill(0);
+  const checkins = new Array(DAYS).fill(0);
+  const paidKobo = new Array(DAYS).fill(0);
+  const earnedKobo = new Array(DAYS).fill(0);
+
+  const [groupsSnap, usersSnap] = await Promise.all([db.collection('groups').get(), db.collection('users').get()]);
+  const users = usersSnap.docs.map((d) => ({ id: d.id, ...(d.data() as Record<string, any>) }));
+  for (const u of users) {
+    const t = u.createdAt?.toMillis?.();
+    if (t) {
+      const i = idx.get(lagosDate(t));
+      if (i !== undefined) signups[i]++;
+    }
+  }
+
+  const groups: Array<Record<string, any> & { members: number; lastMeeting: string | null }> = [];
+  let totalOnlineKobo = 0;
+  let totalCashKobo = 0;
+  let totalEarnedKobo = 0;
+  for (const g of groupsSnap.docs) {
+    const gd = g.data();
+    const mine = users.filter((u) => u.groupId === g.id);
+    const approved = mine.filter((u) => u.status === 'approved');
+
+    // Payments (all time, paid)
+    const pays = await db.collection(`groups/${g.id}/payments`).where('status', '==', 'paid').get();
+    let online = 0;
+    let cash = 0;
+    let earned = 0;
+    for (const p of pays.docs) {
+      const d = p.data();
+      if (d.method === 'cash') cash += d.amountKobo ?? 0;
+      else {
+        online += d.amountKobo ?? 0;
+        earned += d.feeKobo ?? 0;
+      }
+      const t = d.paidAt?.toMillis?.();
+      if (t) {
+        const i = idx.get(lagosDate(t));
+        if (i !== undefined) {
+          paidKobo[i] += d.amountKobo ?? 0;
+          if (d.method !== 'cash') earnedKobo[i] += d.feeKobo ?? 0;
+        }
+      }
+    }
+    totalOnlineKobo += online;
+    totalCashKobo += cash;
+    totalEarnedKobo += earned;
+
+    // Meetings in the last 30 days: count attendees cheaply (count() = 1 read per 1000 people)
+    const sessions = await db.collection(`groups/${g.id}/sessions`).where(FieldPath.documentId(), '>=', since).get();
+    let lastMeeting: string | null = null;
+    let lastCheckins = 0;
+    for (const s of sessions.docs) {
+      const c = (await s.ref.collection('attendees').count().get()).data().count;
+      const i = idx.get(s.id);
+      if (i !== undefined) checkins[i] += c;
+      if (!lastMeeting || s.id > lastMeeting) {
+        lastMeeting = s.id;
+        lastCheckins = c;
+      }
+    }
+
+    groups.push({
+      id: g.id,
+      name: gd.name,
+      lga: gd.lga,
+      state: gd.state,
+      joinCode: gd.joinCode,
+      paused: !!gd.paused,
+      mainExcoStateCode: gd.mainExcoStateCode ?? null,
+      members: approved.length,
+      pending: mine.filter((u) => u.status === 'pending').length,
+      excos: approved.filter((u) => u.role === 'exco').length,
+      noPhoto: approved.filter((u) => !u.photoURL).length,
+      lastMeeting,
+      lastCheckins,
+      onlineKobo: online,
+      cashKobo: cash,
+      earnedKobo: earned,
+      createdAt: gd.createdAt?.toMillis?.() ?? null,
+    });
+  }
+  groups.sort((a, b) => b.members - a.members);
+
+  const value = {
+    generatedAt: Date.now(),
+    totals: {
+      groups: groups.length,
+      activeGroups: groups.filter((g) => g.lastMeeting).length,
+      members: users.filter((u) => u.status === 'approved').length,
+      pending: users.filter((u) => u.status === 'pending').length,
+      onlineKobo: totalOnlineKobo,
+      cashKobo: totalCashKobo,
+      earnedKobo: totalEarnedKobo,
+      checkins30: checkins.reduce((a, b) => a + b, 0),
+    },
+    series: { days, signups, checkins, paidKobo, earnedKobo },
+    groups,
+  };
+  overviewCache = { at: Date.now(), value };
+  return value;
+});
+
+/* ---------- switches ---------- */
+
+export const adminGetConfig = onCall(async (req: CallableRequest) => {
+  const me = await platformMember(req, 'viewer');
+  const c = await platformConfig(true);
+  return {
+    role: me.role,
+    signupsPaused: !!c.signupsPaused,
+    paymentsPaused: !!c.paymentsPaused,
+    maintenance: c.maintenance ?? null,
+    banner: c.banner ?? null,
+    team: me.role === 'owner' ? Object.entries(c.team ?? {}).map(([stateCode, role]) => ({ stateCode, role })) : [],
+    owner: normalizeStateCode(process.env.PLATFORM_ADMIN_STATE_CODE),
+  };
+});
+
+export const adminSetConfig = onCall(async (req: CallableRequest) => {
+  const me = await platformMember(req, 'admin');
+  const d = req.data ?? {};
+  const patch: Record<string, unknown> = {};
+  if (typeof d.signupsPaused === 'boolean') patch.signupsPaused = d.signupsPaused;
+  if (typeof d.paymentsPaused === 'boolean') patch.paymentsPaused = d.paymentsPaused;
+  for (const k of ['maintenance', 'banner'] as const) {
+    if (k in d) patch[k] = typeof d[k] === 'string' && d[k].trim() ? text(d[k], k === 'banner' ? 'Banner' : 'Maintenance message', 3, 200) : null;
+  }
+  if (!Object.keys(patch).length) throw fail('invalid-argument', 'Nothing to change.');
+  await platformRef().set({ ...patch, updatedBy: me.stateCode, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+  configCache = null;
+  console.log(`[platform] ${me.stateCode} changed`, patch);
+  return { ok: true };
+});
+
+export const adminSetGroupPaused = onCall(async (req: CallableRequest) => {
+  const me = await platformMember(req, 'admin');
+  const gid = String(req.data?.gid ?? '');
+  const paused = req.data?.paused === true;
+  const g = await groupRef(gid).get();
+  if (!g.exists) throw fail('not-found', 'Group not found.');
+  await groupRef(gid).update({ paused });
+  overviewCache = null;
+  await log(gid, me.uid, paused ? 'group_paused' : 'group_resumed', { label: me.stateCode });
+  return { ok: true };
+});
+
+/* ---------- broadcast ---------- */
+
+export const adminBroadcast = onCall(async (req: CallableRequest) => {
+  const me = await platformMember(req, 'admin');
+  const title = text(req.data?.title, 'Title', 3, 60);
+  const body = text(req.data?.body, 'Message', 3, 300);
+  const audience = req.data?.audience === 'excos' ? 'excos' : 'everyone';
+  const gids: string[] = Array.isArray(req.data?.gids) ? req.data.gids.map(String).slice(0, 200) : [];
+  const link = MESSAGE_LINKS.has(req.data?.link) ? (req.data.link as string) : '/home';
+
+  const users = await db.collection('users').where('status', '==', 'approved').get();
+  const uids = users.docs
+    .filter((u) => !gids.length || gids.includes(u.data().groupId))
+    .filter((u) => audience === 'everyone' || u.data().role === 'exco')
+    .map((u) => u.id);
+  if (!uids.length) throw fail('failed-precondition', 'Nobody matches that choice.');
+  const sent = await notify(uids, title, body, link, 'broadcast');
+  await db.collection('platform/config/broadcasts').add({
+    title,
+    body,
+    audience,
+    gids,
+    recipients: uids.length,
+    delivered: sent,
+    sentBy: me.stateCode,
+    sentAt: FieldValue.serverTimestamp(),
+  });
+  return { ok: true, recipients: uids.length, delivered: sent };
+});
+
+/* ---------- team (owner only) ---------- */
+
+export const adminSetTeamMember = onCall(async (req: CallableRequest) => {
+  const me = await platformMember(req, 'owner');
+  const sc = normalizeStateCode(req.data?.stateCode);
+  if (!sc) throw fail('invalid-argument', 'Enter a valid state code, e.g. LA/26B/1234.');
+  if (sc === normalizeStateCode(process.env.PLATFORM_ADMIN_STATE_CODE)) throw fail('invalid-argument', 'That is the owner account.');
+  const role = req.data?.role;
+  if (role !== 'admin' && role !== 'viewer' && role !== null) throw fail('invalid-argument', 'Choose Admin or Viewer.');
+  await platformRef().set({ team: { [sc]: role === null ? FieldValue.delete() : role } }, { merge: true });
+  configCache = null;
+  console.log(`[platform] ${me.stateCode} set team ${sc} = ${role}`);
+  return { ok: true };
 });

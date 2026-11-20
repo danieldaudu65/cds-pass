@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { Navigate, Outlet, Route, Routes } from 'react-router-dom';
 import { BottomNav } from './components/BottomNav';
 import { InstallGate } from './components/InstallGate';
@@ -21,6 +21,9 @@ import DuesAdmin from './pages/exco/DuesAdmin';
 import CallBatch from './pages/exco/CallBatch';
 import Dashboard from './pages/exco/Dashboard';
 import Door from './pages/exco/Door';
+import { AnnouncementBanner, MaintenanceScreen, ModeSwitch } from './components/PlatformChrome';
+// Admin mode is only for the CDS Pass team, so it loads separately (keeps the app small for everyone else).
+const Admin = lazy(() => import('./pages/admin/Admin'));
 import GiveNumber from './pages/exco/GiveNumber';
 import Messages from './pages/exco/Messages';
 import Members from './pages/exco/Members';
@@ -192,6 +195,14 @@ export default function App() {
           <Route path="messages" element={<Messages />} />
         </Route>
         <Route path="/exco/cards" element={profile?.role === 'exco' ? <PrintCards /> : <Navigate to="/home" replace />} />
+        <Route
+          path="/admin"
+          element={
+            <Suspense fallback={<Splash />}>
+              <Admin />
+            </Suspense>
+          }
+        />
         <Route path="*" element={<Navigate to={homePath} replace />} />
       </Routes>
     );
@@ -200,7 +211,9 @@ export default function App() {
   return (
     <InstallGate>
       <Toaster />
-      {routes}
+      <AnnouncementBanner />
+      <ModeSwitch />
+      <MaintenanceScreen>{routes}</MaintenanceScreen>
     </InstallGate>
   );
 }

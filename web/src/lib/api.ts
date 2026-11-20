@@ -53,6 +53,18 @@ export const api = {
       messages: { id: string; title: string; body: string; audience: string; recipients: number; delivered: number; sentByName: string; sentAt: number | null }[];
     }
   >('listGroupMessages'),
+  // ---- platform / admin mode
+  appStatus: callable<Record<string, never>, { banner: string | null; maintenance: string | null; signupsPaused: boolean; paymentsPaused: boolean }>('appStatus'),
+  adminWhoAmI: callable<Record<string, never>, { role: PlatformRole | null }>('adminWhoAmI'),
+  adminOverview: callable<{ refresh?: boolean }, AdminOverview>('adminOverview'),
+  adminGetConfig: callable<Record<string, never>, AdminConfig>('adminGetConfig'),
+  adminSetConfig: callable<Partial<{ signupsPaused: boolean; paymentsPaused: boolean; maintenance: string | null; banner: string | null }>, { ok: true }>('adminSetConfig'),
+  adminSetGroupPaused: callable<{ gid: string; paused: boolean }, { ok: true }>('adminSetGroupPaused'),
+  adminBroadcast: callable<
+    { title: string; body: string; audience: 'everyone' | 'excos'; gids: string[]; link: string },
+    { ok: true; recipients: number; delivered: number }
+  >('adminBroadcast'),
+  adminSetTeamMember: callable<{ stateCode: string; role: 'admin' | 'viewer' | null }, { ok: true }>('adminSetTeamMember'),
   testNotification: callable<Record<string, never>, { sent: number; registered: number; members: number }>('testNotification'),
   tableCheck: callable<Who, TableCheckResponse>('tableCheck'),
   markDone: callable<Who, { ok: true }>('markDone'),
@@ -69,3 +81,42 @@ export const api = {
   respondCash: callable<{ duesId: string; confirm: boolean }, { ok: true }>('respondCash'),
   remindDues: callable<{ duesId: string }, { ok: true; owing: number; notified: number }>('remindDues'),
 };
+
+export type PlatformRole = 'owner' | 'admin' | 'viewer';
+
+export interface AdminGroupRow {
+  id: string;
+  name: string;
+  lga: string;
+  state: string;
+  joinCode: string;
+  paused: boolean;
+  mainExcoStateCode: string | null;
+  members: number;
+  pending: number;
+  excos: number;
+  noPhoto: number;
+  lastMeeting: string | null;
+  lastCheckins: number;
+  onlineKobo: number;
+  cashKobo: number;
+  earnedKobo: number;
+  createdAt: number | null;
+}
+
+export interface AdminOverview {
+  generatedAt: number;
+  totals: { groups: number; activeGroups: number; members: number; pending: number; onlineKobo: number; cashKobo: number; earnedKobo: number; checkins30: number };
+  series: { days: string[]; signups: number[]; checkins: number[]; paidKobo: number[]; earnedKobo: number[] };
+  groups: AdminGroupRow[];
+}
+
+export interface AdminConfig {
+  role: PlatformRole;
+  signupsPaused: boolean;
+  paymentsPaused: boolean;
+  maintenance: string | null;
+  banner: string | null;
+  team: { stateCode: string; role: 'admin' | 'viewer' }[];
+  owner: string | null;
+}

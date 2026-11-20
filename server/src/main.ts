@@ -104,6 +104,17 @@ app.post('/api/:name', async (req: Request, res: Response) => {
     }
   }
 
+  // Maintenance mode (switched on in Admin mode): only the admin team can use the app meanwhile.
+  try {
+    const blocked = await handlers.maintenanceGate(req.params.name, auth?.token?.email as string | undefined);
+    if (blocked) {
+      res.status(503).json({ error: { status: 'unavailable', message: blocked } });
+      return;
+    }
+  } catch (e) {
+    console.error('[maintenance check]', e);
+  }
+
   try {
     const result = await fn.handler({ data: req.body?.data ?? {}, auth, rawRequest: req });
     res.json({ result: result ?? null });

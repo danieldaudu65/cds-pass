@@ -26,6 +26,9 @@ Some later sections were written before these changes; where they disagree, **th
 | Extra pushes | meeting opened/ended, dues created/closed, dues account changed, venue changed, approved, role changed, PIN reset, new member waiting (to excos). FCM data includes `kind`. |
 | Sign-up flow | `Signup.tsx`: account → photo upload → register → waits until the profile (and exco claims) reach the phone before leaving. If anything fails after the login is created, the form keeps the typed data and continues from there. Server is pinged (`wakeServer`) when sign-up/login opens. `App.tsx` shows a retry screen instead of an endless spinner if permissions don't load. |
 | Render env vars | `FIREBASE_SERVICE_ACCOUNT`, `CORS_ORIGINS=https://cdspass.name.ng`, `PAYSTACK_SECRET_KEY`, `MONGODB_URI`, `MONGODB_DATABASE`, `CLOUDINARY_*`, `PLATFORM_ADMIN_STATE_CODE`, `SERVICE_FEE_PERCENT`, `PAYSTACK_FEE_PERCENT`. |
+| Dues gate (20 Nov) | Dues have `dueDate` (collection date) and `requiredForCheckIn`. `assertDuesPaid` inside `admit()` blocks check-in from that date until paid; error text starts "Dues not paid" (ScanIn shows a red pay screen). `recordCash` now counts immediately (status paid); member can dispute via `respondCash({confirm:false})` → status `disputed`, main exco notified. Automatic reminders: `GET /cron/reminders?key=CRON_SECRET` (cron-job.org 07:00 + 18:00 Lagos) → `runDuesReminders()`, once per dues per slot (`remindersSent`). |
+| Main exco tools (20 Nov) | `giveNextNumber` (search member, give next number; increments `session.doorEpoch`, door screen refetches; door code HMAC includes epoch). Typed state code at the door = main exco only; printed card = any exco. `sendGroupMessage` / `listGroupMessages`: custom push to all / unpaid / pending / excos, max 5 per day per group, history in `groups/{gid}/messages`. Pages: `exco/GiveNumber.tsx`, `exco/Messages.tsx`. |
+| Admin mode (20 Nov) | Owner = `PLATFORM_ADMIN_STATE_CODE`; team in server-only doc `platform/config.team` {stateCode: 'admin'|'viewer'}. Flags in `platform/config`: signupsPaused, paymentsPaused, maintenance (main.ts `maintenanceGate` returns 503 for non-team), banner. Group pause = `groups.paused` (blocks check-in, meetings, payments). APIs: appStatus (public), adminWhoAmI, adminOverview (5-min cache; users + payments + count() of attendees for last 30 days), adminGetConfig, adminSetConfig, adminSetGroupPaused, adminBroadcast, adminSetTeamMember (owner). Web: `pages/admin/Admin.tsx` (lazy, route /admin), `pages/admin/Charts.tsx` (SVG charts, no library), `components/PlatformChrome.tsx` (gold mode switch User/Exco/Admin, banner, maintenance screen), `hooks/usePlatform.ts`. |
 | Deploy rules | `firebase deploy --only firestore:rules` (firebase.json has no hosting/storage any more). |
 
 ---
@@ -379,6 +382,7 @@ Files in this section:
 - `web/src/components/InstallGate.tsx`
 - `web/src/components/MemberCard.tsx`
 - `web/src/components/PhotoPicker.tsx`
+- `web/src/components/PlatformChrome.tsx`
 - `web/src/components/QRScan.tsx`
 - `web/src/components/SideNav.tsx`
 - `web/src/components/TagCard3D.tsx`
@@ -389,6 +393,7 @@ Files in this section:
 - `web/src/hooks/useExco.ts`
 - `web/src/hooks/useLive.ts`
 - `web/src/hooks/useMyDay.ts`
+- `web/src/hooks/usePlatform.ts`
 - `web/src/index.css`
 - `web/src/lib/api.ts`
 - `web/src/lib/appConfig.ts`
@@ -400,6 +405,7 @@ Files in this section:
 - `web/src/lib/money.ts`
 - `web/src/lib/offlineQueue.ts`
 - `web/src/lib/rules.ts`
+- `web/src/lib/signupDraft.ts`
 - `web/src/lib/signupLock.ts`
 - `web/src/lib/sw.ts`
 - `web/src/lib/tagImage.ts`
@@ -412,11 +418,15 @@ Files in this section:
 - `web/src/pages/Pending.tsx`
 - `web/src/pages/Signup.tsx`
 - `web/src/pages/Welcome.tsx`
+- `web/src/pages/admin/Admin.tsx`
+- `web/src/pages/admin/Charts.tsx`
 - `web/src/pages/exco/CallBatch.tsx`
 - `web/src/pages/exco/Dashboard.tsx`
 - `web/src/pages/exco/Door.tsx`
 - `web/src/pages/exco/DuesAdmin.tsx`
+- `web/src/pages/exco/GiveNumber.tsx`
 - `web/src/pages/exco/Members.tsx`
+- `web/src/pages/exco/Messages.tsx`
 - `web/src/pages/exco/PrintCards.tsx`
 - `web/src/pages/exco/Settings.tsx`
 - `web/src/pages/exco/Table.tsx`
@@ -646,6 +656,8 @@ services:
         sync: false
       - key: PLATFORM_ADMIN_STATE_CODE
         value: LA/26B/2578
+      - key: CRON_SECRET # any long random text; cron-job.org calls /cron/reminders?key=<this>
+        sync: false
       - key: FIREBASE_SERVICE_ACCOUNT # service-account JSON (or base64 of it)
         sync: false
       - key: FIREBASE_STORAGE_BUCKET # e.g. your-id.firebasestorage.app
@@ -876,7 +888,7 @@ export function defineSecret(name: string) {
  */
 import { onCall, onRequest, HttpsError, CallableRequest, setGlobalOptions, defineSecret } from './compat';
 import { initAdmin } from './admin';
-import { getFirestore, FieldValue, Timestamp } from 'firebase-admin/firestore';
+import { getFirestore, FieldPath, FieldValue, Timestamp } from 'firebase-admin/firestore';
 import { getAuth } from 'firebase-admin/auth';
 import { getMessaging } from 'firebase-admin/messaging';
 import { mongoCollection, mongoConfigured } from './mongo';
@@ -1030,6 +1042,9 @@ async function mainExco(req: CallableRequest) {
 async function platformAdmin(req: CallableRequest) {
   const { uid } = signedIn(req);
   const adminStateCode = normalizeStateCode(process.env.PLATFORM_ADMIN_STATE_CODE);
+  // Admin-team members may create groups too (registerPlatformAdmin below still checks the owner's state code).
+  const r = await roleForEmail((req.auth?.token?.email as string | undefined) ?? (await auth.getUser(uid)).email);
+  if (r && (r.role === 'owner' || r.role === 'admin')) return { uid, adminStateCode: adminStateCode ?? r.stateCode };
   const account = await auth.getUser(uid);
   if (!adminStateCode || account.email?.toLowerCase() !== stateCodeToEmail(adminStateCode).toLowerCase()) {
     throw fail('permission-denied', 'Only the CDS Pass platform administrator can create CDS groups.');
@@ -1046,8 +1061,12 @@ function text(v: unknown, label: string, min: number, max: number): string {
   return s;
 }
 
-function doorCode(secret: string, gid: string, sid: string, window: number): string {
-  const h = createHmac('sha256', secret).update(`${gid}|${sid}|${window}`).digest();
+/**
+ * 6-digit door code for a 30-second window. `epoch` goes up each time the main exco gives someone a
+ * number by hand, which makes the code on the door screen change straight away (old one stops working).
+ */
+function doorCode(secret: string, gid: string, sid: string, window: number, epoch = 0): string {
+  const h = createHmac('sha256', secret).update(epoch ? `${gid}|${sid}|${window}|${epoch}` : `${gid}|${sid}|${window}`).digest();
   const n = h.readUInt32BE(0) % 1_000_000;
   return n.toString().padStart(6, '0');
 }
@@ -1079,10 +1098,13 @@ async function validateProfile(uid: string, data: any) {
   const phone = normalizePhone(data?.phone);
   if (!phone) throw fail('invalid-argument', 'Enter a valid Nigerian phone number.');
 
-  const photoURL = data?.photoURL;
-  if (typeof photoURL !== 'string' || !/^https?:\/\//.test(photoURL) || photoURL.length > 2000) {
-    throw fail('invalid-argument', 'A profile picture is required.');
+  // The photo may come later: on slow networks the upload can fail, and that must not block sign-up.
+  // Members without a photo are asked to add one on the "Under review" screen.
+  const rawPhoto = data?.photoURL ?? null;
+  if (rawPhoto !== null && (typeof rawPhoto !== 'string' || !/^https:\/\//.test(rawPhoto) || rawPhoto.length > 2000)) {
+    throw fail('invalid-argument', 'That profile picture link is not valid. Please choose the photo again.');
   }
+  const photoURL: string | null = rawPhoto;
 
   if ((await userRef(uid).get()).exists) {
     throw fail('already-exists', 'This account is already registered.');
@@ -1120,6 +1142,28 @@ function publicMember(uid: string, u: FirebaseFirestore.DocumentData) {
   };
 }
 
+/**
+ * "Pay before you get a number": dues marked requiredForCheckIn block check-in from their collection
+ * date onwards until the member has paid (online, or cash recorded by an exco).
+ * Throws a message that starts with "Dues not paid" so the app can show the red pay screen.
+ */
+async function assertDuesPaid(gid: string, uid: string, fullName: string, forExco: boolean) {
+  const today = lagosDate();
+  const open = await db.collection(`groups/${gid}/dues`).where('active', '==', true).get();
+  const gating = open.docs.filter((d) => d.data().requiredForCheckIn === true && (!d.data().dueDate || d.data().dueDate <= today));
+  if (!gating.length) return;
+  const statuses = await db.getAll(...gating.map((d) => duesStatusRef(gid, d.id, uid)));
+  const unpaid = gating.filter((_, i) => statuses[i].data()?.status !== 'paid');
+  if (!unpaid.length) return;
+  const what = unpaid.map((d) => `${d.data().title} (${naira(d.data().amountKobo)})`).join(', ');
+  throw fail(
+    'failed-precondition',
+    forExco
+      ? `Dues not paid: ${fullName} still owes ${what}. Record their cash payment in Dues first, then check them in.`
+      : `Dues not paid: please pay ${what} before you can get a number. Pay online in the app, or pay cash to an exco and scan again.`,
+  );
+}
+
 /** Gives a person the next number in today's queue (once). */
 async function admit(
   gid: string,
@@ -1131,6 +1175,12 @@ async function admit(
 ) {
   const u = (await userRef(uid).get()).data();
   if (!u || u.status !== 'approved') throw fail('failed-precondition', 'This member is not approved yet.');
+  // Already in today's queue? Then they keep their number, paid or not.
+  const existing = await attendeeRef(gid, sid, uid).get();
+  if (!existing.exists) {
+    await assertGroupActive(gid);
+    await assertDuesPaid(gid, uid, u.fullName, by !== uid);
+  }
 
   return db.runTransaction(async (tx) => {
     const sRef = sessionRef(gid, sid);
@@ -1217,6 +1267,7 @@ async function notifyApprovedGroup(gid: string, title: string, body: string, lin
 
 /** New corps member joins a CDS group with the group's join code. Starts as "pending". */
 export const registerMember = onCall(async (req: CallableRequest) => {
+  if ((await platformConfig()).signupsPaused) throw fail('unavailable', 'New sign-ups are paused for a short while. Please try again later.');
   const { uid } = signedIn(req);
   const p = await validateProfile(uid, req.data);
   const joinCode = String(req.data?.joinCode ?? '').trim().toUpperCase();
@@ -1487,6 +1538,7 @@ export const updateGroupSettings = onCall(async (req: CallableRequest) => {
 // ---------------------------------------------------------------- CDS day
 
 export const startSession = onCall(async (req: CallableRequest) => {
+  await assertGroupActive((req.auth?.token?.gid as string) ?? '');
   const e = await exco(req);
   const sid = lagosDate();
   const ref = sessionRef(e.gid, sid);
@@ -1541,9 +1593,10 @@ export const getDoorCode = onCall(async (req: CallableRequest) => {
     throw fail('failed-precondition', "Open today's CDS meeting first.");
   }
   const secret = (await keysRef(e.gid).get()).data()?.doorSecret as string;
+  const epoch = Number(s.data()!.doorEpoch ?? 0);
   const now = Date.now();
   const w = Math.floor(now / WINDOW_MS);
-  return { code: doorCode(secret, e.gid, sid, w), gid: e.gid, sessionId: sid, expiresAt: (w + 1) * WINDOW_MS };
+  return { code: doorCode(secret, e.gid, sid, w, epoch), gid: e.gid, sessionId: sid, epoch, expiresAt: (w + 1) * WINDOW_MS };
 });
 
 /**
@@ -1570,12 +1623,15 @@ export const checkIn = onCall(async (req: CallableRequest) => {
   }
   const sid = lagosDate(at);
 
-  const [g, keys] = await Promise.all([groupRef(gid).get(), keysRef(gid).get()]);
+  const [g, keys, sess] = await Promise.all([groupRef(gid).get(), keysRef(gid).get(), sessionRef(gid, sid).get()]);
   const secret = keys.data()?.doorSecret as string | undefined;
   if (!secret) throw fail('internal', 'Group is not set up correctly.');
 
   const w = Math.floor(at / WINDOW_MS);
-  if (![w, w - 1].some((x) => doorCode(secret, gid, sid, x) === code)) {
+  const epoch = Number(sess.data()?.doorEpoch ?? 0);
+  // Live scans must match the current door code. Saved (offline) scans may be from before a reset.
+  const epochs = offline ? Array.from({ length: Math.min(epoch, 20) + 1 }, (_, i) => epoch - i) : [epoch];
+  if (!epochs.some((ep) => [w, w - 1].some((x) => doorCode(secret, gid, sid, x, ep) === code))) {
     throw fail('invalid-argument', 'That code has expired. Scan the code on the exco screen again.');
   }
 
@@ -1605,12 +1661,30 @@ export const lookupMember = onCall(async (req: CallableRequest) => {
 
 /** Exco checks in someone without a working phone (printed card, or manual by state code). */
 export const excoCheckIn = onCall(async (req: CallableRequest) => {
-  const e = await exco(req);
-  const { uid, user } = await findMember(e.gid, req.data);
   const method = req.data?.method === 'card' ? 'card' : 'manual';
+  // Printed cards: any exco at the door. Typing a state code by hand: main exco only (use giveNextNumber).
+  const e = method === 'card' ? await exco(req) : await mainExco(req);
+  const { uid, user } = await findMember(e.gid, req.data);
   const r = await admit(e.gid, lagosDate(), uid, method, e.uid, Date.now());
   if (!r.already && method === 'manual') {
     await log(e.gid, e.uid, 'manual_checkin', { target: uid, stateCode: user.stateCode, number: r.number });
+  }
+  return { ...r, member: publicMember(uid, user) };
+});
+
+/**
+ * Main exco gives a registered member the next number by hand (phone off, flat battery …).
+ * Afterwards the door code changes immediately, so nobody can reuse the code that was on screen.
+ */
+export const giveNextNumber = onCall(async (req: CallableRequest) => {
+  const e = await mainExco(req);
+  const { uid, user } = await findMember(e.gid, req.data);
+  const sid = lagosDate();
+  const r = await admit(e.gid, sid, uid, 'manual', e.uid, Date.now());
+  await sessionRef(e.gid, sid).update({ doorEpoch: FieldValue.increment(1), doorResetAt: FieldValue.serverTimestamp() });
+  if (!r.already) {
+    await log(e.gid, e.uid, 'manual_checkin', { target: uid, stateCode: user.stateCode, number: r.number });
+    await notify([uid], `Your number is ${r.number}`, `${e.name} checked you in at the door. Your number is ${r.number}.`, '/tag', 'checkin');
   }
   return { ...r, member: publicMember(uid, user) };
 });
@@ -1710,6 +1784,72 @@ export const testNotification = onCall(async (req: CallableRequest) => {
   );
   await log(e.gid, e.uid, 'notification_test', { notified: sent, targetMembers: targets.length });
   return { sent, registered: targets.length, members: registered };
+});
+
+const MESSAGES_PER_DAY = 5;
+const MESSAGE_LINKS = new Set(['/home', '/dues', '/tag', '/scan']);
+type Audience = 'all' | 'unpaid' | 'pending' | 'excos';
+
+/**
+ * Main exco sends their own push message ("Good morning corpers", "Job alert" …) to a chosen group of
+ * members. Limited to 5 a day per CDS group so people don't switch notifications off.
+ */
+export const sendGroupMessage = onCall(async (req: CallableRequest) => {
+  const e = await mainExco(req);
+  const title = text(req.data?.title, 'Title', 3, 60);
+  const body = text(req.data?.body, 'Message', 3, 300);
+  const audience: Audience = ['all', 'unpaid', 'pending', 'excos'].includes(req.data?.audience) ? req.data.audience : 'all';
+  const link = MESSAGE_LINKS.has(req.data?.link) ? (req.data.link as string) : '/home';
+
+  const day = lagosDate();
+  const counterRef = db.doc(`groups/${e.gid}/private/messages-${day}`);
+  const used = Number((await counterRef.get()).data()?.count ?? 0);
+  if (used >= MESSAGES_PER_DAY) {
+    throw fail('resource-exhausted', `You can send ${MESSAGES_PER_DAY} messages a day. Try again tomorrow.`);
+  }
+
+  const members = await db.collection('users').where('groupId', '==', e.gid).get();
+  let targets = members.docs.filter((d) => (audience === 'pending' ? d.data().status === 'pending' : d.data().status === 'approved'));
+  if (audience === 'excos') targets = targets.filter((d) => d.data().role === 'exco');
+  if (audience === 'unpaid') {
+    const open = await db.collection(`groups/${e.gid}/dues`).where('active', '==', true).get();
+    if (open.empty) throw fail('failed-precondition', 'There are no open dues, so nobody is "not paid".');
+    const owing = new Set<string>();
+    for (const d of open.docs) (await owingMembers(e.gid, d.id)).forEach((u) => owing.add(u));
+    targets = targets.filter((d) => owing.has(d.id));
+  }
+  const uids = targets.map((d) => d.id);
+  if (!uids.length) throw fail('failed-precondition', 'Nobody matches that choice right now.');
+
+  const sent = await notify(uids, title, body, link, 'message');
+  await counterRef.set({ count: FieldValue.increment(1) }, { merge: true });
+  await db.collection(`groups/${e.gid}/messages`).add({
+    title,
+    body,
+    audience,
+    link,
+    recipients: uids.length,
+    delivered: sent,
+    sentBy: e.uid,
+    sentByName: e.name,
+    sentAt: FieldValue.serverTimestamp(),
+  });
+  await log(e.gid, e.uid, 'message_sent', { label: title, notified: sent });
+  return { ok: true, recipients: uids.length, delivered: sent, left: MESSAGES_PER_DAY - used - 1 };
+});
+
+/** History of sent messages (main exco). */
+export const listGroupMessages = onCall(async (req: CallableRequest) => {
+  const e = await mainExco(req);
+  const snap = await db.collection(`groups/${e.gid}/messages`).orderBy('sentAt', 'desc').limit(30).get();
+  const used = Number((await db.doc(`groups/${e.gid}/private/messages-${lagosDate()}`).get()).data()?.count ?? 0);
+  return {
+    left: Math.max(0, MESSAGES_PER_DAY - used),
+    messages: snap.docs.map((d) => {
+      const m = d.data();
+      return { id: d.id, title: m.title, body: m.body, audience: m.audience, recipients: m.recipients, delivered: m.delivered, sentByName: m.sentByName, sentAt: m.sentAt?.toMillis?.() ?? null };
+    }),
+  };
 });
 
 /** Exco scans a tag at the thumbprint table. Green = thumbprint, red = wait. */
@@ -1881,11 +2021,16 @@ export const createDues = onCall(async (req: CallableRequest) => {
   const amount = Number(req.data?.amountNaira);
   if (!Number.isFinite(amount) || amount < 50 || amount > 100_000) throw fail('invalid-argument', 'Amount must be ₦50 – ₦100,000.');
   const dueDate = typeof req.data?.dueDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.data.dueDate) ? req.data.dueDate : null;
+  const requiredForCheckIn = req.data?.requiredForCheckIn === true;
+  if (requiredForCheckIn && !dueDate) throw fail('invalid-argument', 'Choose the collection date, so members know when they must pay.');
+  if (dueDate && dueDate < lagosDate()) throw fail('invalid-argument', 'The collection date cannot be in the past.');
   const ref = db.collection(`groups/${e.gid}/dues`).doc();
   await ref.set({
     title,
     amountKobo: Math.round(amount * 100),
     dueDate,
+    requiredForCheckIn,
+    remindersSent: {},
     active: true,
     createdBy: e.uid,
     createdAt: FieldValue.serverTimestamp(),
@@ -1894,7 +2039,9 @@ export const createDues = onCall(async (req: CallableRequest) => {
   await notifyApprovedGroup(
     e.gid,
     `New CDS dues: ${title}`,
-    `${naira(Math.round(amount * 100))}${dueDate ? ` · due ${dueDate}` : ''}. Open CDS Pass to view or pay.`,
+    `${naira(Math.round(amount * 100))}${dueDate ? ` · collection on ${prettyDate(dueDate)}` : ''}.${
+      requiredForCheckIn ? ' You must pay before you can get a number that day.' : ''
+    } Pay online in CDS Pass or pay cash to an exco.`,
     '/dues',
   );
   return { ok: true, duesId: ref.id };
@@ -1914,6 +2061,8 @@ export const closeDues = onCall(async (req: CallableRequest) => {
 
 /** Member starts an online payment. Returns the Paystack checkout link. */
 export const startPayment = onCall({ secrets: [paystackSecret] }, async (req: CallableRequest) => {
+  if ((await platformConfig()).paymentsPaused) throw fail('unavailable', 'Online payments are paused for a short while. You can pay cash to an exco.');
+  await assertGroupActive((req.auth?.token?.gid as string) ?? '');
   const { uid, gid } = approvedMember(req);
   const duesId = String(req.data?.duesId ?? '');
   const returnUrl = String(req.data?.returnUrl ?? '');
@@ -2018,9 +2167,12 @@ export const recordCash = onCall(async (req: CallableRequest) => {
   const st = await duesStatusRef(e.gid, duesId, uid).get();
   if (st.data()?.status === 'paid') throw fail('already-exists', `${user.fullName} has already paid.`);
 
+  // Cash counts straight away (so they can get a number at the door). The member is told who recorded
+  // it and can tap "This is wrong"; every record is in the activity log.
   const reference = `cash-${e.gid}-${randomBytes(6).toString('hex')}`;
   const amountKobo = d.data()!.amountKobo as number;
-  await paymentRef(e.gid, reference).set({
+  const batch = db.batch();
+  batch.set(paymentRef(e.gid, reference), {
     reference,
     uid,
     duesId,
@@ -2029,16 +2181,17 @@ export const recordCash = onCall(async (req: CallableRequest) => {
     feeKobo: 0,
     totalKobo: amountKobo,
     method: 'cash',
-    status: 'awaiting_member',
+    status: 'paid',
     recordedBy: e.uid,
     recordedByName: e.name,
     fullName: user.fullName,
     stateCode: user.stateCode,
     createdAt: FieldValue.serverTimestamp(),
+    paidAt: FieldValue.serverTimestamp(),
   });
-  await duesStatusRef(e.gid, duesId, uid).set({
+  batch.set(duesStatusRef(e.gid, duesId, uid), {
     uid,
-    status: 'cash_pending',
+    status: 'paid',
     method: 'cash',
     amountKobo,
     reference,
@@ -2047,33 +2200,109 @@ export const recordCash = onCall(async (req: CallableRequest) => {
     fullName: user.fullName,
     stateCode: user.stateCode,
     recordedAt: FieldValue.serverTimestamp(),
+    paidAt: FieldValue.serverTimestamp(),
   });
-  await log(e.gid, e.uid, 'cash_recorded', { target: uid, stateCode: user.stateCode, label: naira(amountKobo) });
-  await notify([uid], 'Confirm your cash payment', `${e.name} recorded ${naira(amountKobo)} cash for ${d.data()!.title}. Open CDS Pass to confirm.`, '/dues');
+  await batch.commit();
+  await log(e.gid, e.uid, 'cash_recorded', { target: uid, stateCode: user.stateCode, label: `${d.data()!.title} · ${naira(amountKobo)}` });
+  const time = new Date().toLocaleTimeString('en-NG', { hour: 'numeric', minute: '2-digit', timeZone: 'Africa/Lagos' });
+  await notify(
+    [uid],
+    `${naira(amountKobo)} cash recorded`,
+    `${e.name} recorded your cash payment for ${d.data()!.title} at ${time}. If this is wrong, open Dues and tap "This is wrong".`,
+    '/dues',
+    'cash',
+  );
   return { ok: true };
 });
 
-/** Member confirms (or disputes) cash the treasurer recorded. */
+/**
+ * Member flags a cash record as wrong ("I didn't pay this"). It stops counting as paid, the main exco
+ * is alerted, and it goes in the activity log. (confirm:true is still accepted from older app versions.)
+ */
 export const respondCash = onCall(async (req: CallableRequest) => {
   const { uid, gid } = approvedMember(req);
   const duesId = String(req.data?.duesId ?? '');
   const confirm = req.data?.confirm === true;
   const sRef = duesStatusRef(gid, duesId, uid);
   const st = await sRef.get();
-  if (st.data()?.status !== 'cash_pending') throw fail('failed-precondition', 'There is no cash payment waiting for you.');
-  const reference = st.data()!.reference as string;
+  const s0 = st.data();
+  if (!s0 || s0.method !== 'cash' || (s0.status !== 'cash_pending' && s0.status !== 'paid')) {
+    throw fail('failed-precondition', 'There is no cash record to respond to.');
+  }
+  const reference = s0.reference as string;
   const batch = db.batch();
   if (confirm) {
     batch.update(sRef, { status: 'paid', paidAt: FieldValue.serverTimestamp() });
     batch.update(paymentRef(gid, reference), { status: 'paid', paidAt: FieldValue.serverTimestamp() });
   } else {
-    batch.delete(sRef);
+    batch.update(sRef, { status: 'disputed', disputedAt: FieldValue.serverTimestamp() });
     batch.update(paymentRef(gid, reference), { status: 'disputed', disputedAt: FieldValue.serverTimestamp() });
   }
   await batch.commit();
-  await log(gid, uid, confirm ? 'cash_confirmed' : 'cash_disputed', { target: uid, reference });
+  await log(gid, uid, confirm ? 'cash_confirmed' : 'cash_disputed', { target: uid, reference, label: s0.recordedByName });
+  if (!confirm) {
+    const g = (await groupRef(gid).get()).data();
+    const main = (g?.mainExcoUid ?? g?.createdBy) as string | undefined;
+    const who = (await userRef(uid).get()).data();
+    if (main) {
+      await notify(
+        [main],
+        'Cash record disputed',
+        `${who?.fullName ?? 'A member'} says they did not pay the cash ${s0.recordedByName ?? 'an exco'} recorded. Check Dues.`,
+        '/exco/dues',
+        'dispute',
+      );
+    }
+  }
   return { ok: true };
 });
+
+/** Approved members of a group who haven't paid these dues. */
+async function owingMembers(gid: string, duesId: string) {
+  const [members, statuses] = await Promise.all([
+    db.collection('users').where('groupId', '==', gid).get(),
+    db.collection(`groups/${gid}/dues/${duesId}/status`).get(),
+  ]);
+  const paid = new Set(statuses.docs.filter((s) => s.data().status === 'paid').map((s) => s.id));
+  return members.docs.filter((m) => m.data().status === 'approved' && !paid.has(m.id)).map((m) => m.id);
+}
+
+const prettyDate = (ymd: string) =>
+  new Date(`${ymd}T12:00:00+01:00`).toLocaleDateString('en-NG', { weekday: 'long', day: 'numeric', month: 'short', timeZone: 'Africa/Lagos' });
+
+/**
+ * Automatic dues reminders. Called by cron-job.org (GET /cron/reminders?key=CRON_SECRET), e.g. at 18:00
+ * and 07:00 Lagos time. Evening run: dues collected TOMORROW. Morning run: dues collected TODAY.
+ * Each reminder is sent once per dues per slot, so extra calls are harmless.
+ */
+export async function runDuesReminders(now = Date.now()) {
+  const today = lagosDate(now);
+  const tomorrow = lagosDate(now + 24 * 3600_000);
+  const hour = Number(new Date(now).toLocaleString('en-GB', { hour: '2-digit', hour12: false, timeZone: 'Africa/Lagos' }));
+  const evening = hour >= 12;
+  const target = evening ? tomorrow : today;
+  const slot = `${target}:${evening ? 'eve' : 'morning'}`;
+  let reminded = 0;
+  const groups = await db.collection('groups').get();
+  for (const g of groups.docs) {
+    const open = await db.collection(`groups/${g.id}/dues`).where('active', '==', true).get();
+    for (const d of open.docs) {
+      const dues = d.data();
+      if (dues.dueDate !== target || dues.remindersSent?.[slot]) continue;
+      const owing = await owingMembers(g.id, d.id);
+      const amount = naira(dues.amountKobo);
+      const title = evening ? `Dues collection tomorrow: ${amount}` : `Dues collection today: ${amount}`;
+      const body = `${dues.title}. ${
+        dues.requiredForCheckIn ? 'You must pay before you can get a number. ' : ''
+      }Pay online in CDS Pass now, or pay cash to an exco.`;
+      const sent = await notify(owing, title, body, '/dues', 'dues-reminder');
+      await d.ref.update({ [`remindersSent.${slot}`]: FieldValue.serverTimestamp() });
+      await log(g.id, 'system', 'dues_reminder', { label: `${dues.title} (${evening ? 'evening before' : 'morning'})`, notified: sent });
+      reminded += owing.length;
+    }
+  }
+  return { slot, reminded };
+}
 
 /** Buzz everyone who hasn't paid yet. */
 export const remindDues = onCall(async (req: CallableRequest) => {
@@ -2081,15 +2310,299 @@ export const remindDues = onCall(async (req: CallableRequest) => {
   const duesId = String(req.data?.duesId ?? '');
   const d = await duesRef(e.gid, duesId).get();
   if (!d.exists) throw fail('not-found', 'Dues not found.');
-  const [members, statuses] = await Promise.all([
-    db.collection('users').where('groupId', '==', e.gid).get(),
-    db.collection(`groups/${e.gid}/dues/${duesId}/status`).get(),
-  ]);
-  const paid = new Set(statuses.docs.filter((s) => s.data().status === 'paid').map((s) => s.id));
-  const owing = members.docs.filter((m) => m.data().status === 'approved' && !paid.has(m.id)).map((m) => m.id);
+  const owing = await owingMembers(e.gid, duesId);
   const sent = await notify(owing, `${d.data()!.title}: ${naira(d.data()!.amountKobo)}`, 'Tap to pay your CDS dues in CDS Pass.', '/dues');
   await log(e.gid, e.uid, 'dues_reminder', { label: d.data()!.title, notified: sent });
   return { ok: true, owing: owing.length, notified: sent };
+});
+
+/* ======================================================================================
+ * PLATFORM ADMIN MODE (Derik + team)
+ * --------------------------------------------------------------------------------------
+ * Owner  = PLATFORM_ADMIN_STATE_CODE on Render. Can do everything, and manage the team.
+ * Team   = platform/config.team { "LA/26B/1234": "admin" | "viewer" } (owner adds/removes).
+ *          viewer: sees charts and all groups.  admin: also switches, broadcasts, creates groups.
+ * Config = platform/config { signupsPaused, paymentsPaused, maintenance, banner, team }.
+ *          Server-only document (clients can't read it); the app gets public bits via appStatus.
+ * ====================================================================================== */
+
+type PlatformRole = 'owner' | 'admin' | 'viewer';
+interface PlatformConfig {
+  signupsPaused?: boolean;
+  paymentsPaused?: boolean;
+  maintenance?: string | null;
+  banner?: string | null;
+  team?: Record<string, 'admin' | 'viewer'>;
+}
+
+const platformRef = () => db.doc('platform/config');
+let configCache: { at: number; value: PlatformConfig } | null = null;
+
+async function platformConfig(fresh = false): Promise<PlatformConfig> {
+  if (!fresh && configCache && Date.now() - configCache.at < 30_000) return configCache.value;
+  const value = ((await platformRef().get()).data() ?? {}) as PlatformConfig;
+  configCache = { at: Date.now(), value };
+  return value;
+}
+
+/** Works out the platform role from the login email (state code). */
+async function roleForEmail(email: string | undefined | null): Promise<{ role: PlatformRole; stateCode: string } | null> {
+  if (!email) return null;
+  const e = email.toLowerCase();
+  const owner = normalizeStateCode(process.env.PLATFORM_ADMIN_STATE_CODE);
+  if (owner && stateCodeToEmail(owner).toLowerCase() === e) return { role: 'owner', stateCode: owner };
+  const team = (await platformConfig()).team ?? {};
+  for (const [sc, role] of Object.entries(team)) {
+    if (stateCodeToEmail(sc).toLowerCase() === e) return { role, stateCode: sc };
+  }
+  return null;
+}
+
+async function platformMember(req: CallableRequest, need: PlatformRole = 'viewer') {
+  const { uid } = signedIn(req);
+  const email = (req.auth?.token?.email as string | undefined) ?? (await auth.getUser(uid)).email;
+  const r = await roleForEmail(email);
+  const rank = { viewer: 1, admin: 2, owner: 3 };
+  if (!r || rank[r.role] < rank[need]) {
+    throw fail('permission-denied', need === 'owner' ? 'Only the CDS Pass owner can do this.' : 'This is for the CDS Pass admin team only.');
+  }
+  const me = (await userRef(uid).get()).data();
+  return { uid, ...r, name: (me?.fullName as string) ?? r.stateCode };
+}
+
+/** Used by main.ts: while maintenance is on, only the admin team can use the app. */
+export async function maintenanceGate(action: string, email: string | undefined): Promise<string | null> {
+  if (action.startsWith('admin') || action === 'appStatus') return null;
+  const msg = (await platformConfig()).maintenance;
+  if (!msg) return null;
+  return (await roleForEmail(email)) ? null : msg;
+}
+
+/** Group switched off by the platform admin. */
+async function assertGroupActive(gid: string) {
+  const g = (await groupRef(gid).get()).data();
+  if (g?.paused) throw fail('failed-precondition', 'This CDS group is paused on CDS Pass. Please contact your main exco.');
+}
+
+/** Public: banner + maintenance message (no login needed). */
+export const appStatus = onCall(async () => {
+  const c = await platformConfig();
+  return { banner: c.banner ?? null, maintenance: c.maintenance ?? null, signupsPaused: !!c.signupsPaused, paymentsPaused: !!c.paymentsPaused };
+});
+
+/** Tells the app whether this login is on the admin team (shows the mode switch). */
+export const adminWhoAmI = onCall(async (req: CallableRequest) => {
+  if (!req.auth) return { role: null };
+  const email = (req.auth.token?.email as string | undefined) ?? null;
+  const r = await roleForEmail(email);
+  return { role: r?.role ?? null };
+});
+
+/* ---------- overview: totals, charts, every group ---------- */
+
+let overviewCache: { at: number; value: unknown } | null = null;
+
+export const adminOverview = onCall(async (req: CallableRequest) => {
+  await platformMember(req, 'viewer');
+  // Cached for 5 minutes so opening the admin page doesn't burn database reads.
+  if (!req.data?.refresh && overviewCache && Date.now() - overviewCache.at < 5 * 60_000) return overviewCache.value;
+
+  const DAYS = 30;
+  const days: string[] = [];
+  for (let i = DAYS - 1; i >= 0; i--) days.push(lagosDate(Date.now() - i * 86_400_000));
+  const since = days[0];
+  const idx = new Map(days.map((d, i) => [d, i]));
+  const signups = new Array(DAYS).fill(0);
+  const checkins = new Array(DAYS).fill(0);
+  const paidKobo = new Array(DAYS).fill(0);
+  const earnedKobo = new Array(DAYS).fill(0);
+
+  const [groupsSnap, usersSnap] = await Promise.all([db.collection('groups').get(), db.collection('users').get()]);
+  const users = usersSnap.docs.map((d) => ({ id: d.id, ...(d.data() as Record<string, any>) }));
+  for (const u of users) {
+    const t = u.createdAt?.toMillis?.();
+    if (t) {
+      const i = idx.get(lagosDate(t));
+      if (i !== undefined) signups[i]++;
+    }
+  }
+
+  const groups: Array<Record<string, any> & { members: number; lastMeeting: string | null }> = [];
+  let totalOnlineKobo = 0;
+  let totalCashKobo = 0;
+  let totalEarnedKobo = 0;
+  for (const g of groupsSnap.docs) {
+    const gd = g.data();
+    const mine = users.filter((u) => u.groupId === g.id);
+    const approved = mine.filter((u) => u.status === 'approved');
+
+    // Payments (all time, paid)
+    const pays = await db.collection(`groups/${g.id}/payments`).where('status', '==', 'paid').get();
+    let online = 0;
+    let cash = 0;
+    let earned = 0;
+    for (const p of pays.docs) {
+      const d = p.data();
+      if (d.method === 'cash') cash += d.amountKobo ?? 0;
+      else {
+        online += d.amountKobo ?? 0;
+        earned += d.feeKobo ?? 0;
+      }
+      const t = d.paidAt?.toMillis?.();
+      if (t) {
+        const i = idx.get(lagosDate(t));
+        if (i !== undefined) {
+          paidKobo[i] += d.amountKobo ?? 0;
+          if (d.method !== 'cash') earnedKobo[i] += d.feeKobo ?? 0;
+        }
+      }
+    }
+    totalOnlineKobo += online;
+    totalCashKobo += cash;
+    totalEarnedKobo += earned;
+
+    // Meetings in the last 30 days: count attendees cheaply (count() = 1 read per 1000 people)
+    const sessions = await db.collection(`groups/${g.id}/sessions`).where(FieldPath.documentId(), '>=', since).get();
+    let lastMeeting: string | null = null;
+    let lastCheckins = 0;
+    for (const s of sessions.docs) {
+      const c = (await s.ref.collection('attendees').count().get()).data().count;
+      const i = idx.get(s.id);
+      if (i !== undefined) checkins[i] += c;
+      if (!lastMeeting || s.id > lastMeeting) {
+        lastMeeting = s.id;
+        lastCheckins = c;
+      }
+    }
+
+    groups.push({
+      id: g.id,
+      name: gd.name,
+      lga: gd.lga,
+      state: gd.state,
+      joinCode: gd.joinCode,
+      paused: !!gd.paused,
+      mainExcoStateCode: gd.mainExcoStateCode ?? null,
+      members: approved.length,
+      pending: mine.filter((u) => u.status === 'pending').length,
+      excos: approved.filter((u) => u.role === 'exco').length,
+      noPhoto: approved.filter((u) => !u.photoURL).length,
+      lastMeeting,
+      lastCheckins,
+      onlineKobo: online,
+      cashKobo: cash,
+      earnedKobo: earned,
+      createdAt: gd.createdAt?.toMillis?.() ?? null,
+    });
+  }
+  groups.sort((a, b) => b.members - a.members);
+
+  const value = {
+    generatedAt: Date.now(),
+    totals: {
+      groups: groups.length,
+      activeGroups: groups.filter((g) => g.lastMeeting).length,
+      members: users.filter((u) => u.status === 'approved').length,
+      pending: users.filter((u) => u.status === 'pending').length,
+      onlineKobo: totalOnlineKobo,
+      cashKobo: totalCashKobo,
+      earnedKobo: totalEarnedKobo,
+      checkins30: checkins.reduce((a, b) => a + b, 0),
+    },
+    series: { days, signups, checkins, paidKobo, earnedKobo },
+    groups,
+  };
+  overviewCache = { at: Date.now(), value };
+  return value;
+});
+
+/* ---------- switches ---------- */
+
+export const adminGetConfig = onCall(async (req: CallableRequest) => {
+  const me = await platformMember(req, 'viewer');
+  const c = await platformConfig(true);
+  return {
+    role: me.role,
+    signupsPaused: !!c.signupsPaused,
+    paymentsPaused: !!c.paymentsPaused,
+    maintenance: c.maintenance ?? null,
+    banner: c.banner ?? null,
+    team: me.role === 'owner' ? Object.entries(c.team ?? {}).map(([stateCode, role]) => ({ stateCode, role })) : [],
+    owner: normalizeStateCode(process.env.PLATFORM_ADMIN_STATE_CODE),
+  };
+});
+
+export const adminSetConfig = onCall(async (req: CallableRequest) => {
+  const me = await platformMember(req, 'admin');
+  const d = req.data ?? {};
+  const patch: Record<string, unknown> = {};
+  if (typeof d.signupsPaused === 'boolean') patch.signupsPaused = d.signupsPaused;
+  if (typeof d.paymentsPaused === 'boolean') patch.paymentsPaused = d.paymentsPaused;
+  for (const k of ['maintenance', 'banner'] as const) {
+    if (k in d) patch[k] = typeof d[k] === 'string' && d[k].trim() ? text(d[k], k === 'banner' ? 'Banner' : 'Maintenance message', 3, 200) : null;
+  }
+  if (!Object.keys(patch).length) throw fail('invalid-argument', 'Nothing to change.');
+  await platformRef().set({ ...patch, updatedBy: me.stateCode, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+  configCache = null;
+  console.log(`[platform] ${me.stateCode} changed`, patch);
+  return { ok: true };
+});
+
+export const adminSetGroupPaused = onCall(async (req: CallableRequest) => {
+  const me = await platformMember(req, 'admin');
+  const gid = String(req.data?.gid ?? '');
+  const paused = req.data?.paused === true;
+  const g = await groupRef(gid).get();
+  if (!g.exists) throw fail('not-found', 'Group not found.');
+  await groupRef(gid).update({ paused });
+  overviewCache = null;
+  await log(gid, me.uid, paused ? 'group_paused' : 'group_resumed', { label: me.stateCode });
+  return { ok: true };
+});
+
+/* ---------- broadcast ---------- */
+
+export const adminBroadcast = onCall(async (req: CallableRequest) => {
+  const me = await platformMember(req, 'admin');
+  const title = text(req.data?.title, 'Title', 3, 60);
+  const body = text(req.data?.body, 'Message', 3, 300);
+  const audience = req.data?.audience === 'excos' ? 'excos' : 'everyone';
+  const gids: string[] = Array.isArray(req.data?.gids) ? req.data.gids.map(String).slice(0, 200) : [];
+  const link = MESSAGE_LINKS.has(req.data?.link) ? (req.data.link as string) : '/home';
+
+  const users = await db.collection('users').where('status', '==', 'approved').get();
+  const uids = users.docs
+    .filter((u) => !gids.length || gids.includes(u.data().groupId))
+    .filter((u) => audience === 'everyone' || u.data().role === 'exco')
+    .map((u) => u.id);
+  if (!uids.length) throw fail('failed-precondition', 'Nobody matches that choice.');
+  const sent = await notify(uids, title, body, link, 'broadcast');
+  await db.collection('platform/config/broadcasts').add({
+    title,
+    body,
+    audience,
+    gids,
+    recipients: uids.length,
+    delivered: sent,
+    sentBy: me.stateCode,
+    sentAt: FieldValue.serverTimestamp(),
+  });
+  return { ok: true, recipients: uids.length, delivered: sent };
+});
+
+/* ---------- team (owner only) ---------- */
+
+export const adminSetTeamMember = onCall(async (req: CallableRequest) => {
+  const me = await platformMember(req, 'owner');
+  const sc = normalizeStateCode(req.data?.stateCode);
+  if (!sc) throw fail('invalid-argument', 'Enter a valid state code, e.g. LA/26B/1234.');
+  if (sc === normalizeStateCode(process.env.PLATFORM_ADMIN_STATE_CODE)) throw fail('invalid-argument', 'That is the owner account.');
+  const role = req.data?.role;
+  if (role !== 'admin' && role !== 'viewer' && role !== null) throw fail('invalid-argument', 'Choose Admin or Viewer.');
+  await platformRef().set({ team: { [sc]: role === null ? FieldValue.delete() : role } }, { merge: true });
+  configCache = null;
+  console.log(`[platform] ${me.stateCode} set team ${sc} = ${role}`);
+  return { ok: true };
 });
 ```
 
@@ -2165,6 +2678,24 @@ const STATUS: Record<string, number> = {
   'deadline-exceeded': 504,
 };
 
+/**
+ * Automatic dues reminders. cron-job.org calls this twice a day (e.g. 07:00 and 18:00 Lagos):
+ *   GET /cron/reminders?key=<CRON_SECRET>
+ */
+app.get('/cron/reminders', async (req: Request, res: Response) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret || req.query.key !== secret) {
+    res.status(403).json({ error: 'forbidden' });
+    return;
+  }
+  try {
+    res.json(await handlers.runDuesReminders());
+  } catch (e) {
+    console.error('[cron/reminders]', e);
+    res.status(500).json({ error: 'failed' });
+  }
+});
+
 const actions = handlers as unknown as Record<string, Callable | RawEndpoint | undefined>;
 
 app.post('/api/:name', async (req: Request, res: Response) => {
@@ -2184,6 +2715,17 @@ app.post('/api/:name', async (req: Request, res: Response) => {
       res.status(401).json({ error: { status: 'unauthenticated', message: 'Your login has expired. Please log in again.' } });
       return;
     }
+  }
+
+  // Maintenance mode (switched on in Admin mode): only the admin team can use the app meanwhile.
+  try {
+    const blocked = await handlers.maintenanceGate(req.params.name, auth?.token?.email as string | undefined);
+    if (blocked) {
+      res.status(503).json({ error: { status: 'unavailable', message: blocked } });
+      return;
+    }
+  } catch (e) {
+    console.error('[maintenance check]', e);
   }
 
   try {
@@ -2408,16 +2950,30 @@ uploadRouter.post(
       return fail(res, 500, 'Photo upload is not set up on the server yet.');
     }
 
+    const started = Date.now();
+    let answered = false;
+    // Never leave the phone waiting: if Cloudinary hasn't answered in 30 s, say so.
+    const guard = setTimeout(() => {
+      if (answered) return;
+      answered = true;
+      console.error(`Cloudinary upload timed out after 30s (uid ${uid}, ${file.size} bytes)`);
+      fail(res, 504, 'Photo upload is slow right now. Please try again.');
+    }, 30_000);
+
     const stream = cloudinary.uploader.upload_stream(
       {
+        timeout: 30_000,
         resource_type: 'image',
         folder: 'cds-pass/avatars',
         public_id: uid, // one photo per person: a new upload replaces the old one
         overwrite: true,
-        invalidate: true,
         transformation: [{ width: 512, height: 512, crop: 'limit', quality: 'auto' }],
       },
       (error, result) => {
+        clearTimeout(guard);
+        if (answered) return;
+        answered = true;
+        console.log(`avatar upload ${error ? 'FAILED' : 'ok'} in ${Date.now() - started}ms (${file.size} bytes)`);
         if (error || !result) {
           console.error('Cloudinary upload failed:', error);
           return fail(res, 500, 'Could not upload your photo. Please try again.');
@@ -2520,7 +3076,7 @@ VITE_PAYSTACK_FEE_PERCENT=1.5
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Poppins:wght@600;700;800&display=swap"
       rel="stylesheet"
     />
     <title>CDS Pass</title>
@@ -2534,7 +3090,32 @@ VITE_PAYSTACK_FEE_PERCENT=1.5
     </script>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <!-- Shown until the app's code has downloaded (React replaces it). Slow networks no longer see a blank page. -->
+      <div id="boot" style="min-height:100dvh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;font-family:system-ui,sans-serif;background:#0B6B3A;color:#fff;text-align:center;padding:24px">
+        <div style="width:72px;height:72px;border-radius:22px;background:#fff;color:#0B6B3A;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:22px">CDS</div>
+        <div style="font-size:20px;font-weight:800">CDS Pass</div>
+        <div id="boot-msg" style="font-size:14px;opacity:.85">Loading…</div>
+        <button id="boot-retry" onclick="location.reload()" style="display:none;height:44px;padding:0 22px;border:0;border-radius:14px;background:#fff;color:#0B6B3A;font-weight:800;font-size:15px">Try again</button>
+      </div>
+    </div>
+    <script>
+      // If the code is slow or fails to download, say so instead of staying blank.
+      (function () {
+        function show(msg, retry) {
+          var m = document.getElementById('boot-msg'), b = document.getElementById('boot-retry');
+          if (!m) return; // app already started
+          m.textContent = msg;
+          if (retry && b) b.style.display = 'inline-block';
+        }
+        setTimeout(function () { show('Still loading… your network seems slow. Please wait a little.'); }, 8000);
+        setTimeout(function () { show('This is taking too long. Check your data or network, then try again.', true); }, 30000);
+        window.addEventListener('error', function (e) {
+          var t = e && e.target;
+          if (t && (t.tagName === 'SCRIPT' || t.tagName === 'LINK')) show('Could not load the app. Check your network and try again.', true);
+        }, true);
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
@@ -2607,6 +3188,26 @@ export default {
   RewriteCond %{REQUEST_FILENAME} !-f
   RewriteCond %{REQUEST_FILENAME} !-d
   RewriteRule ^ index.html [L]
+</IfModule>
+
+# Compress text files (JS, CSS, HTML) so phones download about a third of the size.
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE text/html text/plain text/css text/javascript application/javascript application/json application/manifest+json image/svg+xml
+</IfModule>
+
+# Files in /assets have a unique name per build, so phones can keep them for a year.
+# index.html must always be checked again, so a new upload shows up straight away.
+<IfModule mod_headers.c>
+  <FilesMatch "\.(js|css)$">
+    Header set Cache-Control "public, max-age=31536000, immutable"
+  </FilesMatch>
+  <FilesMatch "^(index\.html|firebase-messaging-sw\.js|manifest\.webmanifest)$">
+    Header set Cache-Control "no-cache"
+  </FilesMatch>
+</IfModule>
+
+<IfModule mod_mime.c>
+  AddType application/manifest+json .webmanifest
 </IfModule>
 ```
 
@@ -2934,7 +3535,7 @@ Write-Output "Wrote $output at 1200x630."
 ### `web/src/App.tsx`
 
 ```tsx
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { Navigate, Outlet, Route, Routes } from 'react-router-dom';
 import { BottomNav } from './components/BottomNav';
 import { InstallGate } from './components/InstallGate';
@@ -2957,6 +3558,11 @@ import DuesAdmin from './pages/exco/DuesAdmin';
 import CallBatch from './pages/exco/CallBatch';
 import Dashboard from './pages/exco/Dashboard';
 import Door from './pages/exco/Door';
+import { AnnouncementBanner, MaintenanceScreen, ModeSwitch } from './components/PlatformChrome';
+// Admin mode is only for the CDS Pass team, so it loads separately (keeps the app small for everyone else).
+const Admin = lazy(() => import('./pages/admin/Admin'));
+import GiveNumber from './pages/exco/GiveNumber';
+import Messages from './pages/exco/Messages';
 import Members from './pages/exco/Members';
 import PrintCards from './pages/exco/PrintCards';
 import Settings from './pages/exco/Settings';
@@ -2964,7 +3570,7 @@ import Table from './pages/exco/Table';
 
 function Splash() {
   return (
-    <div className="grid min-h-[100dvh] place-items-center bg-green-dark">
+    <div className="hero-green grid min-h-[100dvh] place-items-center">
       <div className="flex flex-col items-center gap-4 text-white">
         <img src="/icon.svg" alt="" className="h-20 w-20 rounded-3xl shadow-lift" />
         <Spinner light />
@@ -3122,8 +3728,18 @@ export default function App() {
           <Route path="members" element={<Members />} />
           <Route path="dues" element={<DuesAdmin />} />
           <Route path="settings" element={<Settings />} />
+          <Route path="give-number" element={<GiveNumber />} />
+          <Route path="messages" element={<Messages />} />
         </Route>
         <Route path="/exco/cards" element={profile?.role === 'exco' ? <PrintCards /> : <Navigate to="/home" replace />} />
+        <Route
+          path="/admin"
+          element={
+            <Suspense fallback={<Splash />}>
+              <Admin />
+            </Suspense>
+          }
+        />
         <Route path="*" element={<Navigate to={homePath} replace />} />
       </Routes>
     );
@@ -3132,7 +3748,9 @@ export default function App() {
   return (
     <InstallGate>
       <Toaster />
-      {routes}
+      <AnnouncementBanner />
+      <ModeSwitch />
+      <MaintenanceScreen>{routes}</MaintenanceScreen>
     </InstallGate>
   );
 }
@@ -3222,6 +3840,7 @@ export function BottomNav({ mode }: { mode: 'member' | 'exco' }) {
                   <Icon name={t.icon} size={21} />
                 </span>
                 <span className="relative">{t.label}</span>
+                {isActive && <span className="absolute bottom-1 h-1 w-1 rounded-full bg-gold" />}
               </>
             )}
           </NavLink>
@@ -3289,11 +3908,11 @@ import { Icon } from './ui';
 
 export function ExcoHeader({ title, sub, children }: { title: string; sub?: string; children?: ReactNode }) {
   return (
-    <header className="grid-bg bg-green-dark px-5 pb-5 pt-[max(1.25rem,env(safe-area-inset-top))] text-white lg:rounded-[28px] lg:px-7 lg:pb-6 lg:pt-6">
+    <header className="hero-green px-5 pb-5 pt-[max(1.25rem,env(safe-area-inset-top))] text-white lg:rounded-[28px] lg:px-7 lg:pb-6 lg:pt-6">
       <div className="flex items-center justify-between">
         <div className="min-w-0">
           <p className="text-[11px] font-extrabold tracking-[0.2em] text-green-mid">EXCO</p>
-          <h1 className="truncate text-xl font-extrabold">{title}</h1>
+          <h1 className="truncate text-2xl font-extrabold">{title}</h1>
           {sub && <p className="truncate text-xs font-semibold text-green-mid">{sub}</p>}
         </div>
         <div className="flex gap-2">
@@ -3465,8 +4084,8 @@ export function InstallGate({ children }: { children: ReactNode }) {
   if (!needed || standalone) return <>{children}</>;
 
   return (
-    <div className="screen bg-green-dark text-white">
-      <div className="grid-bg flex flex-1 flex-col px-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] pt-[max(2.5rem,env(safe-area-inset-top))]">
+    <div className="screen hero-green text-white">
+      <div className="flex flex-1 flex-col px-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] pt-[max(2.5rem,env(safe-area-inset-top))]">
         <motion.div
           initial={{ y: 20, opacity: 0, rotate: -6 }}
           animate={{ y: 0, opacity: 1, rotate: 0 }}
@@ -3619,10 +4238,13 @@ export function PhotoPicker({
   value,
   currentPhotoURL,
   onChange,
+  onPickerOpen,
 }: {
   value: Blob | null;
   currentPhotoURL?: string | null;
   onChange: (b: Blob | null, err?: string) => void;
+  /** Called just before the camera/gallery opens (true) and when we're back (false). */
+  onPickerOpen?: (open: boolean) => void;
 }) {
   const cam = useRef<HTMLInputElement>(null);
   const gallery = useRef<HTMLInputElement>(null);
@@ -3635,12 +4257,29 @@ export function PhotoPicker({
     return () => URL.revokeObjectURL(url);
   }, [value]);
 
+  const [working, setWorking] = useState(false);
+
+  function open(input: HTMLInputElement | null) {
+    onPickerOpen?.(true);
+    // If they cancel the camera/gallery no file arrives, but the page gets focus back.
+    const back = () => {
+      window.removeEventListener('focus', back);
+      setTimeout(() => onPickerOpen?.(false), 500);
+    };
+    window.addEventListener('focus', back);
+    input?.click();
+  }
+
   async function pick(f: File | undefined) {
+    onPickerOpen?.(false);
     if (!f) return;
+    setWorking(true);
     try {
       onChange(await compressPhoto(f));
     } catch (e) {
       onChange(null, (e as Error).message);
+    } finally {
+      setWorking(false);
     }
   }
 
@@ -3651,7 +4290,9 @@ export function PhotoPicker({
         animate={{ scale: 1, rotate: 0 }}
         className="relative h-40 w-40 overflow-hidden rounded-full bg-green-light shadow-lift ring-8 ring-white"
       >
-        {preview || currentPhotoURL ? (
+        {working ? (
+          <div className="grid h-full w-full place-items-center text-sm font-bold text-green">Preparing…</div>
+        ) : preview || currentPhotoURL ? (
           <img src={preview ?? currentPhotoURL ?? undefined} alt="Your profile" className="h-full w-full object-cover" />
         ) : (
           <div className="grid h-full w-full place-items-center text-green">
@@ -3663,15 +4304,139 @@ export function PhotoPicker({
         Use a clear photo of your face. The exco compares it with your NYSC ID card.
       </p>
       <div className="grid w-full grid-cols-2 gap-3">
-        <button type="button" onClick={() => cam.current?.click()} className="flex h-14 items-center justify-center gap-2 rounded-2xl bg-green font-bold text-white">
+        <button type="button" onClick={() => open(cam.current)} disabled={working} className="flex h-14 items-center justify-center gap-2 rounded-2xl bg-green font-bold text-white">
           <Icon name="camera" /> Take photo
         </button>
-        <button type="button" onClick={() => gallery.current?.click()} className="flex h-14 items-center justify-center gap-2 rounded-2xl border-2 border-green bg-card font-bold text-green">
+        <button type="button" onClick={() => open(gallery.current)} disabled={working} className="flex h-14 items-center justify-center gap-2 rounded-2xl border-2 border-green bg-card font-bold text-green">
           Choose photo
         </button>
       </div>
       <input ref={cam} type="file" accept="image/*" capture="user" hidden onChange={(e) => pick(e.target.files?.[0])} />
       <input ref={gallery} type="file" accept="image/*" hidden onChange={(e) => pick(e.target.files?.[0])} />
+    </div>
+  );
+}
+```
+
+---
+
+### `web/src/components/PlatformChrome.tsx`
+
+```tsx
+import { AnimatePresence, motion } from 'framer-motion';
+import { useState, type ReactNode } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { useAuth } from '../hooks/useAuth';
+import { useAppStatus, usePlatformRole } from '../hooks/usePlatform';
+import { Icon } from './ui';
+
+/**
+ * Floating mode switch for the CDS Pass admin team: 👤 User · 🧑‍💼 Exco · 🛡️ Admin.
+ * Invisible to everyone else.
+ */
+export function ModeSwitch() {
+  const role = usePlatformRole();
+  const { profile } = useAuth();
+  const nav = useNavigate();
+  const { pathname } = useLocation();
+  const [open, setOpen] = useState(false);
+  if (!role || !profile || profile.status !== 'approved') return null;
+
+  const current = pathname.startsWith('/admin') ? 'admin' : pathname.startsWith('/exco') ? 'exco' : 'user';
+  const modes = [
+    { id: 'user', label: 'User', icon: '👤', to: '/home' },
+    ...(profile.role === 'exco' ? [{ id: 'exco', label: 'Exco', icon: '🧑‍💼', to: '/exco' }] : []),
+    { id: 'admin', label: 'Admin', icon: '🛡️', to: '/admin' },
+  ];
+  const now = modes.find((m) => m.id === current) ?? modes[0];
+
+  return (
+    <div className="fixed right-3 top-[max(env(safe-area-inset-top),12px)] z-50 lg:right-6">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex h-9 items-center gap-1.5 rounded-full bg-gold px-3 text-xs font-extrabold text-[#3d2e00] shadow-lift"
+        aria-label="Switch mode"
+      >
+        <span>{now.icon}</span> {now.label} <Icon name="chevron" size={14} />
+      </button>
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ opacity: 0, y: -6, scale: 0.96 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -6, scale: 0.96 }}
+            className="absolute right-0 mt-2 w-44 overflow-hidden rounded-2xl border border-line bg-card p-1.5 shadow-lift"
+          >
+            {modes.map((m) => (
+              <button
+                key={m.id}
+                onClick={() => {
+                  setOpen(false);
+                  nav(m.to);
+                }}
+                className={`flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-left text-sm font-bold ${
+                  m.id === current ? 'bg-green text-white' : 'text-ink hover:bg-green-light'
+                }`}
+              >
+                <span>{m.icon}</span> {m.label} mode
+              </button>
+            ))}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+/** Announcement banner set in Admin mode (each person can close it once). */
+export function AnnouncementBanner() {
+  const status = useAppStatus();
+  const [closed, setClosed] = useState(() => {
+    try {
+      return localStorage.getItem('cdspass.bannerClosed') ?? '';
+    } catch {
+      return '';
+    }
+  });
+  const text = status?.banner;
+  if (!text || closed === text) return null;
+  return (
+    <div className="relative z-40 flex items-start gap-3 bg-gold px-4 py-2.5 text-sm font-semibold text-[#3d2e00]">
+      <span>📣</span>
+      <p className="flex-1">{text}</p>
+      <button
+        aria-label="Close announcement"
+        onClick={() => {
+          setClosed(text);
+          try {
+            localStorage.setItem('cdspass.bannerClosed', text);
+          } catch {
+            /* ignore */
+          }
+        }}
+        className="font-extrabold"
+      >
+        ✕
+      </button>
+    </div>
+  );
+}
+
+/** Full-screen notice while maintenance is on (the admin team can still get in). */
+export function MaintenanceScreen({ children }: { children: ReactNode }) {
+  const status = useAppStatus();
+  const role = usePlatformRole();
+  if (!status?.maintenance || role) return <>{children}</>;
+  return (
+    <div className="hero-green grid min-h-[100dvh] place-items-center px-6 text-center text-white">
+      <div className="max-w-sm space-y-4">
+        <div className="mx-auto grid h-20 w-20 place-items-center rounded-3xl bg-white/15 text-4xl">🛠️</div>
+        <h1 className="text-2xl font-extrabold">CDS Pass is updating</h1>
+        <p className="text-green-mid">{status.maintenance}</p>
+        <button onClick={() => location.reload()} className="h-12 rounded-2xl bg-gold px-6 font-bold text-[#3d2e00]">
+          Try again
+        </button>
+      </div>
     </div>
   );
 }
@@ -4115,11 +4880,11 @@ export function Toaster() {
 ### `web/src/components/ui.tsx`
 
 ```tsx
-import { motion, type HTMLMotionProps } from 'framer-motion';
-import { forwardRef, type InputHTMLAttributes, type ReactNode } from 'react';
+import { AnimatePresence, motion, type HTMLMotionProps } from 'framer-motion';
+import { forwardRef, useEffect, useId, useMemo, useRef, useState, type InputHTMLAttributes, type KeyboardEvent, type ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 
-type Variant = 'primary' | 'outline' | 'ghost' | 'danger' | 'light';
+type Variant = 'primary' | 'outline' | 'ghost' | 'danger' | 'light' | 'gold';
 
 const variants: Record<Variant, string> = {
   primary: 'bg-green text-white shadow-[0_8px_0_#064726] active:shadow-[0_3px_0_#064726] active:translate-y-[5px]',
@@ -4127,6 +4892,7 @@ const variants: Record<Variant, string> = {
   ghost: 'bg-green-light text-green',
   danger: 'bg-bad text-white shadow-[0_8px_0_#7A1810] active:shadow-[0_3px_0_#7A1810] active:translate-y-[5px]',
   light: 'bg-card text-green shadow-[0_8px_0_rgb(var(--line))] active:shadow-[0_3px_0_rgb(var(--line))] active:translate-y-[5px]',
+  gold: 'bg-gold text-[#3d2e00] shadow-[0_8px_0_#B39B5A] active:shadow-[0_3px_0_#B39B5A] active:translate-y-[5px]',
 };
 
 interface ButtonProps extends Omit<HTMLMotionProps<'button'>, 'children'> {
@@ -4202,8 +4968,9 @@ export function ErrorBox({ children }: { children: ReactNode }) {
   );
 }
 
-export function Pill({ children, tone = 'green' }: { children: ReactNode; tone?: 'green' | 'warn' | 'bad' | 'muted' | 'white' }) {
+export function Pill({ children, tone = 'green' }: { children: ReactNode; tone?: 'green' | 'warn' | 'bad' | 'muted' | 'white' | 'gold' }) {
   const tones = {
+    gold: 'bg-gold-bg text-gold-text',
     green: 'bg-green-light text-green',
     warn: 'bg-warn-bg text-warn',
     bad: 'bg-bad-bg text-bad',
@@ -4217,7 +4984,7 @@ export function Pill({ children, tone = 'green' }: { children: ReactNode; tone?:
 export function TopBar({ title, back, right, sub }: { title: string; back?: string | true; right?: ReactNode; sub?: string }) {
   const nav = useNavigate();
   return (
-    <header className="sticky top-0 z-20 bg-green-dark/95 px-4 pb-4 pt-[max(1rem,env(safe-area-inset-top))] text-white backdrop-blur lg:top-4 lg:rounded-3xl lg:px-6 lg:pt-4">
+    <header className="hero-green sticky top-0 z-20 px-4 pb-4 pt-[max(1rem,env(safe-area-inset-top))] text-white backdrop-blur lg:top-4 lg:rounded-3xl lg:px-6 lg:pt-4">
       <div className="flex items-center gap-3">
         {back ? (
           typeof back === 'string' ? (
@@ -4255,11 +5022,15 @@ export function Page({ children, className = '' }: { children: ReactNode; classN
   );
 }
 
-export function Stat({ value, label, tone = 'dark' }: { value: ReactNode; label: string; tone?: 'dark' | 'light' }) {
+export function Stat({ value, label, tone = 'dark' }: { value: ReactNode; label: string; tone?: 'dark' | 'light' | 'gold' }) {
   return (
-    <div className={`rounded-2xl p-3 ${tone === 'dark' ? 'bg-white/10 text-white' : 'bg-white text-ink shadow-card'}`}>
-      <div className="text-2xl font-extrabold leading-tight">{value}</div>
-      <div className={`text-xs font-semibold ${tone === 'dark' ? 'text-green-mid' : 'text-muted'}`}>{label}</div>
+    <div
+      className={`rounded-2xl p-3 ${
+        tone === 'dark' ? 'bg-white/10 text-white' : tone === 'gold' ? 'bg-gold text-[#3d2e00]' : 'bg-white text-ink shadow-card'
+      }`}
+    >
+      <div className="font-display text-2xl font-extrabold leading-tight">{value}</div>
+      <div className={`text-xs font-semibold ${tone === 'dark' ? 'text-green-mid' : tone === 'gold' ? 'opacity-75' : 'text-muted'}`}>{label}</div>
     </div>
   );
 }
@@ -4313,6 +5084,7 @@ const paths: Record<string, ReactNode> = {
   ),
   finger: <path d="M12 11v3m-4-4a4 4 0 0 1 8 0v4a8 8 0 0 1-1 4M5 8a8 8 0 0 1 14 0m-3 12a12 12 0 0 0 1-6M8 14a4 4 0 0 0 1 3" />,
   check: <path d="M20 6 9 17l-5-5" />,
+  chevron: <path d="m6 9 6 6 6-6" />,
   x: <path d="M18 6 6 18M6 6l12 12" />,
   bell: (
     <>
@@ -4388,6 +5160,209 @@ export function Icon({ name, size = 22, className = '' }: { name: IconName; size
     </svg>
   );
 }
+
+
+/* ------------------------------------------------------------------ */
+/* Select: our own dropdown (no grey browser box).                     */
+/* ------------------------------------------------------------------ */
+
+export interface SelectOption<T extends string = string> {
+  value: T;
+  label: string;
+  hint?: string;
+}
+
+/**
+ * Styled dropdown. Tap to open a list that slides in; tap an option to choose.
+ * With more than 8 options a search box appears (e.g. the list of banks).
+ * Closes on outside tap or Escape. Arrow keys + Enter work on laptops.
+ */
+export function Select<T extends string = string>({
+  value,
+  onChange,
+  options,
+  placeholder = 'Choose…',
+  label,
+  size = 'md',
+  disabled,
+  inline = false,
+  className = '',
+}: {
+  value: T | '';
+  onChange: (v: T) => void;
+  options: SelectOption<T>[];
+  placeholder?: string;
+  label?: string;
+  size?: 'sm' | 'md';
+  disabled?: boolean;
+  /** Open the list in the page flow instead of floating over it (use inside boxes that clip their content). */
+  inline?: boolean;
+  className?: string;
+}) {
+  const id = useId();
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState('');
+  const [hi, setHi] = useState(0);
+  const box = useRef<HTMLDivElement>(null);
+  const searchable = options.length > 8;
+  const current = options.find((o) => o.value === value);
+
+  const shown = useMemo(() => {
+    const t = q.trim().toLowerCase();
+    return t ? options.filter((o) => o.label.toLowerCase().includes(t)) : options;
+  }, [options, q]);
+
+  useEffect(() => {
+    if (!open) return;
+    setQ('');
+    setHi(Math.max(0, options.findIndex((o) => o.value === value)));
+    const away = (e: PointerEvent) => {
+      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('pointerdown', away);
+    return () => document.removeEventListener('pointerdown', away);
+  }, [open, options, value]);
+
+  function pick(o: SelectOption<T>) {
+    onChange(o.value);
+    setOpen(false);
+  }
+
+  function onKey(e: KeyboardEvent) {
+    if (e.key === 'Escape') return setOpen(false);
+    if (!open && (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      return setOpen(true);
+    }
+    if (!open) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setHi((h) => Math.min(shown.length - 1, h + 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setHi((h) => Math.max(0, h - 1));
+    } else if (e.key === 'Enter' && shown[hi]) {
+      e.preventDefault();
+      pick(shown[hi]);
+    }
+  }
+
+  const h = size === 'sm' ? 'h-10 rounded-xl px-3 text-sm' : 'h-14 rounded-2xl px-4 text-base';
+
+  return (
+    <div ref={box} className={`relative ${className}`} onKeyDown={onKey}>
+      {label && (
+        <label htmlFor={id} className="label">
+          {label}
+        </label>
+      )}
+      <button
+        id={id}
+        type="button"
+        disabled={disabled}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        className={`flex w-full items-center justify-between gap-2 border-2 bg-card font-semibold text-ink outline-none transition disabled:opacity-50 ${h} ${
+          open ? 'border-green shadow-[0_0_0_4px_rgb(var(--green-light))]' : 'border-line hover:border-green/50'
+        }`}
+      >
+        <span className={`truncate ${current ? '' : 'text-muted'}`}>{current?.label ?? placeholder}</span>
+        <motion.span animate={{ rotate: open ? 180 : 0 }} className="shrink-0 text-green">
+          <Icon name="chevron" size={size === 'sm' ? 16 : 20} />
+        </motion.span>
+      </button>
+
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ opacity: 0, y: -6, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -6, scale: 0.98 }}
+            transition={{ duration: 0.15 }}
+            className={`${inline ? 'relative' : 'absolute left-0 right-0 z-40 min-w-[11rem] shadow-lift'} mt-2 overflow-hidden rounded-2xl border border-line bg-card`}
+          >
+            {searchable && (
+              <div className="border-b border-line p-2">
+                <input
+                  autoFocus
+                  value={q}
+                  onChange={(e) => {
+                    setQ(e.target.value);
+                    setHi(0);
+                  }}
+                  placeholder="Search…"
+                  className="h-11 w-full rounded-xl bg-paper px-3 text-sm text-ink outline-none"
+                />
+              </div>
+            )}
+            <ul role="listbox" className="max-h-72 overflow-y-auto overscroll-contain p-1.5">
+              {shown.length === 0 && <li className="px-3 py-3 text-sm text-muted">Nothing found</li>}
+              {shown.map((o, i) => {
+                const selected = o.value === value;
+                return (
+                  <li key={o.value} role="option" aria-selected={selected}>
+                    <button
+                      type="button"
+                      onMouseEnter={() => setHi(i)}
+                      onClick={() => pick(o)}
+                      className={`flex w-full items-center justify-between gap-2 rounded-xl px-3 py-2.5 text-left text-sm font-semibold transition-colors ${
+                        selected ? 'bg-green text-white' : i === hi ? 'bg-green-light text-green' : 'text-ink'
+                      }`}
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate">{o.label}</span>
+                        {o.hint && <span className={`block text-xs font-normal ${selected ? 'text-green-mid' : 'text-muted'}`}>{o.hint}</span>}
+                      </span>
+                      {selected && <Icon name="check" size={16} />}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Checkbox: our own tick box.                                          */
+/* ------------------------------------------------------------------ */
+
+export function Checkbox({
+  checked,
+  onChange,
+  children,
+  className = '',
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <label className={`flex cursor-pointer gap-3 ${className}`}>
+      <input type="checkbox" className="peer sr-only" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <span
+        aria-hidden
+        className={`mt-0.5 grid h-6 w-6 shrink-0 place-items-center rounded-lg border-2 transition-colors peer-focus-visible:ring-4 peer-focus-visible:ring-green-light ${
+          checked ? 'border-green bg-green text-white' : 'border-line bg-card'
+        }`}
+      >
+        <AnimatePresence>
+          {checked && (
+            <motion.span initial={{ scale: 0 }} animate={{ scale: 1 }} exit={{ scale: 0 }} transition={{ type: 'spring', stiffness: 500, damping: 25 }}>
+              <Icon name="check" size={15} />
+            </motion.span>
+          )}
+        </AnimatePresence>
+      </span>
+      <span className="min-w-0">{children}</span>
+    </label>
+  );
+}
 ```
 
 ---
@@ -4396,6 +5371,7 @@ export function Icon({ name, size = 22, className = '' }: { name: IconName; size
 
 ```tsx
 import { onAuthStateChanged, signOut, type User } from 'firebase/auth';
+import { clearDraft } from '../lib/signupDraft';
 import { doc, onSnapshot } from 'firebase/firestore';
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react';
 import { auth, db } from '../lib/firebase';
@@ -4502,6 +5478,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     !!profile && profile.status === 'approved' && claims.approved === true && claims.role === profile.role;
 
   const logout = useCallback(async () => {
+    clearDraft();
     await signOut(auth);
   }, []);
 
@@ -4657,6 +5634,15 @@ export function useGroupMembers(gid: string | undefined) {
   return useMemo(() => list?.slice().sort((a, b) => a.fullName.localeCompare(b.fullName)), [list]);
 }
 
+/** Only the members waiting for approval: far fewer reads than loading the whole group. */
+export function usePendingMembers(gid: string | undefined) {
+  const q = useMemo(
+    () => (gid ? query(collection(db, 'users'), where('groupId', '==', gid), where('status', '==', 'pending')) : null),
+    [gid],
+  );
+  return useList<Profile>(q, `pending:${gid}`);
+}
+
 export function useLogs(gid: string | undefined, max = 50) {
   const [logs, setLogs] = useState<LogEntry[] | undefined>(undefined);
   useEffect(() => {
@@ -4744,6 +5730,61 @@ export function useMyDay() {
 
 ---
 
+### `web/src/hooks/usePlatform.ts`
+
+```ts
+import { useEffect, useState } from 'react';
+import { api, type PlatformRole } from '../lib/api';
+import { useAuth } from './useAuth';
+
+/** The admin-team role for the logged-in user (null for normal users). Asked once per login. */
+let cache: { uid: string; role: PlatformRole | null } | null = null;
+
+export function usePlatformRole(): PlatformRole | null {
+  const { user } = useAuth();
+  const [role, setRole] = useState<PlatformRole | null>(cache && user && cache.uid === user.uid ? cache.role : null);
+  useEffect(() => {
+    if (!user) return;
+    const known = cache;
+    if (known && known.uid === user.uid) {
+      setRole(known.role);
+      return;
+    }
+    let live = true;
+    api
+      .adminWhoAmI({})
+      .then((r) => {
+        cache = { uid: user.uid, role: r.role };
+        if (live) setRole(r.role);
+      })
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [user]);
+  return role;
+}
+
+/** Public app status: banner + maintenance (fetched once, never blocks the app). */
+type Status = Awaited<ReturnType<typeof api.appStatus>>;
+let statusPromise: Promise<Status> | null = null;
+
+export function useAppStatus(): Status | null {
+  const [s, setS] = useState<Status | null>(null);
+  useEffect(() => {
+    statusPromise ??= api.appStatus({});
+    let live = true;
+    statusPromise.then((v) => live && setS(v)).catch(() => (statusPromise = null));
+    return () => {
+      live = false;
+    };
+  }, []);
+  return s;
+}
+```
+
+---
+
 ### `web/src/index.css`
 
 ```css
@@ -4767,6 +5808,8 @@ export function useMyDay() {
   --bad-text: 180 35 24;
   --bad-bg: 253 231 229;
   --shadow: 11 107 58;
+  --gold-bg: 247 240 218;
+  --gold-text: 107 82 0;
   color-scheme: light;
 }
 
@@ -4784,6 +5827,8 @@ export function useMyDay() {
   --bad-text: 252 129 120;
   --bad-bg: 61 23 20;
   --shadow: 0 0 0;
+  --gold-bg: 52 45 22;
+  --gold-text: 230 211 154;
   color-scheme: dark;
 }
 
@@ -4801,10 +5846,19 @@ export function useMyDay() {
   --warn-bg: 255 244 214;
   --bad-text: 180 35 24;
   --bad-bg: 253 231 229;
+  --gold-bg: 247 240 218;
+  --gold-text: 107 82 0;
   color-scheme: light;
 }
 
 @layer base {
+  h1,
+  h2,
+  h3,
+  .font-display {
+    font-family: 'Poppins', 'Plus Jakarta Sans', system-ui, sans-serif;
+    letter-spacing: -0.01em;
+  }
   html,
   body,
   #root {
@@ -4840,10 +5894,35 @@ export function useMyDay() {
   .input {
     @apply h-14 w-full rounded-2xl border-2 border-line bg-card px-4 text-base text-ink outline-none transition focus:border-green;
   }
+  /* Our green header: deep NYSC green with a soft gold glow in the corner and faint dots. */
+  .hero-green {
+    background-color: #064726;
+    background-image: radial-gradient(circle at 92% -10%, rgba(217, 197, 138, 0.38), transparent 42%),
+      radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px),
+      linear-gradient(155deg, #053d20 0%, #0b6b3a 62%, #0e7f47 100%);
+    background-size: 100% 100%, 18px 18px, 100% 100%;
+  }
+  /* Big green "your number" card */
+  .number-card {
+    background-image: radial-gradient(circle at 100% 0%, rgba(255, 255, 255, 0.12), transparent 45%),
+      linear-gradient(150deg, #10854a 0%, #0b6b3a 60%, #075230 100%);
+    box-shadow: 0 22px 44px -20px rgba(11, 107, 58, 0.75);
+  }
   .grid-bg {
     background-image: radial-gradient(rgba(255, 255, 255, 0.09) 1px, transparent 1px);
     background-size: 18px 18px;
   }
+}
+
+@keyframes turn-glow {
+  0%, 100% { box-shadow: 0 22px 44px -20px rgba(11, 107, 58, 0.75), 0 0 0 0 rgba(217, 197, 138, 0.0); }
+  50% { box-shadow: 0 22px 44px -20px rgba(11, 107, 58, 0.75), 0 0 0 10px rgba(217, 197, 138, 0.35); }
+}
+.turn-glow {
+  animation: turn-glow 1.8s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .turn-glow { animation: none; }
 }
 
 /* Text colours that need a lighter shade on dark backgrounds. */
@@ -4903,7 +5982,7 @@ interface ProfileInput {
   stateCode: string;
   fullName: string;
   phone: string;
-  photoURL: string;
+  photoURL: string | null;
 }
 type Who = { uid?: string; stateCode?: string };
 
@@ -4930,7 +6009,7 @@ export const api = {
   // CDS day
   startSession: callable<Record<string, never>, { ok: true; sessionId: string }>('startSession'),
   endSession: callable<Record<string, never>, { ok: true }>('endSession'),
-  getDoorCode: callable<Record<string, never>, { code: string; gid: string; sessionId: string; expiresAt: number }>('getDoorCode'),
+  getDoorCode: callable<Record<string, never>, { code: string; gid: string; sessionId: string; epoch?: number; expiresAt: number }>('getDoorCode'),
   checkIn: callable<
     { code: string; gid?: string; lat?: number; lng?: number; scannedAt?: number },
     { number: number; already: boolean; sessionId: string }
@@ -4939,6 +6018,30 @@ export const api = {
   excoCheckIn: callable<Who & { method: 'card' | 'manual' }, { number: number; already: boolean; member: PublicMember }>('excoCheckIn'),
   setPriority: callable<Who, { ok: true; pNumber: number }>('setPriority'),
   callNext: callable<{ mode: 'priority' | 'next' }, { ok: true; batch: Batch; notified: number; inBatch: number }>('callNext'),
+  giveNextNumber: callable<Who, { number: number; already: boolean; member: PublicMember }>('giveNextNumber'),
+  sendGroupMessage: callable<
+    { title: string; body: string; audience: 'all' | 'unpaid' | 'pending' | 'excos'; link: string },
+    { ok: true; recipients: number; delivered: number; left: number }
+  >('sendGroupMessage'),
+  listGroupMessages: callable<
+    Record<string, never>,
+    {
+      left: number;
+      messages: { id: string; title: string; body: string; audience: string; recipients: number; delivered: number; sentByName: string; sentAt: number | null }[];
+    }
+  >('listGroupMessages'),
+  // ---- platform / admin mode
+  appStatus: callable<Record<string, never>, { banner: string | null; maintenance: string | null; signupsPaused: boolean; paymentsPaused: boolean }>('appStatus'),
+  adminWhoAmI: callable<Record<string, never>, { role: PlatformRole | null }>('adminWhoAmI'),
+  adminOverview: callable<{ refresh?: boolean }, AdminOverview>('adminOverview'),
+  adminGetConfig: callable<Record<string, never>, AdminConfig>('adminGetConfig'),
+  adminSetConfig: callable<Partial<{ signupsPaused: boolean; paymentsPaused: boolean; maintenance: string | null; banner: string | null }>, { ok: true }>('adminSetConfig'),
+  adminSetGroupPaused: callable<{ gid: string; paused: boolean }, { ok: true }>('adminSetGroupPaused'),
+  adminBroadcast: callable<
+    { title: string; body: string; audience: 'everyone' | 'excos'; gids: string[]; link: string },
+    { ok: true; recipients: number; delivered: number }
+  >('adminBroadcast'),
+  adminSetTeamMember: callable<{ stateCode: string; role: 'admin' | 'viewer' | null }, { ok: true }>('adminSetTeamMember'),
   testNotification: callable<Record<string, never>, { sent: number; registered: number; members: number }>('testNotification'),
   tableCheck: callable<Who, TableCheckResponse>('tableCheck'),
   markDone: callable<Who, { ok: true }>('markDone'),
@@ -4947,7 +6050,7 @@ export const api = {
   listBanks: callable<Record<string, never>, { name: string; code: string }[]>('listBanks'),
   resolveAccount: callable<{ bankCode: string; accountNumber: string }, { accountName: string }>('resolveAccount'),
   setPayoutAccount: callable<{ bankCode: string; bankName: string; accountNumber: string }, { ok: true; accountName: string }>('setPayoutAccount'),
-  createDues: callable<{ title: string; amountNaira: number; dueDate?: string }, { ok: true; duesId: string }>('createDues'),
+  createDues: callable<{ title: string; amountNaira: number; dueDate?: string; requiredForCheckIn?: boolean }, { ok: true; duesId: string }>('createDues'),
   closeDues: callable<{ duesId: string }, { ok: true }>('closeDues'),
   startPayment: callable<{ duesId: string; returnUrl: string }, { authorizationUrl: string; reference: string; totalKobo: number }>('startPayment'),
   verifyPayment: callable<{ reference: string }, { status: string }>('verifyPayment'),
@@ -4955,6 +6058,45 @@ export const api = {
   respondCash: callable<{ duesId: string; confirm: boolean }, { ok: true }>('respondCash'),
   remindDues: callable<{ duesId: string }, { ok: true; owing: number; notified: number }>('remindDues'),
 };
+
+export type PlatformRole = 'owner' | 'admin' | 'viewer';
+
+export interface AdminGroupRow {
+  id: string;
+  name: string;
+  lga: string;
+  state: string;
+  joinCode: string;
+  paused: boolean;
+  mainExcoStateCode: string | null;
+  members: number;
+  pending: number;
+  excos: number;
+  noPhoto: number;
+  lastMeeting: string | null;
+  lastCheckins: number;
+  onlineKobo: number;
+  cashKobo: number;
+  earnedKobo: number;
+  createdAt: number | null;
+}
+
+export interface AdminOverview {
+  generatedAt: number;
+  totals: { groups: number; activeGroups: number; members: number; pending: number; onlineKobo: number; cashKobo: number; earnedKobo: number; checkins30: number };
+  series: { days: string[]; signups: number[]; checkins: number[]; paidKobo: number[]; earnedKobo: number[] };
+  groups: AdminGroupRow[];
+}
+
+export interface AdminConfig {
+  role: PlatformRole;
+  signupsPaused: boolean;
+  paymentsPaused: boolean;
+  maintenance: string | null;
+  banner: string | null;
+  team: { stateCode: string; role: 'admin' | 'viewer' }[];
+  owner: string | null;
+}
 ```
 
 ---
@@ -5114,7 +6256,7 @@ export function errorText(e: unknown): string {
     case 'auth/user-not-found':
       return 'Wrong state code or PIN.';
     case 'auth/email-already-in-use':
-      return 'This state code is already registered. Log in instead.';
+      return 'This state code already has an account. Tap Log in, use the same PIN, and you will continue where you stopped.';
     case 'auth/too-many-requests':
       return 'Too many tries. Wait a few minutes and try again.';
     case 'auth/network-request-failed':
@@ -5136,32 +6278,56 @@ export function errorText(e: unknown): string {
 /**
  * Crops a photo to a centred square and shrinks it to ~512px JPEG,
  * so a profile picture costs ~40–80 KB of data instead of several MB.
+ *
+ * Phone cameras take 12–50 megapixel photos. Opening one at full size needs 50–200 MB of memory,
+ * which can make a low-memory phone close the app. So we ask the browser to decode it already
+ * shrunk (createImageBitmap with resize), and only fall back to the full-size way if that isn't supported.
  */
 export async function compressPhoto(file: File, size = 512, quality = 0.82): Promise<Blob> {
-  if (!file.type.startsWith('image/')) throw new Error('Please choose a photo.');
+  if (!file.type.startsWith('image/') && file.type !== '') throw new Error('Please choose a photo.');
 
-  const url = URL.createObjectURL(file);
+  let source: CanvasImageSource;
+  let width: number;
+  let height: number;
+  let cleanup = () => {};
+
   try {
+    // Decode at about 2× the final size; keeps the shape, uses a fraction of the memory.
+    const bmp = await createImageBitmap(file, { resizeWidth: size * 2, resizeQuality: 'high', imageOrientation: 'from-image' });
+    source = bmp;
+    width = bmp.width;
+    height = bmp.height;
+    cleanup = () => bmp.close();
+  } catch {
+    const url = URL.createObjectURL(file);
+    cleanup = () => URL.revokeObjectURL(url);
     const img = await new Promise<HTMLImageElement>((resolve, reject) => {
       const i = new Image();
       i.onload = () => resolve(i);
       i.onerror = () => reject(new Error('Could not read that photo. Try another one.'));
       i.src = url;
+    }).catch((e) => {
+      cleanup();
+      throw e;
     });
-    const side = Math.min(img.naturalWidth, img.naturalHeight);
-    const sx = (img.naturalWidth - side) / 2;
-    const sy = (img.naturalHeight - side) / 2;
+    source = img;
+    width = img.naturalWidth;
+    height = img.naturalHeight;
+  }
+
+  try {
+    const side = Math.min(width, height);
     const canvas = document.createElement('canvas');
     canvas.width = size;
     canvas.height = size;
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Your browser cannot process photos.');
-    ctx.drawImage(img, sx, sy, side, side, 0, 0, size, size);
+    ctx.drawImage(source, (width - side) / 2, (height - side) / 2, side, side, 0, 0, size, size);
     return await new Promise<Blob>((resolve, reject) =>
       canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Could not process photo.'))), 'image/jpeg', quality),
     );
   } finally {
-    URL.revokeObjectURL(url);
+    cleanup();
   }
 }
 ```
@@ -5488,6 +6654,95 @@ export function parseQR(text: string):
   if (parts[1] === 'D' && parts.length === 4) return { type: 'door', gid: parts[2], code: parts[3] };
   if (parts[1] === 'M' && parts.length === 3) return { type: 'member', uid: parts[2] };
   return null;
+}
+```
+
+---
+
+### `web/src/lib/signupDraft.ts`
+
+```ts
+/**
+ * Keeps what someone has typed during sign-up, so it survives the phone closing the app.
+ *
+ * Why: on many Android phones, opening the camera or gallery uses so much memory that the
+ * system kills the browser / installed app in the background. When the person comes back the
+ * app starts fresh and everything typed was gone, so they were stuck in a loop at the photo step.
+ *
+ * Stored on this phone only (localStorage), for at most 24 hours, and never the PIN.
+ * Cleared when sign-up succeeds or the person logs out.
+ */
+const KEY = 'cdspass.signupDraft.v1';
+const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+export interface SignupDraft {
+  step: number;
+  stateCode: string;
+  fullName: string;
+  phone: string;
+  joinCode: string;
+  startGroup: boolean;
+  group: { name: string; lga: string; state: string };
+  /** The already-shrunk photo (~50 KB) as a data URL. */
+  photo: string | null;
+  /** True while the camera/gallery is open; if we start up with this still set, the phone closed the app. */
+  pickerOpen: boolean;
+  savedAt: number;
+}
+
+export function loadDraft(): SignupDraft | null {
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (!raw) return null;
+    const d = JSON.parse(raw) as SignupDraft;
+    if (!d || typeof d.savedAt !== 'number' || Date.now() - d.savedAt > MAX_AGE_MS) {
+      localStorage.removeItem(KEY);
+      return null;
+    }
+    return d;
+  } catch {
+    return null;
+  }
+}
+
+export function saveDraft(d: Omit<SignupDraft, 'savedAt'>) {
+  try {
+    localStorage.setItem(KEY, JSON.stringify({ ...d, savedAt: Date.now() }));
+  } catch {
+    // Storage full or blocked (private mode): try again without the photo, else give up quietly.
+    try {
+      localStorage.setItem(KEY, JSON.stringify({ ...d, photo: null, savedAt: Date.now() }));
+    } catch {
+      /* nothing else we can do */
+    }
+  }
+}
+
+/** Marks the camera/gallery as open (or closed) without touching the rest of the draft. */
+export function markPickerOpen(open: boolean) {
+  const d = loadDraft();
+  if (d) saveDraft({ ...d, pickerOpen: open });
+}
+
+export function clearDraft() {
+  try {
+    localStorage.removeItem(KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+export function blobToDataUrl(b: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result));
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(b);
+  });
+}
+
+export async function dataUrlToBlob(url: string): Promise<Blob> {
+  return (await fetch(url)).blob();
 }
 ```
 
@@ -5901,7 +7156,10 @@ export interface Dues {
   id: string;
   title: string;
   amountKobo: number;
+  /** Collection date (YYYY-MM-DD). */
   dueDate: string | null;
+  /** Members must pay before they can get a number, from the collection date. */
+  requiredForCheckIn?: boolean;
   active: boolean;
   createdAt?: Timestamp;
 }
@@ -5909,7 +7167,7 @@ export interface Dues {
 /** groups/{gid}/dues/{duesId}/status/{uid} */
 export interface DuesStatus {
   uid: string;
-  status: 'paid' | 'cash_pending';
+  status: 'paid' | 'cash_pending' | 'disputed';
   method: 'online' | 'cash';
   amountKobo: number;
   reference: string;
@@ -5949,6 +7207,8 @@ export interface Session {
   lastTo: number;
   batchSeq: number;
   batch: Batch | null;
+  /** Goes up when the main exco gives a number by hand; the door screen fetches a new code. */
+  doorEpoch?: number;
 }
 
 export interface Attendee {
@@ -6013,6 +7273,17 @@ import { API_URL, auth } from './firebase';
  * The server uses the login token to know who the photo belongs to.
  */
 export async function uploadAvatar(_uid: string, blob: Blob): Promise<string> {
+  // Slow networks: give each try 40 s, and try a second time automatically before giving up.
+  try {
+    return await uploadOnce(blob, 40_000);
+  } catch (e) {
+    const code = (e as { code?: string }).code;
+    if (code !== 'functions/deadline-exceeded' && code !== 'functions/unavailable' && code !== 'functions/internal') throw e;
+    return await uploadOnce(blob, 40_000);
+  }
+}
+
+async function uploadOnce(blob: Blob, timeoutMs: number): Promise<string> {
   const token = await auth.currentUser?.getIdToken();
   if (!token) throw new Error('Please log in again.');
 
@@ -6021,7 +7292,7 @@ export async function uploadAvatar(_uid: string, blob: Blob): Promise<string> {
 
   let res: Response;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60_000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     res = await fetch(`${API_URL}/upload/avatar`, {
       method: 'POST',
@@ -6040,7 +7311,9 @@ export async function uploadAvatar(_uid: string, blob: Blob): Promise<string> {
 
   const json = (await res.json().catch(() => ({}))) as { url?: string; error?: { message?: string } };
   if (!res.ok || !json.url) {
-    throw new Error(json.error?.message ?? 'Could not upload your photo. Please try again.');
+    throw Object.assign(new Error(json.error?.message ?? 'Could not upload your photo. Please try again.'), {
+      code: res.status >= 500 ? 'functions/internal' : 'functions/invalid-argument',
+    });
   }
   return json.url;
 }
@@ -6176,10 +7449,58 @@ export default function Login() {
 ### `web/src/pages/Pending.tsx`
 
 ```tsx
+import { doc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { motion } from 'framer-motion';
+import { useState } from 'react';
 import { Avatar } from '../components/Avatar';
-import { Button } from '../components/ui';
+import { PhotoPicker } from '../components/PhotoPicker';
+import { Button, ErrorBox } from '../components/ui';
 import { useAuth } from '../hooks/useAuth';
+import { db, errorText } from '../lib/firebase';
+import { toast } from '../lib/toast';
+import { uploadAvatar } from '../lib/upload';
+
+/** Shown when the photo didn't upload during sign-up (slow network). The exco needs it to approve. */
+function AddPhoto({ uid }: { uid: string }) {
+  const [photo, setPhoto] = useState<Blob | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  async function save() {
+    if (!photo) return setError('Take or choose a clear photo of your face first.');
+    setBusy(true);
+    setError('');
+    try {
+      const photoURL = await uploadAvatar(uid, photo);
+      await updateDoc(doc(db, 'users', uid), { photoURL, updatedAt: serverTimestamp() });
+      toast('Photo saved', 'success', 'The exco can now review your account.');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-6 w-full space-y-4 rounded-3xl bg-card p-6 text-left text-ink shadow-lift">
+      <div>
+        <p className="text-lg font-extrabold">Add your photo</p>
+        <p className="text-sm text-muted">Your photo didn't upload during sign-up. The exco needs it to approve you.</p>
+      </div>
+      <PhotoPicker
+        value={photo}
+        onChange={(b, err) => {
+          setPhoto(b);
+          setError(err ?? '');
+        }}
+      />
+      {error && <ErrorBox>{error}</ErrorBox>}
+      <Button onClick={save} disabled={busy || !photo}>
+        {busy ? 'Uploading…' : 'Save photo'}
+      </Button>
+    </div>
+  );
+}
 
 const steps = [
   { t: 'Account created', d: 'Your details and photo are saved.' },
@@ -6194,8 +7515,8 @@ export default function Pending() {
   const rejected = profile.status === 'rejected';
 
   return (
-    <div className="screen bg-green-dark text-white">
-      <div className="grid-bg flex flex-1 flex-col items-center px-6 pb-8 pt-[max(2.5rem,env(safe-area-inset-top))] text-center">
+    <div className="screen hero-green text-white">
+      <div className="flex flex-1 flex-col items-center px-6 pb-8 pt-[max(2.5rem,env(safe-area-inset-top))] text-center">
         <motion.div initial={{ scale: 0.8, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="relative">
           {!rejected && (
             <motion.span
@@ -6208,6 +7529,8 @@ export default function Pending() {
         </motion.div>
         <h1 className="mt-6 text-2xl font-extrabold">{profile.fullName}</h1>
         <p className="font-semibold text-green-mid">{profile.stateCode}</p>
+
+        {!rejected && !profile.photoURL && <AddPhoto uid={profile.uid} />}
 
         <motion.div
           initial={{ y: 20, opacity: 0 }}
@@ -6283,13 +7606,14 @@ import { motion } from 'framer-motion';
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { PhotoPicker } from '../components/PhotoPicker';
-import { Button, ErrorBox, Field, TopBar } from '../components/ui';
+import { Button, Checkbox, ErrorBox, Field, TopBar } from '../components/ui';
 import { useAuth } from '../hooks/useAuth';
 import { api } from '../lib/api';
 import { auth, errorText, wakeServer } from '../lib/firebase';
 import { PLATFORM_ADMIN_STATE_CODE } from '../lib/appConfig';
 import { normalizePhone, normalizeStateCode, stateCodeToEmail } from '../lib/rules';
 import { setSignupLock } from '../lib/signupLock';
+import { blobToDataUrl, clearDraft, dataUrlToBlob, loadDraft, markPickerOpen, saveDraft } from '../lib/signupDraft';
 import { toast } from '../lib/toast';
 import { uploadAvatar } from '../lib/upload';
 
@@ -6302,20 +7626,27 @@ function stateCodeFromCurrentUser(): string {
 export default function Signup({ finish = false }: { finish?: boolean }) {
   const { logout, profile: savedProfile, claims } = useAuth();
   const navigate = useNavigate();
+  // Anything typed before the phone closed the app (see lib/signupDraft.ts). Read once.
+  const [draft] = useState(() => {
+    const d = loadDraft();
+    // In "finish" mode the login already exists: only reuse a draft for the same state code.
+    if (d && finish && normalizeStateCode(d.stateCode) !== stateCodeFromCurrentUser()) return null;
+    return d;
+  });
   const steps = finish ? ['Details', 'Photo', 'CDS group'] : ['Details', 'Photo', 'CDS group', 'PIN'];
-  const [rawStep, setStep] = useState(0);
+  const [rawStep, setStep] = useState(draft?.step ?? 0);
   // If sign-up switches to "finish" mode (fewer steps), never point past the last step.
   const step = Math.min(rawStep, steps.length - 1);
   const [dir, setDir] = useState(1);
 
-  const [stateCode, setStateCode] = useState(finish ? stateCodeFromCurrentUser() : '');
-  const [fullName, setFullName] = useState('');
-  const [phone, setPhone] = useState('');
+  const [stateCode, setStateCode] = useState(finish ? stateCodeFromCurrentUser() : draft?.stateCode ?? '');
+  const [fullName, setFullName] = useState(draft?.fullName ?? '');
+  const [phone, setPhone] = useState(draft?.phone ?? '');
   const [photo, setPhoto] = useState<Blob | null>(null);
-  const [joinCode, setJoinCode] = useState('');
+  const [joinCode, setJoinCode] = useState(draft?.joinCode ?? '');
   // Only the platform admin may start a brand-new group while signing up (first-time setup).
-  const [startGroup, setStartGroup] = useState(false);
-  const [group, setGroup] = useState({ name: '', lga: '', state: '' });
+  const [startGroup, setStartGroup] = useState(draft?.startGroup ?? false);
+  const [group, setGroup] = useState(draft?.group ?? { name: '', lga: '', state: '' });
   const isPlatformAdmin = normalizeStateCode(stateCode) === PLATFORM_ADMIN_STATE_CODE;
   const creatingGroup = isPlatformAdmin && startGroup;
   /** Set once the server has saved everything; we then wait for the profile to arrive before leaving. */
@@ -6326,6 +7657,20 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
 
   const [error, setError] = useState('');
   const [busy, setBusy] = useState('');
+  /** The phone closed the app while the camera/gallery was open. */
+  const [wasClosed] = useState(() => !!draft?.pickerOpen);
+  const [photoData, setPhotoData] = useState<string | null>(draft?.photo ?? null);
+
+  // Bring back a photo that was already chosen before the app was closed.
+  useEffect(() => {
+    if (draft?.photo) void dataUrlToBlob(draft.photo).then(setPhoto).catch(() => setPhotoData(null));
+  }, [draft]);
+
+  // Save progress on every change (never the PIN).
+  useEffect(() => {
+    if (doneTo) return;
+    saveDraft({ step: rawStep, stateCode, fullName, phone, joinCode, startGroup, group, photo: photoData, pickerOpen: false });
+  }, [rawStep, stateCode, fullName, phone, joinCode, startGroup, group, photoData, doneTo]);
 
   // Wake the free Render server now, so it is ready by the time the form is submitted.
   useEffect(() => wakeServer(), []);
@@ -6340,6 +7685,7 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
     const profileReady = !!savedProfile;
     const excoReady = savedProfile?.status !== 'approved' || (claims.approved === true && claims.role === savedProfile.role);
     const go = () => {
+      clearDraft();
       setSignupLock(false);
       navigate(doneTo, { replace: true });
     };
@@ -6402,7 +7748,14 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
       }
 
       setBusy('Uploading your photo…');
-      const photoURL = await uploadAvatar(uid, photo!);
+      let photoURL: string | null = null;
+      try {
+        photoURL = await uploadAvatar(uid, photo!);
+      } catch (e) {
+        // Don't let a slow photo upload block the whole sign-up. They add it on the next screen.
+        if ((e as Error).message === 'Please log in again.') throw e;
+        toast("Your photo didn't upload", 'error', "Your account is still being created. You'll add the photo on the next screen.");
+      }
 
       setBusy('Saving your details…');
       const profile = { stateCode: sc, fullName: fullName.trim(), phone: normalizePhone(phone)!, photoURL };
@@ -6505,11 +7858,20 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
                   <h2 className="text-2xl font-extrabold">Profile picture</h2>
                   <p className="text-muted">This shows on the exco's screen when you thumbprint.</p>
                 </div>
+                {wasClosed && !photo && (
+                  <p className="rounded-2xl bg-warn-bg px-4 py-3 text-sm text-warn">
+                    Your phone closed the app while the camera was open, but your details are saved. Try
+                    <b> Choose photo</b> and pick a selfie from your gallery: it uses less memory.
+                  </p>
+                )}
                 <PhotoPicker
                   value={photo}
+                  onPickerOpen={markPickerOpen}
                   onChange={(b, err) => {
                     setPhoto(b);
                     setError(err ?? '');
+                    if (b) void blobToDataUrl(b).then(setPhotoData).catch(() => setPhotoData(null));
+                    else setPhotoData(null);
                   }}
                 />
               </>
@@ -6584,18 +7946,10 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
                   value={pin2}
                   onChange={(e) => setPin2(e.target.value.replace(/\D/g, ''))}
                 />
-                <label className="flex gap-3 rounded-2xl bg-card p-4 text-sm shadow-card">
-                  <input
-                    type="checkbox"
-                    className="mt-0.5 h-5 w-5 shrink-0 accent-green"
-                    checked={consent}
-                    onChange={(e) => setConsent(e.target.checked)}
-                  />
-                  <span>
-                    I agree that my name, state code, phone number and photo are stored by CDS Pass and shown to my
-                    CDS excos for attendance only. CDS Pass is an independent tool, not run by NYSC.
-                  </span>
-                </label>
+                <Checkbox checked={consent} onChange={setConsent} className="rounded-2xl bg-card p-4 text-sm shadow-card">
+                  I agree that my name, state code, phone number and photo are stored by CDS Pass and shown to my
+                  CDS excos for attendance only. CDS Pass is an independent tool, not run by NYSC.
+                </Checkbox>
               </>
             )}
           </motion.div>
@@ -6636,8 +7990,9 @@ export default function Signup({ finish = false }: { finish?: boolean }) {
 
 ```tsx
 import { motion } from 'framer-motion';
-import { lazy, Suspense, useMemo } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { lazy, Suspense, useMemo, useState } from 'react';
+import { Navigate, useNavigate } from 'react-router-dom';
+import { loadDraft } from '../lib/signupDraft';
 import { Button } from '../components/ui';
 import { canUse3D } from '../lib/device';
 
@@ -6670,10 +8025,13 @@ const points = [
 export default function Welcome() {
   const nav = useNavigate();
   const use3D = useMemo(canUse3D, []);
+  // The phone closed the app while the camera was open during sign-up: go straight back there.
+  const [resume] = useState(() => !!loadDraft()?.pickerOpen);
+  if (resume) return <Navigate to="/signup" replace />;
 
   return (
-    <div className="screen bg-green-dark text-white lg:max-w-6xl lg:flex-row">
-      <div className="grid-bg relative h-[46dvh] min-h-[320px] lg:h-auto lg:w-1/2">
+    <div className="screen hero-green text-white lg:max-w-6xl lg:flex-row">
+      <div className="relative h-[46dvh] min-h-[320px] lg:h-auto lg:w-1/2">
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_40%,rgba(14,127,70,.8),transparent_65%)]" />
         <div className="relative h-full">
           {use3D ? (
@@ -6697,17 +8055,24 @@ export default function Welcome() {
           <br />
           <span className="text-green">for numbers at CDS.</span>
         </h1>
+        <span className="mt-3 block h-1.5 w-16 rounded-full bg-gold" />
 
-        <ul className="mt-6 space-y-4">
+        <ul className="mt-5 space-y-2.5">
           {points.map((p, i) => (
             <motion.li
               key={p.t}
               initial={{ x: -20, opacity: 0 }}
               animate={{ x: 0, opacity: 1 }}
               transition={{ delay: 0.15 + i * 0.1 }}
-              className="flex gap-3"
+              className={`flex gap-3 rounded-2xl p-3 ${i === 0 ? 'bg-green-light' : i === 1 ? 'bg-card shadow-card' : 'bg-gold-bg'}`}
             >
-              <span className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-green text-sm font-extrabold text-white">{i + 1}</span>
+              <span
+                className={`grid h-9 w-9 shrink-0 place-items-center rounded-xl font-display text-sm font-extrabold ${
+                  i === 0 ? 'bg-green text-white' : i === 1 ? 'bg-green-light text-green' : 'bg-gold-bg text-gold-text'
+                }`}
+              >
+                {i + 1}
+              </span>
               <div>
                 <p className="font-bold">{p.t}</p>
                 <p className="text-sm text-muted">{p.d}</p>
@@ -6717,7 +8082,9 @@ export default function Welcome() {
         </ul>
 
         <div className="mt-auto space-y-3 pt-8 lg:mt-10 lg:max-w-sm">
-          <Button onClick={() => nav('/signup')}>Get started</Button>
+          <Button variant="gold" onClick={() => nav('/signup')}>
+            Get started
+          </Button>
           <Button variant="outline" onClick={() => nav('/login')}>
             I already have an account
           </Button>
@@ -6725,6 +8092,589 @@ export default function Welcome() {
         </div>
       </motion.div>
     </div>
+  );
+}
+```
+
+---
+
+### `web/src/pages/admin/Admin.tsx`
+
+```tsx
+import { AnimatePresence, motion } from 'framer-motion';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Navigate } from 'react-router-dom';
+import { Button, Checkbox, ErrorBox, Field, Icon, Page, Pill, Select, Stat } from '../../components/ui';
+import { usePlatformRole } from '../../hooks/usePlatform';
+import { api, type AdminConfig, type AdminGroupRow, type AdminOverview } from '../../lib/api';
+import { errorText } from '../../lib/firebase';
+import { naira } from '../../lib/money';
+import { toast } from '../../lib/toast';
+import { TrendChart } from './Charts';
+
+type Tab = 'overview' | 'groups' | 'controls' | 'message' | 'team';
+
+const sum = (a: number[]) => a.reduce((x, y) => x + y, 0);
+const nairaShort = (kobo: number) => {
+  const n = kobo / 100;
+  return n >= 1_000_000 ? `₦${(n / 1_000_000).toFixed(1)}m` : n >= 1000 ? `₦${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : `₦${Math.round(n)}`;
+};
+
+/* ---------------------------------------------------------------- overview */
+
+function Overview({ data }: { data: AdminOverview }) {
+  const s = data.series;
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <Stat tone="light" value={data.totals.groups} label={`CDS groups · ${data.totals.activeGroups} met this month`} />
+        <Stat tone="light" value={data.totals.members.toLocaleString()} label={`Members · ${data.totals.pending} waiting`} />
+        <Stat tone="light" value={data.totals.checkins30.toLocaleString()} label="Check-ins (30 days)" />
+        <Stat tone="gold" value={naira(data.totals.earnedKobo)} label="Your earnings (all time)" />
+      </div>
+      <div className="grid gap-3 lg:grid-cols-2">
+        <TrendChart title="New sign-ups per day" days={s.days} values={s.signups} kind="line" total={`${sum(s.signups)} in 30 days`} />
+        <TrendChart title="Check-ins per CDS day" days={s.days} values={s.checkins} kind="bar" total={`${sum(s.checkins)} in 30 days`} />
+        <TrendChart
+          title="Dues collected per day"
+          days={s.days}
+          values={s.paidKobo}
+          kind="bar"
+          format={nairaShort}
+          total={naira(sum(s.paidKobo))}
+        />
+        <TrendChart
+          title="Your earnings per day (3% fee)"
+          days={s.days}
+          values={s.earnedKobo}
+          kind="line"
+          format={nairaShort}
+          total={naira(sum(s.earnedKobo))}
+        />
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <Stat tone="light" value={naira(data.totals.onlineKobo)} label="Dues paid online (all time)" />
+        <Stat tone="light" value={naira(data.totals.cashKobo)} label="Cash recorded (all time)" />
+      </div>
+      <p className="text-center text-xs text-muted">
+        Updated {new Date(data.generatedAt).toLocaleTimeString('en-NG', { hour: 'numeric', minute: '2-digit' })}. Figures refresh every 5 minutes.
+      </p>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- groups */
+
+function Groups({ data, canEdit, onChanged }: { data: AdminOverview; canEdit: boolean; onChanged: () => void }) {
+  const [q, setQ] = useState('');
+  const [open, setOpen] = useState<string | null>(null);
+  const [busy, setBusy] = useState('');
+  const list = useMemo(() => {
+    const t = q.trim().toLowerCase();
+    return data.groups.filter((g) => !t || `${g.name} ${g.lga} ${g.state} ${g.joinCode}`.toLowerCase().includes(t));
+  }, [data.groups, q]);
+
+  async function pause(g: AdminGroupRow) {
+    const next = !g.paused;
+    if (!confirm(next ? `Pause ${g.name}? Members can't check in or pay until you resume it.` : `Resume ${g.name}?`)) return;
+    setBusy(g.id);
+    try {
+      await api.adminSetGroupPaused({ gid: g.id, paused: next });
+      toast(next ? `${g.name} paused` : `${g.name} resumed`, 'success');
+      onChanged();
+    } catch (e) {
+      toast(errorText(e), 'error');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <input className="input" placeholder="Search group, LGA, state or code" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search groups" />
+      {list.length === 0 && <p className="card text-center text-sm text-muted">No groups match.</p>}
+      {list.map((g) => (
+        <div key={g.id} className="card !p-0">
+          <button onClick={() => setOpen(open === g.id ? null : g.id)} className="flex w-full items-center gap-3 p-4 text-left">
+            <span className={`grid h-11 w-11 shrink-0 place-items-center rounded-xl font-display font-extrabold ${g.paused ? 'bg-bad-bg text-bad' : 'bg-green-light text-green'}`}>
+              {g.name.slice(0, 2).toUpperCase()}
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block truncate font-bold">{g.name}</span>
+              <span className="block truncate text-xs text-muted">
+                {g.lga}, {g.state} · {g.members} members{g.pending ? ` · ${g.pending} waiting` : ''}
+              </span>
+            </span>
+            {g.paused ? <Pill tone="bad">Paused</Pill> : g.lastMeeting ? <Pill>Active</Pill> : <Pill tone="muted">No meeting</Pill>}
+          </button>
+          <AnimatePresence>
+            {open === g.id && (
+              <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden">
+                <div className="space-y-3 border-t border-line p-4">
+                  <div className="grid grid-cols-2 gap-2 text-sm sm:grid-cols-3">
+                    <Info k="Group code" v={g.joinCode} />
+                    <Info k="Main exco" v={g.mainExcoStateCode ?? '—'} />
+                    <Info k="Excos" v={String(g.excos)} />
+                    <Info k="Last meeting" v={g.lastMeeting ? `${g.lastMeeting} · ${g.lastCheckins} in` : '—'} />
+                    <Info k="Missing photos" v={String(g.noPhoto)} />
+                    <Info k="Paid online" v={naira(g.onlineKobo)} />
+                    <Info k="Cash recorded" v={naira(g.cashKobo)} />
+                    <Info k="Your earnings" v={naira(g.earnedKobo)} />
+                  </div>
+                  {canEdit && (
+                    <Button variant={g.paused ? 'primary' : 'outline'} loading={busy === g.id} onClick={() => pause(g)}>
+                      {g.paused ? 'Resume this group' : 'Pause this group'}
+                    </Button>
+                  )}
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Info({ k, v }: { k: string; v: string }) {
+  return (
+    <div className="rounded-xl bg-paper px-3 py-2">
+      <p className="text-[11px] font-semibold text-muted">{k}</p>
+      <p className="truncate font-bold">{v}</p>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- controls */
+
+function Controls({ config, canEdit, onSaved }: { config: AdminConfig; canEdit: boolean; onSaved: () => void }) {
+  const [banner, setBanner] = useState(config.banner ?? '');
+  const [maintenance, setMaintenance] = useState(config.maintenance ?? '');
+  const [busy, setBusy] = useState('');
+
+  async function save(key: string, patch: Parameters<typeof api.adminSetConfig>[0], done: string) {
+    setBusy(key);
+    try {
+      await api.adminSetConfig(patch);
+      toast(done, 'success');
+      onSaved();
+    } catch (e) {
+      toast(errorText(e), 'error');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      {!canEdit && <p className="rounded-2xl bg-gold-bg px-4 py-3 text-sm text-gold-text">You have view-only access.</p>}
+      <div className="card space-y-3">
+        <p className="font-bold">Switches</p>
+        <Checkbox
+          checked={config.signupsPaused}
+          onChange={(v) => canEdit && save('signups', { signupsPaused: v }, v ? 'New sign-ups paused' : 'Sign-ups open again')}
+          className="rounded-2xl bg-paper p-3 text-sm"
+        >
+          <span className="font-bold">Pause new sign-ups</span>
+          <span className="block text-xs text-muted">Existing members keep working.</span>
+        </Checkbox>
+        <Checkbox
+          checked={config.paymentsPaused}
+          onChange={(v) => canEdit && save('payments', { paymentsPaused: v }, v ? 'Online payments paused' : 'Online payments back on')}
+          className="rounded-2xl bg-paper p-3 text-sm"
+        >
+          <span className="font-bold">Pause online payments</span>
+          <span className="block text-xs text-muted">Members can still pay cash to excos.</span>
+        </Checkbox>
+      </div>
+
+      <div className="card space-y-3">
+        <p className="font-bold">Announcement banner</p>
+        <p className="text-sm text-muted">A gold bar at the top of everyone's app. Leave empty to remove it.</p>
+        <Field label="Banner text" maxLength={200} placeholder="New: pay your dues online in CDS Pass" value={banner} onChange={(e) => setBanner(e.target.value)} />
+        <Button variant="gold" disabled={!canEdit} loading={busy === 'banner'} onClick={() => save('banner', { banner: banner.trim() || null }, banner.trim() ? 'Banner is live' : 'Banner removed')}>
+          {banner.trim() ? 'Show banner' : 'Remove banner'}
+        </Button>
+      </div>
+
+      <div className="card space-y-3">
+        <p className="font-bold">Maintenance mode</p>
+        <p className="text-sm text-muted">Everyone except the admin team sees an “updating” screen. Use while you upload a big update.</p>
+        <Field label="Message" maxLength={200} placeholder="CDS Pass is updating. Back in 10 minutes." value={maintenance} onChange={(e) => setMaintenance(e.target.value)} />
+        <div className="grid grid-cols-2 gap-2">
+          <Button
+            variant="outline"
+            disabled={!canEdit || !maintenance.trim()}
+            loading={busy === 'mOn'}
+            onClick={() => confirm('Turn maintenance ON for everyone?') && save('mOn', { maintenance: maintenance.trim() }, 'Maintenance is ON')}
+          >
+            Turn on
+          </Button>
+          <Button disabled={!canEdit || !config.maintenance} loading={busy === 'mOff'} onClick={() => save('mOff', { maintenance: null }, 'Maintenance is OFF')}>
+            Turn off
+          </Button>
+        </div>
+        {config.maintenance && <Pill tone="bad">Maintenance is ON now</Pill>}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- broadcast */
+
+function Broadcast({ data, canEdit }: { data: AdminOverview; canEdit: boolean }) {
+  const [title, setTitle] = useState('');
+  const [body, setBody] = useState('');
+  const [audience, setAudience] = useState<'everyone' | 'excos'>('everyone');
+  const [target, setTarget] = useState('all');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  async function send() {
+    setError('');
+    const where = target === 'all' ? 'ALL CDS groups' : data.groups.find((g) => g.id === target)?.name;
+    if (!confirm(`Send "${title}" to ${audience === 'excos' ? 'excos' : 'everyone'} in ${where}?`)) return;
+    setBusy(true);
+    try {
+      const r = await api.adminBroadcast({ title, body, audience, gids: target === 'all' ? [] : [target], link: '/home' });
+      toast(`Sent to ${r.recipients} people`, 'success');
+      setTitle('');
+      setBody('');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card space-y-4">
+      <Select
+        label="Which CDS groups"
+        value={target}
+        onChange={setTarget}
+        options={[{ value: 'all', label: 'All CDS groups' }, ...data.groups.map((g) => ({ value: g.id, label: g.name, hint: `${g.lga} · ${g.members} members` }))]}
+      />
+      <Select<'everyone' | 'excos'>
+        label="Who"
+        value={audience}
+        onChange={setAudience}
+        options={[
+          { value: 'everyone', label: 'Everyone (approved members)' },
+          { value: 'excos', label: 'Excos only' },
+        ]}
+      />
+      <Field label="Title" maxLength={60} placeholder="New on CDS Pass" value={title} onChange={(e) => setTitle(e.target.value)} />
+      <div>
+        <label htmlFor="b-body" className="label">
+          Message
+        </label>
+        <textarea id="b-body" rows={4} maxLength={300} className="input !h-auto resize-none py-3" value={body} onChange={(e) => setBody(e.target.value)} />
+      </div>
+      <ErrorBox>{error}</ErrorBox>
+      <Button disabled={!canEdit || title.trim().length < 3 || body.trim().length < 3} loading={busy} onClick={send}>
+        <Icon name="bell" /> Send to {target === 'all' ? 'all groups' : 'this group'}
+      </Button>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- team */
+
+function Team({ config, onSaved }: { config: AdminConfig; onSaved: () => void }) {
+  const [sc, setSc] = useState('');
+  const [role, setRole] = useState<'viewer' | 'admin'>('viewer');
+  const [busy, setBusy] = useState('');
+
+  async function set(stateCode: string, r: 'viewer' | 'admin' | null) {
+    setBusy(stateCode);
+    try {
+      await api.adminSetTeamMember({ stateCode, role: r });
+      toast(r ? 'Team updated' : 'Removed from the team', 'success');
+      setSc('');
+      onSaved();
+    } catch (e) {
+      toast(errorText(e), 'error');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="card space-y-3">
+        <p className="font-bold">Admin team</p>
+        <p className="text-sm text-muted">
+          <b>Viewer</b>: sees charts and all groups. <b>Admin</b>: can also use switches, pause groups, send messages and create groups. Only you
+          (owner {config.owner}) can change the team.
+        </p>
+        <ul className="divide-y divide-line">
+          <li className="flex items-center justify-between py-2 text-sm">
+            <span className="font-bold">{config.owner}</span>
+            <Pill tone="gold">Owner</Pill>
+          </li>
+          {config.team.map((m) => (
+            <li key={m.stateCode} className="flex items-center justify-between gap-2 py-2 text-sm">
+              <span className="font-bold">{m.stateCode}</span>
+              <span className="flex items-center gap-2">
+                <Pill tone={m.role === 'admin' ? 'green' : 'muted'}>{m.role === 'admin' ? 'Admin' : 'Viewer'}</Pill>
+                <button
+                  disabled={busy === m.stateCode}
+                  onClick={() => confirm(`Remove ${m.stateCode} from the team?`) && set(m.stateCode, null)}
+                  className="text-xs font-bold text-bad"
+                >
+                  Remove
+                </button>
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <div className="card space-y-3">
+        <p className="font-bold">Add someone</p>
+        <Field label="Their state code" placeholder="LA/26B/1234" autoCapitalize="characters" value={sc} onChange={(e) => setSc(e.target.value)} />
+        <Select<'viewer' | 'admin'>
+          label="Access"
+          value={role}
+          onChange={setRole}
+          options={[
+            { value: 'viewer', label: 'Viewer (see only)', hint: 'Best for a partner' },
+            { value: 'admin', label: 'Admin (can change things)' },
+          ]}
+        />
+        <Button loading={busy === sc && !!sc} disabled={sc.trim().length < 8} onClick={() => set(sc.trim(), role)}>
+          Add to team
+        </Button>
+        <p className="text-xs text-muted">They need a CDS Pass account. After you add them, they log out and in again to see Admin mode.</p>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------- page */
+
+export default function Admin() {
+  const role = usePlatformRole();
+  const [tab, setTab] = useState<Tab>('overview');
+  const [data, setData] = useState<AdminOverview | null>(null);
+  const [config, setConfig] = useState<AdminConfig | null>(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async (refresh = false) => {
+    setLoading(true);
+    setError('');
+    try {
+      const [o, c] = await Promise.all([api.adminOverview({ refresh }), api.adminGetConfig({})]);
+      setData(o);
+      setConfig(c);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  if (role === null && error) return <Navigate to="/home" replace />;
+  const canEdit = config?.role === 'owner' || config?.role === 'admin';
+  const tabs: { id: Tab; label: string }[] = [
+    { id: 'overview', label: 'Overview' },
+    { id: 'groups', label: 'Groups' },
+    { id: 'controls', label: 'Controls' },
+    { id: 'message', label: 'Message' },
+    ...(config?.role === 'owner' ? [{ id: 'team' as Tab, label: 'Team' }] : []),
+  ];
+
+  return (
+    <div className="min-h-[100dvh] bg-paper text-ink">
+      <header className="hero-green px-5 pb-6 pt-[max(env(safe-area-inset-top),20px)] text-white">
+        <div className="mx-auto max-w-5xl">
+          <p className="text-sm text-green-mid">🛡️ Admin mode{config ? ` · ${config.role}` : ''}</p>
+          <div className="flex items-center justify-between gap-3">
+            <h1 className="text-2xl font-extrabold">CDS Pass control room</h1>
+            <button
+              onClick={() => load(true)}
+              disabled={loading}
+              className="mr-24 h-9 shrink-0 rounded-full bg-white/15 px-3 text-xs font-bold disabled:opacity-50 lg:mr-28"
+            >
+              {loading ? 'Loading…' : 'Refresh'}
+            </button>
+          </div>
+          <div className="mt-4 flex gap-1 overflow-x-auto rounded-2xl bg-white/10 p-1">
+            {tabs.map((t) => (
+              <button key={t.id} onClick={() => setTab(t.id)} className={`relative h-10 shrink-0 flex-1 rounded-xl px-3 text-sm font-bold ${tab === t.id ? 'text-brand' : 'text-white'}`}>
+                {tab === t.id && <motion.span layoutId="admin-tab" className="absolute inset-0 rounded-xl bg-white" />}
+                <span className="relative">{t.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </header>
+      <Page className="mx-auto max-w-5xl space-y-4 pb-16">
+        <ErrorBox>{error}</ErrorBox>
+        {!data || !config ? (
+          <div className="grid gap-3 lg:grid-cols-2">
+            {[0, 1, 2, 3].map((i) => (
+              <div key={i} className="card h-48 animate-pulse" />
+            ))}
+          </div>
+        ) : tab === 'overview' ? (
+          <Overview data={data} />
+        ) : tab === 'groups' ? (
+          <Groups data={data} canEdit={canEdit} onChanged={() => load(true)} />
+        ) : tab === 'controls' ? (
+          <Controls key={JSON.stringify(config)} config={config} canEdit={canEdit} onSaved={() => load()} />
+        ) : tab === 'message' ? (
+          <Broadcast data={data} canEdit={canEdit} />
+        ) : (
+          <Team config={config} onSaved={() => load()} />
+        )}
+      </Page>
+    </div>
+  );
+}
+```
+
+---
+
+### `web/src/pages/admin/Charts.tsx`
+
+```tsx
+import { useMemo, useState } from 'react';
+
+/**
+ * Small single-series charts for Admin mode (no chart library: keeps the app light).
+ * One series each, so no legend: the title names it. Marks use our green (brighter in dark mode),
+ * grid and axes stay quiet, and hovering / tapping shows the exact value for that day.
+ */
+
+const W = 320;
+const H = 140;
+const PAD = { l: 34, r: 8, t: 10, b: 22 };
+
+const shortDay = (ymd: string) => new Date(`${ymd}T12:00:00`).toLocaleDateString('en-NG', { day: 'numeric', month: 'short' });
+
+function niceMax(v: number) {
+  if (v <= 4) return 4;
+  const p = 10 ** Math.floor(Math.log10(v));
+  const m = v / p;
+  return (m <= 2 ? 2 : m <= 5 ? 5 : 10) * p;
+}
+
+export function TrendChart({
+  title,
+  days,
+  values,
+  kind = 'line',
+  format = (n) => n.toLocaleString('en-NG'),
+  total,
+}: {
+  title: string;
+  days: string[];
+  values: number[];
+  kind?: 'line' | 'bar';
+  format?: (n: number) => string;
+  total?: string;
+}) {
+  const [hover, setHover] = useState<number | null>(null);
+  const max = useMemo(() => niceMax(Math.max(0, ...values)), [values]);
+  const n = values.length;
+  const iw = W - PAD.l - PAD.r;
+  const ih = H - PAD.t - PAD.b;
+  const x = (i: number) => PAD.l + (n <= 1 ? iw / 2 : (i / (n - 1)) * iw);
+  const y = (v: number) => PAD.t + ih - (v / max) * ih;
+  const step = iw / Math.max(1, n);
+  const barW = Math.max(2, Math.min(14, step - 2)); // 2px surface gap between bars
+
+  const path = values.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+  const area = `${path} L${x(n - 1)},${PAD.t + ih} L${x(0)},${PAD.t + ih} Z`;
+  const barX = (i: number) => PAD.l + i * step + (step - barW) / 2;
+
+  function pick(clientX: number, el: SVGSVGElement) {
+    const r = el.getBoundingClientRect();
+    const sx = ((clientX - r.left) / r.width) * W;
+    const i = kind === 'bar' ? Math.floor((sx - PAD.l) / step) : Math.round(((sx - PAD.l) / iw) * (n - 1));
+    setHover(i >= 0 && i < n ? i : null);
+  }
+
+  const hx = hover === null ? 0 : kind === 'bar' ? barX(hover) + barW / 2 : x(hover);
+
+  return (
+    <figure className="card !p-4">
+      <figcaption className="flex items-baseline justify-between gap-2">
+        <span className="text-sm font-bold">{title}</span>
+        {total && <span className="font-display text-lg font-extrabold text-green">{total}</span>}
+      </figcaption>
+      <div className="relative mt-2">
+        <svg
+          viewBox={`0 0 ${W} ${H}`}
+          className="w-full touch-none select-none"
+          role="img"
+          aria-label={`${title}, last ${n} days`}
+          onPointerMove={(e) => pick(e.clientX, e.currentTarget)}
+          onPointerDown={(e) => pick(e.clientX, e.currentTarget)}
+          onPointerLeave={() => setHover(null)}
+        >
+          {/* quiet grid: 0, half, max */}
+          {[0, 0.5, 1].map((f) => (
+            <g key={f}>
+              <line x1={PAD.l} x2={W - PAD.r} y1={y(max * f)} y2={y(max * f)} stroke="rgb(var(--line))" strokeWidth={1} />
+              <text x={PAD.l - 6} y={y(max * f) + 3} textAnchor="end" fontSize={9} fill="rgb(var(--muted))">
+                {format(max * f)}
+              </text>
+            </g>
+          ))}
+          {/* x labels: first, middle, last */}
+          {[0, Math.floor((n - 1) / 2), n - 1].map((i) => (
+            <text key={i} x={kind === 'bar' ? barX(i) + barW / 2 : x(i)} y={H - 6} textAnchor="middle" fontSize={9} fill="rgb(var(--muted))">
+              {shortDay(days[i])}
+            </text>
+          ))}
+
+          {kind === 'line' ? (
+            <>
+              <path d={area} fill="rgb(var(--green-text) / 0.12)" />
+              <path d={path} fill="none" stroke="rgb(var(--green-text))" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+            </>
+          ) : (
+            values.map((v, i) => {
+              const h = Math.max(0, PAD.t + ih - y(v));
+              return (
+                <rect
+                  key={i}
+                  x={barX(i)}
+                  y={PAD.t + ih - h}
+                  width={barW}
+                  height={h}
+                  rx={Math.min(3, barW / 2)}
+                  fill="rgb(var(--green-text))"
+                  opacity={hover === null || hover === i ? 1 : 0.45}
+                />
+              );
+            })
+          )}
+
+          {hover !== null && (
+            <g pointerEvents="none">
+              <line x1={hx} x2={hx} y1={PAD.t} y2={PAD.t + ih} stroke="rgb(var(--muted))" strokeDasharray="3 3" strokeWidth={1} />
+              {kind === 'line' && <circle cx={hx} cy={y(values[hover])} r={4.5} fill="rgb(var(--green-text))" stroke="rgb(var(--card))" strokeWidth={2} />}
+            </g>
+          )}
+        </svg>
+        {hover !== null && (
+          <div
+            className="pointer-events-none absolute top-0 -translate-x-1/2 rounded-xl bg-ink px-2.5 py-1.5 text-xs font-semibold text-paper shadow-lift"
+            style={{ left: `${Math.min(88, Math.max(12, (hx / W) * 100))}%` }}
+          >
+            {shortDay(days[hover])}: <b>{format(values[hover])}</b>
+          </div>
+        )}
+      </div>
+    </figure>
   );
 }
 ```
@@ -6853,7 +8803,7 @@ import { Avatar } from '../../components/Avatar';
 import { ExcoHeader } from '../../components/ExcoHeader';
 import { Button, ErrorBox, Icon, Page, Pill, Stat } from '../../components/ui';
 import { useExcoDay } from '../../hooks/useExco';
-import { useGroupMembers } from '../../hooks/useLive';
+import { usePendingMembers } from '../../hooks/useLive';
 import { api } from '../../lib/api';
 import { errorText } from '../../lib/firebase';
 import { batchLabel, tagLabel } from '../../lib/rules';
@@ -6861,8 +8811,9 @@ import { toast } from '../../lib/toast';
 
 export default function Dashboard() {
   const { me, group, session, attendees, stats, open } = useExcoDay();
-  const members = useGroupMembers(me.groupId);
-  const pendingCount = members?.filter((m) => m.status === 'pending').length ?? 0;
+  const isMainExco = (group?.mainExcoUid ?? group?.createdBy) === me.uid;
+  // Dashboard only needs the waiting count, so it reads just those members (not the whole group).
+  const pendingCount = usePendingMembers(me.groupId)?.length ?? 0;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -6893,7 +8844,7 @@ export default function Dashboard() {
         <div className="grid grid-cols-3 gap-2">
           <Stat value={stats.present} label="Present" />
           <Stat value={stats.done} label="Thumbprinted" />
-          <Stat value={stats.waiting} label="Waiting" />
+          <Stat value={stats.waiting} label="Waiting" tone="gold" />
         </div>
       </ExcoHeader>
 
@@ -6904,7 +8855,7 @@ export default function Dashboard() {
               <p className="font-bold">Today's meeting</p>
               <p className="text-sm text-muted">{open ? 'Open. Members can scan in.' : session ? 'Closed' : 'Not opened yet'}</p>
             </div>
-            <Pill tone={open ? 'green' : 'muted'}>{open ? 'Live' : 'Off'}</Pill>
+            <Pill tone={open ? 'green' : 'gold'}>{open ? '● Live' : 'Off'}</Pill>
           </div>
           <Button variant={open ? 'outline' : 'primary'} loading={busy} onClick={toggleSession}>
             {open ? 'End meeting' : "Open today's meeting"}
@@ -6915,24 +8866,53 @@ export default function Dashboard() {
         {open && (
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
             {[
-              { to: '/exco/door', icon: 'door', t: 'Door code', d: 'Members scan in' },
-              { to: '/exco/call', icon: 'megaphone', t: 'Call batch', d: `Now: ${batchLabel(session?.batch)}` },
-              { to: '/exco/table', icon: 'finger', t: 'Table check', d: 'Green or red' },
-              { to: '/exco/members', icon: 'users', t: 'Members', d: pendingCount ? `${pendingCount} to approve` : 'All approved' },
-            ].map((c) => (
-              <Link key={c.to} to={c.to} className="card !p-4 transition active:scale-[0.98]">
-                <span className="grid h-11 w-11 place-items-center rounded-xl bg-green-light text-green">
-                  <Icon name={c.icon} />
-                </span>
-                <p className="mt-3 font-bold">{c.t}</p>
-                <p className="text-xs text-muted">{c.d}</p>
-              </Link>
+              { to: '/exco/door', icon: 'door', t: 'Door code', d: 'Members scan in', tone: 'solid' },
+              { to: '/exco/call', icon: 'megaphone', t: 'Call batch', d: `Now: ${batchLabel(session?.batch)}`, tone: 'gold' },
+              { to: '/exco/table', icon: 'finger', t: 'Table check', d: 'Green or red', tone: 'light' },
+              { to: '/exco/members', icon: 'users', t: 'Members', d: pendingCount ? `${pendingCount} to approve` : 'All approved', tone: 'gold' },
+            ].map((c, i) => (
+              <motion.div key={c.to} initial={{ y: 14, opacity: 0 }} animate={{ y: 0, opacity: 1 }} transition={{ delay: i * 0.06 }}>
+                <Link
+                  to={c.to}
+                  className={`block rounded-3xl p-4 shadow-card transition active:scale-[0.98] ${
+                    c.tone === 'solid' ? 'number-card text-white' : c.tone === 'gold' ? 'bg-gold-bg text-gold-text' : 'bg-green-light text-green'
+                  }`}
+                >
+                  <span className={`grid h-11 w-11 place-items-center rounded-xl ${c.tone === 'solid' ? 'bg-white/15' : 'bg-card shadow-card'}`}>
+                    <Icon name={c.icon as Parameters<typeof Icon>[0]['name']} />
+                  </span>
+                  <p className="mt-3 font-display font-bold">{c.t}</p>
+                  <p className={`text-xs ${c.tone === 'solid' ? 'text-green-mid' : 'opacity-80'}`}>{c.d}</p>
+                </Link>
+              </motion.div>
             ))}
           </div>
         )}
 
+        {isMainExco && (
+          <div className="grid grid-cols-2 gap-3">
+            <Link to="/exco/messages" className="flex flex-col gap-2 rounded-3xl bg-gold-bg p-4 text-gold-text shadow-card active:scale-[0.98]">
+              <span className="grid h-11 w-11 place-items-center rounded-xl bg-card shadow-card">
+                <Icon name="bell" />
+              </span>
+              <span className="font-display font-bold">Send a message</span>
+              <span className="text-xs opacity-80">To everyone or a group</span>
+            </Link>
+            <Link
+              to="/exco/give-number"
+              className={`flex flex-col gap-2 rounded-3xl bg-green-light p-4 text-green shadow-card active:scale-[0.98] ${open ? '' : 'opacity-60'}`}
+            >
+              <span className="grid h-11 w-11 place-items-center rounded-xl bg-card shadow-card">
+                <Icon name="users" />
+              </span>
+              <span className="font-display font-bold">Give a number</span>
+              <span className="text-xs opacity-80">{open ? 'Phone off? Find them' : 'When the meeting is open'}</span>
+            </Link>
+          </div>
+        )}
+
         <Link to="/exco/dues" className="card flex items-center gap-3 !p-4">
-          <span className="grid h-11 w-11 place-items-center rounded-xl bg-green-light text-green">
+          <span className="grid h-11 w-11 place-items-center rounded-xl bg-gold-bg text-gold-text">
             <Icon name="card" />
           </span>
           <div className="flex-1">
@@ -7003,7 +8983,8 @@ import type { Attendee, PublicMember } from '../../lib/types';
 
 type Tab = 'code' | 'scan' | 'manual';
 
-function DoorCode() {
+/** `epoch` changes when the main exco gives someone a number by hand: fetch a new code at once. */
+function DoorCode({ epoch }: { epoch: number }) {
   const [code, setCode] = useState<{ code: string; gid: string; expiresAt: number } | null>(null);
   const [left, setLeft] = useState(30);
   const [error, setError] = useState('');
@@ -7020,7 +9001,7 @@ function DoorCode() {
 
   useEffect(() => {
     void refresh();
-  }, [refresh]);
+  }, [refresh, epoch]);
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -7096,7 +9077,8 @@ function AssistedCheckIn({ mode }: { mode: 'scan' | 'manual' }) {
     if (!found) return;
     setBusy('admit');
     try {
-      const r = await api.excoCheckIn({ uid: found.uid, method: mode === 'scan' ? 'card' : 'manual' });
+      // Typed state code = main exco only; it also changes the door code straight away.
+      const r = mode === 'scan' ? await api.excoCheckIn({ uid: found.uid, method: 'card' }) : await api.giveNextNumber({ uid: found.uid });
       toast(r.already ? `Already No. ${r.number}` : `Checked in · No. ${r.number}`, 'success', found.member.fullName);
       await lookup({ uid: found.uid });
     } catch (e) {
@@ -7145,7 +9127,7 @@ function AssistedCheckIn({ mode }: { mode: 'scan' | 'manual' }) {
           <Button loading={busy === 'lookup'} onClick={() => lookup({ stateCode })}>
             Find member
           </Button>
-          <p className="text-xs text-muted">Manual check-ins are logged with your name.</p>
+          <p className="text-xs text-muted">Main exco only. Logged with your name, and the door code changes straight after.</p>
         </div>
       )}
 
@@ -7185,18 +9167,19 @@ function AssistedCheckIn({ mode }: { mode: 'scan' | 'manual' }) {
 }
 
 export default function Door() {
-  const { open, stats } = useExcoDay();
+  const { me, group, session, open, stats } = useExcoDay();
+  const isMainExco = (group?.mainExcoUid ?? group?.createdBy) === me.uid;
   const [tab, setTab] = useState<Tab>('code');
   const tabs: { id: Tab; label: string }[] = [
     { id: 'code', label: 'Door code' },
     { id: 'scan', label: 'Scan card' },
-    { id: 'manual', label: 'State code' },
+    ...(isMainExco ? [{ id: 'manual' as Tab, label: 'State code' }] : []),
   ];
 
   return (
     <>
       <ExcoHeader title="Door check-in" sub={`${stats.present} checked in so far`}>
-        <div className="grid grid-cols-3 gap-1 rounded-2xl bg-white/10 p-1">
+        <div className={`grid gap-1 rounded-2xl bg-white/10 p-1 ${tabs.length === 3 ? 'grid-cols-3' : 'grid-cols-2'}`}>
           {tabs.map((t) => (
             <button key={t.id} onClick={() => setTab(t.id)} className={`relative h-11 rounded-xl text-sm font-bold ${tab === t.id ? 'text-brand' : 'text-white'}`}>
               {tab === t.id && <motion.span layoutId="door-tab" className="absolute inset-0 rounded-xl bg-white" />}
@@ -7214,7 +9197,7 @@ export default function Door() {
             </Link>
           </div>
         ) : tab === 'code' ? (
-          <DoorCode />
+          <DoorCode epoch={session?.doorEpoch ?? 0} />
         ) : (
           <AssistedCheckIn key={tab} mode={tab} />
         )}
@@ -7233,7 +9216,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { useEffect, useMemo, useState } from 'react';
 import { Avatar } from '../../components/Avatar';
 import { ExcoHeader } from '../../components/ExcoHeader';
-import { Button, ErrorBox, Field, Icon, Page, Pill, Stat } from '../../components/ui';
+import { Button, Checkbox, ErrorBox, Field, Icon, Page, Pill, Select, Stat } from '../../components/ui';
 import { useMe } from '../../hooks/useAuth';
 import { useActiveDues, useDuesStatuses, useGroup, useGroupMembers } from '../../hooks/useLive';
 import { api } from '../../lib/api';
@@ -7314,19 +9297,15 @@ function PayoutAccount() {
       <AnimatePresence>
         {editing && (
           <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="space-y-3 overflow-hidden">
-            <div>
-              <label htmlFor="bank" className="label">
-                Bank
-              </label>
-              <select id="bank" className="input" value={bankCode} onChange={(e) => setBankCode(e.target.value)}>
-                <option value="">{banks ? 'Choose bank' : 'Loading banks…'}</option>
-                {banks?.map((b) => (
-                  <option key={b.code} value={b.code}>
-                    {b.name}
-                  </option>
-                ))}
-              </select>
-            </div>
+            <Select
+              inline
+              label="Bank"
+              value={bankCode}
+              onChange={setBankCode}
+              disabled={!banks}
+              placeholder={banks ? 'Choose bank' : 'Loading banks…'}
+              options={(banks ?? []).map((b) => ({ value: b.code, label: b.name }))}
+            />
             <Field
               label="Account number"
               inputMode="numeric"
@@ -7356,15 +9335,18 @@ function NewDues({ onDone }: { onDone: () => void }) {
   const [title, setTitle] = useState('');
   const [amount, setAmount] = useState('');
   const [dueDate, setDueDate] = useState('');
+  const [required, setRequired] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Lagos' });
 
   async function create() {
     setError('');
+    if (required && !dueDate) return setError('Choose the collection date first.');
     setBusy(true);
     try {
-      await api.createDues({ title, amountNaira: Number(amount), dueDate: dueDate || undefined });
-      toast('Dues created', 'success', 'Members can pay now.');
+      await api.createDues({ title, amountNaira: Number(amount), dueDate: dueDate || undefined, requiredForCheckIn: required });
+      toast('Dues created', 'success', 'Everyone has been told. Reminders go out the evening before and that morning.');
       onDone();
     } catch (e) {
       setError(errorText(e));
@@ -7378,7 +9360,15 @@ function NewDues({ onDone }: { onDone: () => void }) {
       <p className="font-bold">New dues</p>
       <Field label="Title" placeholder="November dues" value={title} onChange={(e) => setTitle(e.target.value)} />
       <Field label="Amount (₦)" inputMode="numeric" placeholder="1000" value={amount} onChange={(e) => setAmount(e.target.value.replace(/\D/g, ''))} />
-      <Field label="Due date (optional)" type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
+      <Field label={required ? 'Collection date' : 'Collection date (optional)'} type="date" min={today} value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
+      <Checkbox checked={required} onChange={setRequired} className="rounded-2xl bg-green-light p-4 text-sm text-green">
+        <span className="font-bold">Must pay before getting a number</span>
+        <span className="block text-xs opacity-80">
+          From the collection date, members who haven't paid see a red “Please pay your dues” screen when they scan, until they pay
+          online or you mark their cash as paid.
+        </span>
+      </Checkbox>
+      <p className="text-xs text-muted">Members are told now, then reminded automatically the evening before and that morning.</p>
       <ErrorBox>{error}</ErrorBox>
       <div className="flex gap-2">
         <Button variant="outline" full={false} className="w-28" onClick={onDone}>
@@ -7398,17 +9388,28 @@ function DuesDetail({ dues }: { dues: Dues }) {
   const statuses = useDuesStatuses(me.groupId, dues.id);
   const [tab, setTab] = useState<'owing' | 'paid'>('owing');
   const [search, setSearch] = useState('');
+  const [batch, setBatch] = useState('all');
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
 
   const rows = useMemo(() => {
     const byUid = new Map((statuses ?? []).map((s) => [s.uid, s]));
     const approved = (members ?? []).filter((m) => m.status === 'approved');
-    const q = search.trim().toLowerCase();
+    const q = search.trim().toLowerCase().replace(/[\s/-]/g, '');
     return approved
       .map((m) => ({ m, s: byUid.get(m.uid) }))
-      .filter((r) => !q || r.m.fullName.toLowerCase().includes(q) || r.m.stateCode.toLowerCase().includes(q));
-  }, [members, statuses, search]);
+      .filter((r) => batch === 'all' || r.m.stateCode.split('/')[1] === batch)
+      .filter((r) => !q || r.m.fullName.toLowerCase().replace(/\s/g, '').includes(q) || r.m.stateCode.toLowerCase().replace(/[\s/-]/g, '').includes(q));
+  }, [members, statuses, search, batch]);
+
+  const batches = useMemo(
+    () => [...new Set((members ?? []).filter((m) => m.status === 'approved').map((m) => m.stateCode.split('/')[1]).filter(Boolean))].sort(),
+    [members],
+  );
+  const disputedCount = rows.filter((r) => r.s?.status === 'disputed').length;
+  const collection = dues.dueDate
+    ? new Date(`${dues.dueDate}T12:00:00`).toLocaleDateString('en-NG', { weekday: 'short', day: 'numeric', month: 'short' })
+    : null;
 
   const paid = rows.filter((r) => r.s?.status === 'paid');
   const owing = rows.filter((r) => r.s?.status !== 'paid');
@@ -7434,7 +9435,10 @@ function DuesDetail({ dues }: { dues: Dues }) {
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="text-lg font-extrabold">{dues.title}</p>
-          <p className="text-sm text-muted">{naira(dues.amountKobo)} per member</p>
+          <p className="text-sm text-muted">
+            {naira(dues.amountKobo)} per member{collection ? ` · collection ${collection}` : ''}
+          </p>
+          {dues.requiredForCheckIn && <Pill tone="gold">Pay before getting a number</Pill>}
         </div>
         <button
           onClick={() => confirm(`Close "${dues.title}"? Members won't be able to pay it any more.`) && run('close', () => api.closeDues({ duesId: dues.id }), 'Dues closed')}
@@ -7459,6 +9463,24 @@ function DuesDetail({ dues }: { dues: Dues }) {
       </div>
 
       <input className="input" placeholder="Search name or state code" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search members" />
+      {batches.length > 1 && (
+        <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
+          {['all', ...batches].map((b) => (
+            <button
+              key={b}
+              onClick={() => setBatch(b)}
+              className={`h-9 shrink-0 rounded-full px-4 text-sm font-bold ${batch === b ? 'bg-green text-white' : 'bg-green-light text-green'}`}
+            >
+              {b === 'all' ? 'All batches' : `Batch ${b}`}
+            </button>
+          ))}
+        </div>
+      )}
+      {disputedCount > 0 && (
+        <p className="rounded-2xl bg-bad-bg px-4 py-3 text-sm font-semibold text-bad">
+          {disputedCount} cash {disputedCount === 1 ? 'record was' : 'records were'} reported as wrong by the member. Check with the exco who recorded it.
+        </p>
+      )}
 
       <ul className="divide-y divide-line">
         {list.map(({ m, s }) => (
@@ -7473,16 +9495,19 @@ function DuesDetail({ dues }: { dues: Dues }) {
             ) : s?.status === 'cash_pending' ? (
               <Pill tone="warn">Awaiting member</Pill>
             ) : (
-              <button
-                onClick={() =>
-                  confirm(`Record ${naira(dues.amountKobo)} cash from ${m.fullName}? They will be asked to confirm it.`) &&
-                  run(`cash:${m.uid}`, () => api.recordCash({ uid: m.uid, duesId: dues.id }), 'Cash recorded. Waiting for the member to confirm.')
-                }
-                disabled={busy === `cash:${m.uid}`}
-                className="flex h-10 items-center gap-1.5 rounded-xl bg-green-light px-3 text-sm font-bold text-green disabled:opacity-50"
-              >
-                <Icon name="cash" size={18} /> Cash
-              </button>
+              <div className="flex items-center gap-2">
+                {s?.status === 'disputed' && <Pill tone="bad">Disputed</Pill>}
+                <button
+                  onClick={() =>
+                    confirm(`Mark ${m.fullName} as PAID: ${naira(dues.amountKobo)} cash?\n\nOnly do this after you have received the money. It counts straight away and ${m.fullName.split(' ')[0]} will be told you recorded it.`) &&
+                    run(`cash:${m.uid}`, () => api.recordCash({ uid: m.uid, duesId: dues.id }), `${m.fullName.split(' ')[0]} is now paid. They can scan in.`)
+                  }
+                  disabled={busy === `cash:${m.uid}`}
+                  className="flex h-10 items-center gap-1.5 rounded-xl bg-green px-3 text-sm font-bold text-white disabled:opacity-50"
+                >
+                  <Icon name="cash" size={18} /> Paid (cash)
+                </button>
+              </div>
             )}
           </li>
         ))}
@@ -7532,8 +9557,167 @@ export default function DuesAdmin() {
           </p>
         )}
         <p className="text-center text-xs text-muted">
-          Cash only counts after the member confirms it on their phone. Every cash record is in the activity log.
+          “Paid (cash)” counts immediately. The member is told who recorded it and can tap “This is wrong”. Every cash record is in the activity log.
         </p>
+      </Page>
+    </>
+  );
+}
+```
+
+---
+
+### `web/src/pages/exco/GiveNumber.tsx`
+
+```tsx
+import { AnimatePresence, motion } from 'framer-motion';
+import { useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { Avatar } from '../../components/Avatar';
+import { ExcoHeader } from '../../components/ExcoHeader';
+import { Button, ErrorBox, Icon, Page, Pill } from '../../components/ui';
+import { useExcoDay } from '../../hooks/useExco';
+import { useGroupMembers } from '../../hooks/useLive';
+import { api } from '../../lib/api';
+import { errorText } from '../../lib/firebase';
+import { tagLabel } from '../../lib/rules';
+import { toast } from '../../lib/toast';
+import type { Profile } from '../../lib/types';
+
+/**
+ * Main exco only: give a registered member the next number when their phone is off / dead.
+ * Search, tap the person, confirm. The door code changes straight after.
+ */
+export default function GiveNumber() {
+  const { me, group, open, attendees } = useExcoDay();
+  const members = useGroupMembers(me.groupId);
+  const isMainExco = (group?.mainExcoUid ?? group?.createdBy) === me.uid;
+  const [search, setSearch] = useState('');
+  const [picked, setPicked] = useState<Profile | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [given, setGiven] = useState<{ name: string; number: number } | null>(null);
+
+  const byUid = useMemo(() => new Map((attendees ?? []).map((a) => [a.uid, a])), [attendees]);
+  const list = useMemo(() => {
+    const q = search.trim().toLowerCase().replace(/[\s/-]/g, '');
+    if (!q) return [];
+    return (members ?? [])
+      .filter((m) => m.status === 'approved')
+      .filter((m) => m.fullName.toLowerCase().replace(/\s/g, '').includes(q) || m.stateCode.toLowerCase().replace(/[\s/-]/g, '').includes(q))
+      .slice(0, 20);
+  }, [members, search]);
+
+  async function give() {
+    if (!picked) return;
+    setError('');
+    setBusy(true);
+    try {
+      const r = await api.giveNextNumber({ uid: picked.uid });
+      navigator.vibrate?.([60, 40, 60]);
+      setGiven({ name: picked.fullName, number: r.number });
+      toast(r.already ? `${picked.fullName} already has No. ${r.number}` : `${picked.fullName} is No. ${r.number}`, 'success', 'The door code has changed.');
+      setPicked(null);
+      setSearch('');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <ExcoHeader title="Give a number" sub="For registered members whose phone is off" />
+      <Page className="space-y-4">
+        {group && !isMainExco ? (
+          <div className="card text-center text-sm text-muted">Only the main exco can give numbers by hand.</div>
+        ) : !open ? (
+          <div className="card text-center">
+            <p className="font-bold">Today's meeting is not open</p>
+            <Link to="/exco" className="mt-3 inline-block font-bold text-green">
+              Open it from Today →
+            </Link>
+          </div>
+        ) : (
+          <>
+            <AnimatePresence>
+              {given && (
+                <motion.div
+                  initial={{ scale: 0.9, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="number-card rounded-[28px] p-5 text-center text-white"
+                >
+                  <p className="text-sm text-green-mid">{given.name}</p>
+                  <p className="font-display text-7xl font-extrabold">{given.number}</p>
+                  <p className="text-xs text-green-mid">Tell them their number. The door code has changed.</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            <div className="card space-y-3">
+              <input
+                className="input"
+                autoFocus
+                placeholder="Search name or state code"
+                value={search}
+                onChange={(e) => {
+                  setSearch(e.target.value);
+                  setPicked(null);
+                  setGiven(null);
+                }}
+                aria-label="Search members"
+              />
+              {!search && <p className="text-sm text-muted">Type a name or state code (e.g. 26B/1142) to find the person.</p>}
+              {search && members === undefined && <div className="h-14 animate-pulse rounded-2xl bg-line" />}
+              {search && members && list.length === 0 && <p className="text-sm text-muted">No approved member matches.</p>}
+              <ul className="divide-y divide-line">
+                {list.map((m) => {
+                  const a = byUid.get(m.uid);
+                  return (
+                    <li key={m.uid}>
+                      <button
+                        onClick={() => setPicked(m)}
+                        className={`flex w-full items-center gap-3 rounded-2xl px-2 py-3 text-left ${picked?.uid === m.uid ? 'bg-green-light' : ''}`}
+                      >
+                        <Avatar src={m.photoURL} name={m.fullName} size={44} />
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-bold">{m.fullName}</p>
+                          <p className="text-xs text-muted">{m.stateCode}</p>
+                        </div>
+                        {a ? <Pill>No. {tagLabel(a)}</Pill> : <Pill tone="muted">No number</Pill>}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+
+            <AnimatePresence>
+              {picked && (
+                <motion.div initial={{ y: 20, opacity: 0 }} animate={{ y: 0, opacity: 1 }} exit={{ y: 20, opacity: 0 }} className="card space-y-3">
+                  <div className="flex items-center gap-3">
+                    <Avatar src={picked.photoURL} name={picked.fullName} size={64} />
+                    <div className="min-w-0">
+                      <p className="font-display text-lg font-extrabold">{picked.fullName}</p>
+                      <p className="text-sm text-muted">{picked.stateCode}</p>
+                    </div>
+                  </div>
+                  <p className="rounded-2xl bg-gold-bg px-4 py-3 text-sm text-gold-text">Check their NYSC ID card matches this photo before you give a number.</p>
+                  <ErrorBox>{error}</ErrorBox>
+                  {byUid.get(picked.uid) ? (
+                    <p className="text-center font-bold text-green">Already has No. {tagLabel(byUid.get(picked.uid)!)}</p>
+                  ) : (
+                    <Button loading={busy} onClick={give}>
+                      <Icon name="check" /> Give next number
+                    </Button>
+                  )}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </>
+        )}
       </Page>
     </>
   );
@@ -7552,7 +9736,7 @@ import { Avatar } from '../../components/Avatar';
 import { ExcoHeader } from '../../components/ExcoHeader';
 import { MemberCard } from '../../components/MemberCard';
 import { QRScan } from '../../components/QRScan';
-import { Button, ErrorBox, Icon, Page, Pill } from '../../components/ui';
+import { Button, ErrorBox, Icon, Page, Pill, Select } from '../../components/ui';
 import { useMe } from '../../hooks/useAuth';
 import { useGroup, useGroupMembers } from '../../hooks/useLive';
 import { api } from '../../lib/api';
@@ -7562,6 +9746,14 @@ import { toast } from '../../lib/toast';
 import type { Profile } from '../../lib/types';
 
 type Filter = 'pending' | 'approved' | 'excos';
+type Sort = 'name' | 'newest' | 'code';
+
+/** "LA/26B/1142" → "26B" (the NYSC batch). */
+const batchOf = (stateCode: string) => stateCode.split('/')[1] ?? '';
+const timeOf = (m: Profile) => {
+  const t = (m as unknown as { createdAt?: { toMillis?: () => number } }).createdAt;
+  return typeof t?.toMillis === 'function' ? t.toMillis() : 0;
+};
 
 export default function Members() {
   const me = useMe();
@@ -7570,6 +9762,9 @@ export default function Members() {
   const isMainExco = (group?.mainExcoUid ?? group?.createdBy) === me.uid;
   const [filter, setFilter] = useState<Filter>('pending');
   const [search, setSearch] = useState('');
+  const [batch, setBatch] = useState<string>('all');
+  const [noPhotoOnly, setNoPhotoOnly] = useState(false);
+  const [sort, setSort] = useState<Sort>('name');
   const [selected, setSelected] = useState<Profile | null>(null);
   const [scanning, setScanning] = useState(false);
   const [busy, setBusy] = useState('');
@@ -7584,12 +9779,44 @@ export default function Members() {
     [members],
   );
 
+  // Members in the current tab, before the batch / photo filters (used for the chip counts).
+  const inTab = useMemo(
+    () =>
+      (members ?? []).filter((m) =>
+        filter === 'pending' ? m.status === 'pending' : filter === 'excos' ? m.role === 'exco' : m.status === 'approved',
+      ),
+    [members, filter],
+  );
+
+  // Batches that actually exist in this tab, e.g. [["26A", 12], ["26B", 30]].
+  const batches = useMemo(() => {
+    const c = new Map<string, number>();
+    for (const m of inTab) {
+      const b = batchOf(m.stateCode);
+      if (b) c.set(b, (c.get(b) ?? 0) + 1);
+    }
+    return [...c.entries()].sort(([a], [b]) => a.localeCompare(b));
+  }, [inTab]);
+
   const list = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return (members ?? [])
-      .filter((m) => (filter === 'pending' ? m.status === 'pending' : filter === 'excos' ? m.role === 'exco' : m.status === 'approved'))
-      .filter((m) => !q || m.fullName.toLowerCase().includes(q) || m.stateCode.toLowerCase().includes(q));
-  }, [members, filter, search]);
+    // Search ignores slashes and spaces, so "26b1142", "26B/1142" and "1142" all find LA/26B/1142.
+    const q = search.trim().toLowerCase().replace(/[\s/-]/g, '');
+    const rows = inTab
+      .filter((m) => batch === 'all' || batchOf(m.stateCode) === batch)
+      .filter((m) => !noPhotoOnly || !m.photoURL)
+      .filter(
+        (m) =>
+          !q ||
+          m.fullName.toLowerCase().replace(/\s/g, '').includes(q) ||
+          m.stateCode.toLowerCase().replace(/[\s/-]/g, '').includes(q) ||
+          (m.phone ?? '').replace(/\D/g, '').includes(q.replace(/^0/, '')),
+      );
+    return [...rows].sort((a, b) =>
+      sort === 'newest' ? timeOf(b) - timeOf(a) : sort === 'code' ? a.stateCode.localeCompare(b.stateCode, undefined, { numeric: true }) : a.fullName.localeCompare(b.fullName),
+    );
+  }, [inTab, batch, noPhotoOnly, search, sort]);
+
+  const filtersOn = batch !== 'all' || noPhotoOnly || search.trim() !== '';
 
   async function run(label: string, fn: () => Promise<unknown>, done: string) {
     setError('');
@@ -7698,17 +9925,69 @@ export default function Members() {
           ) : (
             <motion.div key="list" className="space-y-3">
               <div className="flex gap-2">
-                <input className="input flex-1" placeholder="Search name or state code" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search members" />
+                <input className="input flex-1" placeholder="Search name, state code or phone" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search members" />
                 <button onClick={() => setScanning(true)} aria-label="Scan member code" className="grid h-14 w-14 place-items-center rounded-2xl bg-green text-white">
                   <Icon name="scan" />
                 </button>
+              </div>
+
+              {/* Batch chips (26A, 26B, 26C …), no-photo filter and sort */}
+              <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
+                {[['all', inTab.length] as [string, number], ...batches].map(([b, n]) => (
+                  <button
+                    key={b}
+                    onClick={() => setBatch(b)}
+                    className={`relative h-10 shrink-0 rounded-full px-4 text-sm font-bold transition-colors ${
+                      batch === b ? 'text-white' : 'bg-card text-ink shadow-card'
+                    }`}
+                  >
+                    {batch === b && <motion.span layoutId="batch-chip" className="absolute inset-0 rounded-full bg-green" />}
+                    <span className="relative">
+                      {b === 'all' ? 'All batches' : `Batch ${b}`} <span className="opacity-70">{n}</span>
+                    </span>
+                  </button>
+                ))}
+                <button
+                  onClick={() => setNoPhotoOnly((v) => !v)}
+                  className={`h-10 shrink-0 rounded-full px-4 text-sm font-bold ${noPhotoOnly ? 'bg-warn text-white' : 'bg-card text-warn shadow-card'}`}
+                >
+                  No photo
+                </button>
+              </div>
+              <div className="flex items-center justify-between gap-2 text-sm">
+                <span className="text-muted">
+                  {list.length} {list.length === 1 ? 'person' : 'people'}
+                  {filtersOn && (
+                    <button
+                      onClick={() => {
+                        setBatch('all');
+                        setNoPhotoOnly(false);
+                        setSearch('');
+                      }}
+                      className="ml-2 font-bold text-green"
+                    >
+                      Clear filters
+                    </button>
+                  )}
+                </span>
+                <Select<Sort>
+                  size="sm"
+                  className="w-40"
+                  value={sort}
+                  onChange={setSort}
+                  options={[
+                    { value: 'name', label: 'Name A–Z' },
+                    { value: 'code', label: 'State code' },
+                    { value: 'newest', label: 'Newest first' },
+                  ]}
+                />
               </div>
 
               {members === undefined ? (
                 <div className="card h-40 animate-pulse" />
               ) : list.length === 0 ? (
                 <div className="card text-center text-sm text-muted">
-                  {filter === 'pending' ? 'Nobody is waiting for approval.' : 'No members here yet.'}
+                  {filtersOn ? 'Nobody matches these filters.' : filter === 'pending' ? 'Nobody is waiting for approval.' : 'No members here yet.'}
                 </div>
               ) : (
                 <ul className="card divide-y divide-line !p-0">
@@ -7718,7 +9997,10 @@ export default function Members() {
                         <Avatar src={m.photoURL} name={m.fullName} size={44} />
                         <div className="min-w-0 flex-1">
                           <p className="truncate font-bold">{m.fullName}</p>
-                          <p className="text-xs text-muted">{m.stateCode}</p>
+                          <p className="text-xs text-muted">
+                            {m.stateCode}
+                            {!m.photoURL && <span className="font-bold text-warn"> · No photo yet</span>}
+                          </p>
                         </div>
                         {m.role === 'exco' && <Pill>Exco</Pill>}
                         {m.status === 'pending' && <Pill tone="warn">Pending</Pill>}
@@ -7735,6 +10017,205 @@ export default function Members() {
           )}
         </AnimatePresence>
         <ErrorBox>{error}</ErrorBox>
+      </Page>
+    </>
+  );
+}
+```
+
+---
+
+### `web/src/pages/exco/Messages.tsx`
+
+```tsx
+import { AnimatePresence, motion } from 'framer-motion';
+import { useCallback, useEffect, useState } from 'react';
+import { ExcoHeader } from '../../components/ExcoHeader';
+import { Button, ErrorBox, Field, Icon, Page, Pill, Select } from '../../components/ui';
+import { useMe } from '../../hooks/useAuth';
+import { useGroup } from '../../hooks/useLive';
+import { api } from '../../lib/api';
+import { errorText } from '../../lib/firebase';
+import { toast } from '../../lib/toast';
+
+type Audience = 'all' | 'unpaid' | 'pending' | 'excos';
+
+const TEMPLATES: { emoji: string; label: string; title: string; body: string; link: string; audience?: Audience }[] = [
+  { emoji: '☀️', label: 'Good morning', title: 'Good morning corpers ☀️', body: 'Have a great day. See you at CDS!', link: '/home' },
+  { emoji: '💼', label: 'Job alert', title: 'Job alert 💼', body: 'A new opportunity is available. Ask the excos for details.', link: '/home' },
+  { emoji: '💰', label: 'Dues reminder', title: 'Dues reminder 💰', body: 'Please pay your CDS dues in the app before the next meeting.', link: '/dues', audience: 'unpaid' },
+  { emoji: '📍', label: 'Venue change', title: 'Venue change 📍', body: 'This week’s CDS meeting holds at a new venue: ', link: '/home' },
+  { emoji: '⚠️', label: 'Meeting cancelled', title: 'CDS meeting cancelled ⚠️', body: 'There will be no CDS meeting this week. More details soon.', link: '/home' },
+];
+
+const AUDIENCES: { value: Audience; label: string; hint: string }[] = [
+  { value: 'all', label: 'Everyone (approved members)', hint: 'All approved corpers in this CDS' },
+  { value: 'unpaid', label: 'Haven’t paid dues', hint: 'Members who still owe any open dues' },
+  { value: 'pending', label: 'Waiting for approval', hint: 'People who signed up but aren’t approved yet' },
+  { value: 'excos', label: 'Excos only', hint: 'Just the excos' },
+];
+
+const LINKS = [
+  { value: '/home', label: 'Home' },
+  { value: '/dues', label: 'Dues' },
+  { value: '/tag', label: 'My tag' },
+  { value: '/scan', label: 'Scan in' },
+];
+
+type Sent = Awaited<ReturnType<typeof api.listGroupMessages>>['messages'][number];
+
+/** Main exco: send a custom push message to members ("Good morning corpers", "Job alert" …). */
+export default function Messages() {
+  const me = useMe();
+  const group = useGroup(me.groupId);
+  const isMainExco = (group?.mainExcoUid ?? group?.createdBy) === me.uid;
+
+  const [title, setTitle] = useState('');
+  const [body, setBody] = useState('');
+  const [audience, setAudience] = useState<Audience>('all');
+  const [link, setLink] = useState('/home');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [history, setHistory] = useState<Sent[] | null>(null);
+  const [left, setLeft] = useState<number | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await api.listGroupMessages({});
+      setHistory(r.messages);
+      setLeft(r.left);
+    } catch {
+      setHistory([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isMainExco) void load();
+  }, [isMainExco, load]);
+
+  async function send() {
+    setError('');
+    if (title.trim().length < 3 || body.trim().length < 3) return setError('Write a title and a message.');
+    const who = AUDIENCES.find((a) => a.value === audience)!.label.toLowerCase();
+    if (!confirm(`Send "${title.trim()}" to ${who}?`)) return;
+    setBusy(true);
+    try {
+      const r = await api.sendGroupMessage({ title: title.trim(), body: body.trim(), audience, link });
+      toast(`Sent to ${r.recipients} ${r.recipients === 1 ? 'person' : 'people'}`, 'success', `${r.left} message${r.left === 1 ? '' : 's'} left today.`);
+      setTitle('');
+      setBody('');
+      await load();
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (group && !isMainExco) {
+    return (
+      <>
+        <ExcoHeader title="Send a message" />
+        <Page>
+          <div className="card text-center text-sm text-muted">Only the main exco can send messages to members.</div>
+        </Page>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <ExcoHeader title="Send a message" sub={left === null ? 'Push notification to members' : `${left} of 5 left today`} />
+      <Page className="space-y-4">
+        <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
+          {TEMPLATES.map((t) => (
+            <button
+              key={t.label}
+              onClick={() => {
+                setTitle(t.title);
+                setBody(t.body);
+                setLink(t.link);
+                if (t.audience) setAudience(t.audience);
+              }}
+              className="h-10 shrink-0 rounded-full bg-card px-4 text-sm font-bold text-green shadow-card active:scale-95"
+            >
+              {t.emoji} {t.label}
+            </button>
+          ))}
+        </div>
+
+        <div className="card space-y-4">
+          <Field label="Title" maxLength={60} placeholder="Good morning corpers" value={title} onChange={(e) => setTitle(e.target.value)} />
+          <div>
+            <label htmlFor="msg-body" className="label">
+              Message
+            </label>
+            <textarea
+              id="msg-body"
+              maxLength={300}
+              rows={4}
+              placeholder="Write your message…"
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              className="input !h-auto resize-none py-3"
+            />
+            <p className="mt-1 text-right text-xs text-muted">{body.length}/300</p>
+          </div>
+          <Select<Audience>
+            label="Send to"
+            value={audience}
+            onChange={setAudience}
+            options={AUDIENCES.map((a) => ({ value: a.value, label: a.label, hint: a.hint }))}
+          />
+          <Select label="When they tap it, open" value={link} onChange={setLink} options={LINKS} />
+
+          {/* Preview of how it looks on a phone */}
+          <AnimatePresence>
+            {(title || body) && (
+              <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="rounded-2xl bg-line p-3">
+                <p className="mb-2 text-[11px] font-bold uppercase tracking-wider text-muted">Preview</p>
+                <div className="flex gap-3 rounded-2xl bg-card p-3 shadow-card">
+                  <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-green text-xs font-extrabold text-white">CDS</span>
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-bold">{title || 'Title'}</p>
+                    <p className="line-clamp-3 text-sm text-muted">{body || 'Message'}</p>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          <ErrorBox>{error}</ErrorBox>
+          <Button loading={busy} disabled={left === 0} onClick={send}>
+            <Icon name="bell" /> Send message
+          </Button>
+          <p className="text-center text-xs text-muted">Up to 5 messages a day, so members don’t turn notifications off. Only members with alerts on receive it.</p>
+        </div>
+
+        <div className="card !p-0">
+          <p className="px-5 pb-2 pt-4 font-bold">Sent messages</p>
+          {history === null ? (
+            <div className="mx-5 mb-4 h-14 animate-pulse rounded-2xl bg-line" />
+          ) : history.length === 0 ? (
+            <p className="px-5 pb-4 text-sm text-muted">Nothing sent yet.</p>
+          ) : (
+            <ul className="divide-y divide-line">
+              {history.map((m) => (
+                <li key={m.id} className="space-y-1 px-5 py-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="truncate text-sm font-bold">{m.title}</p>
+                    <Pill tone="muted">{m.recipients} people</Pill>
+                  </div>
+                  <p className="line-clamp-2 text-sm text-muted">{m.body}</p>
+                  <p className="text-xs text-muted">
+                    {m.sentByName} ·{' '}
+                    {m.sentAt ? new Date(m.sentAt).toLocaleString('en-NG', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }) : ''}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       </Page>
     </>
   );
@@ -7809,8 +10290,9 @@ export default function PrintCards() {
 
 ```tsx
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { ThemeToggle } from '../../components/ThemeToggle';
-import { Button, ErrorBox, Field, Page, TopBar } from '../../components/ui';
+import { Button, ErrorBox, Field, Icon, Page, TopBar } from '../../components/ui';
 import { useMe } from '../../hooks/useAuth';
 import { useGroup, useLogs } from '../../hooks/useLive';
 import { api } from '../../lib/api';
@@ -7971,14 +10453,31 @@ export default function Settings() {
         </div>
 
         <div className="card space-y-3">
-          <p className="font-bold">Test notifications</p>
-          <p className="text-sm text-muted">The main exco can send a test alert to every approved CDS member who has enabled notifications.</p>
+          <p className="font-bold">Main exco tools</p>
           {(group?.mainExcoUid ?? group?.createdBy) === me.uid ? (
-            <Button variant="ghost" loading={busy === 'notification'} onClick={testNotification}>
-              Send test notification to all members
-            </Button>
+            <>
+              <Link to="/exco/messages" className="flex items-center gap-3 rounded-2xl bg-gold-bg p-4 text-gold-text">
+                <Icon name="bell" />
+                <span className="flex-1">
+                  <span className="block font-bold">Send a message</span>
+                  <span className="block text-xs opacity-80">Good morning, job alerts, dues reminders… to everyone or a chosen group</span>
+                </span>
+                →
+              </Link>
+              <Link to="/exco/give-number" className="flex items-center gap-3 rounded-2xl bg-green-light p-4 text-green">
+                <Icon name="users" />
+                <span className="flex-1">
+                  <span className="block font-bold">Give a number</span>
+                  <span className="block text-xs opacity-80">For a registered member whose phone is off. The door code changes after.</span>
+                </span>
+                →
+              </Link>
+              <Button variant="ghost" loading={busy === 'notification'} onClick={testNotification}>
+                Send a test notification
+              </Button>
+            </>
           ) : (
-            <p className="text-sm font-semibold text-muted">Only the main exco can send the group test notification.</p>
+            <p className="text-sm font-semibold text-muted">Only the main exco can send messages and give numbers by hand.</p>
           )}
         </div>
 
@@ -8213,6 +10712,10 @@ function DuesCard({ dues, hasAccount }: { dues: DuesItem; hasAccount: boolean })
   const [error, setError] = useState('');
   const paid = status?.status === 'paid';
   const cashPending = status?.status === 'cash_pending';
+  const disputed = status?.status === 'disputed';
+  const collection = dues.dueDate
+    ? new Date(`${dues.dueDate}T12:00:00`).toLocaleDateString('en-NG', { weekday: 'long', day: 'numeric', month: 'short' })
+    : null;
 
   async function pay() {
     setError('');
@@ -8231,7 +10734,7 @@ function DuesCard({ dues, hasAccount }: { dues: DuesItem; hasAccount: boolean })
     setBusy(confirm ? 'yes' : 'no');
     try {
       await api.respondCash({ duesId: dues.id, confirm });
-      toast(confirm ? 'Cash payment confirmed' : 'Reported to your excos', confirm ? 'success' : 'info');
+      toast(confirm ? 'Cash payment confirmed' : 'Reported to your main exco', confirm ? 'success' : 'info');
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -8244,10 +10747,9 @@ function DuesCard({ dues, hasAccount }: { dues: DuesItem; hasAccount: boolean })
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="text-lg font-extrabold">{dues.title}</p>
-          {dues.dueDate && (
-            <p className="text-sm text-muted">
-              Due {new Date(`${dues.dueDate}T12:00:00`).toLocaleDateString('en-NG', { day: 'numeric', month: 'short' })}
-            </p>
+          {collection && <p className="text-sm text-muted">Collection on {collection}</p>}
+          {dues.requiredForCheckIn && !paid && (
+            <p className="mt-1 inline-flex rounded-full bg-bad-bg px-2.5 py-1 text-xs font-bold text-bad">Pay before you can get a number</p>
           )}
         </div>
         <p className="text-2xl font-extrabold text-green">{naira(dues.amountKobo)}</p>
@@ -8261,10 +10763,29 @@ function DuesCard({ dues, hasAccount }: { dues: DuesItem; hasAccount: boolean })
           <div>
             <p className="font-extrabold">Paid</p>
             <p className="text-xs">
-              {status.method === 'cash' ? 'Cash, confirmed by you' : 'Online'} ·{' '}
-              {status.paidAt?.toDate().toLocaleDateString('en-NG', { day: 'numeric', month: 'short' })}
+              {status.method === 'cash' ? `Cash, recorded by ${status.recordedByName ?? 'an exco'}` : 'Online'} ·{' '}
+              {(status.paidAt ?? status.recordedAt)?.toDate().toLocaleString('en-NG', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })}
             </p>
           </div>
+          {status.method === 'cash' && (
+            <button
+              disabled={busy === 'no'}
+              onClick={() =>
+                confirm(`Report that you did NOT pay this ${naira(status.amountKobo)} cash? Your main exco will be told.`) && respond(false)
+              }
+              className="ml-auto rounded-xl px-2 py-1 text-xs font-bold text-bad underline disabled:opacity-50"
+            >
+              This is wrong
+            </button>
+          )}
+        </div>
+      ) : disputed ? (
+        <div className="rounded-2xl bg-bad-bg p-4 text-sm text-bad">
+          <p className="font-bold">You reported a cash record as wrong.</p>
+          <p>Your main exco has been told and will sort it out. Until then this counts as not paid.</p>
+          <Button className="mt-3" loading={busy === 'pay'} disabled={!hasAccount} onClick={pay}>
+            <Icon name="card" /> Pay {naira(duesCharges(dues.amountKobo).totalKobo)} online
+          </Button>
         </div>
       ) : cashPending ? (
         <div className="space-y-3 rounded-2xl bg-warn-bg p-4 text-warn">
@@ -8401,7 +10922,7 @@ export default function Home() {
 
   return (
     <>
-      <header className="grid-bg relative bg-green-dark px-5 pb-20 pt-[max(1.5rem,env(safe-area-inset-top))] text-white lg:rounded-[28px] lg:px-8 lg:pt-8">
+      <header className="hero-green relative px-5 pb-20 pt-[max(1.5rem,env(safe-area-inset-top))] text-white lg:rounded-[28px] lg:px-8 lg:pt-8">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <img src="/icon.svg" alt="" className="h-9 w-9 rounded-xl" />
@@ -8414,22 +10935,26 @@ export default function Home() {
           )}
         </div>
         <div className="mt-6 flex items-center gap-3">
-          <Avatar src={me.photoURL} name={me.fullName} size={52} ring />
+          <Avatar src={me.photoURL} name={me.fullName} size={56} ring />
           <div className="min-w-0">
             <p className="text-sm text-green-mid">{greeting()},</p>
-            <p className="truncate text-xl font-extrabold">{me.fullName.split(' ')[0]}</p>
-            <p className="text-xs font-semibold text-green-mid">
-              {me.stateCode} · {group?.name ?? '…'}
-            </p>
+            <h1 className="truncate text-2xl font-extrabold leading-tight">{me.fullName.split(' ')[0]}</h1>
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              <span className="rounded-full bg-white/15 px-2.5 py-1 text-[11px] font-bold">{me.stateCode}</span>
+              <span className="max-w-[160px] truncate rounded-full bg-white/15 px-2.5 py-1 text-[11px] font-bold">{group?.name ?? '…'}</span>
+            </div>
           </div>
         </div>
       </header>
 
       <Page className="relative z-10 -mt-14 space-y-4 lg:!px-6">
-        <motion.div className="card flex flex-col items-center gap-3 text-center">
+        {!att && <motion.div initial={{ y: 16, opacity: 0 }} animate={{ y: 0, opacity: 1 }} className={`card flex flex-col items-center gap-3 text-center ${open ? '' : 'border-2 border-gold/60'}`}>
+          <span className={`grid h-14 w-14 place-items-center rounded-2xl ${open ? 'bg-green text-white' : 'bg-gold-bg text-gold-text'}`}>
+            <Icon name={open ? 'scan' : 'bell'} size={26} />
+          </span>
           {!open && !att && (
             <>
-              <Pill tone="muted">No meeting open</Pill>
+              <Pill tone="gold">No meeting open</Pill>
               <p className="text-lg font-extrabold">Today's CDS hasn't started</p>
               <p className="text-sm text-muted">When an exco opens the meeting, scan the code at the door to get your number.</p>
             </>
@@ -8441,7 +10966,7 @@ export default function Home() {
               <p className="text-lg font-extrabold">You're not checked in yet</p>
               <Link
                 to="/scan"
-                className="flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-green font-bold text-white shadow-[0_8px_0_#064726] active:translate-y-[5px] active:shadow-[0_3px_0_#064726]"
+                className="flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-gold font-bold text-[#3d2e00] shadow-[0_8px_0_#B39B5A] active:translate-y-[5px] active:shadow-[0_3px_0_#B39B5A]"
               >
                 <Icon name="scan" /> Scan in at the door
               </Link>
@@ -8449,67 +10974,115 @@ export default function Home() {
             </>
           )}
 
-          {att && (
-            <>
-              <Pill tone={session?.status === 'closed' ? 'muted' : status === 'turn' ? 'green' : status === 'done' ? 'green' : 'warn'}>
+        </motion.div>}
+
+        {!att && (
+          <div className="grid grid-cols-2 gap-3">
+            <motion.div initial={{ y: 16, opacity: 0 }} animate={{ y: 0, opacity: 1 }} transition={{ delay: 0.08 }} className="rounded-3xl bg-green-light p-4">
+              <span className="grid h-9 w-9 place-items-center rounded-xl bg-card text-green shadow-card">
+                <Icon name="door" size={18} />
+              </span>
+              <p className="mt-3 text-xs font-semibold text-green">Today's meeting</p>
+              <p className="font-display text-xl font-extrabold text-green">{open ? 'Open now' : session?.status === 'closed' ? 'Ended' : 'Not open'}</p>
+            </motion.div>
+            <motion.div initial={{ y: 16, opacity: 0 }} animate={{ y: 0, opacity: 1 }} transition={{ delay: 0.16 }}>
+              <Link to="/dues" className="block h-full rounded-3xl bg-gold-bg p-4">
+                <span className="grid h-9 w-9 place-items-center rounded-xl bg-card text-gold-text shadow-card">
+                  <Icon name="card" size={18} />
+                </span>
+                <p className="mt-3 text-xs font-semibold text-gold-text">Dues</p>
+                <p className="font-display text-xl font-extrabold text-gold-text">Check & pay →</p>
+              </Link>
+            </motion.div>
+          </div>
+        )}
+
+        {att && (
+          <>
+            <motion.div
+              initial={{ y: 16, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              className={`number-card relative overflow-hidden rounded-[30px] p-6 text-white ${status === 'turn' && session?.status !== 'closed' ? 'turn-glow' : ''}`}
+            >
+              <span className="pointer-events-none absolute -right-16 -top-16 h-56 w-56 rounded-full border-[28px] border-white/[0.07]" />
+              <span
+                className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-bold ${
+                  session?.status === 'closed' ? 'bg-white/15 text-white' : status === 'turn' ? 'bg-gold text-[#3d2e00]' : 'bg-white/15 text-white'
+                }`}
+              >
+                <span className={`h-2 w-2 rounded-full ${status === 'turn' && session?.status !== 'closed' ? 'bg-[#3d2e00]' : 'bg-white'}`} />
                 {session?.status === 'closed'
                   ? 'Meeting ended'
                   : status === 'turn'
-                    ? "It's your turn"
+                    ? "It's your turn!"
                     : status === 'done'
                       ? 'Thumbprinted ✓'
                       : 'Checked in'}
-              </Pill>
-              <span className="text-xs font-bold tracking-[0.3em] text-muted">YOUR NUMBER</span>
-              <motion.span
+              </span>
+              <p className="mt-4 text-xs font-bold tracking-[0.25em] text-green-mid">YOUR NUMBER</p>
+              <motion.p
                 key={tag}
                 initial={{ scale: 0.6, opacity: 0 }}
                 animate={{ scale: 1, opacity: 1 }}
-                className="text-[88px] font-extrabold leading-none text-green"
-                style={{ textShadow: '0 3px 0 rgb(var(--line)), 0 6px 0 rgb(var(--green-light))' }}
+                transition={{ type: 'spring', stiffness: 220, damping: 16 }}
+                className="font-display text-[92px] font-extrabold leading-[0.95]"
+                style={{ textShadow: '0 5px 0 rgba(0,0,0,.14)' }}
               >
                 {tag}
-              </motion.span>
-              <div className="grid w-full grid-cols-2 gap-2">
-                <div className="rounded-2xl bg-paper p-3 text-left">
-                  <p className="text-xs text-muted">Now calling</p>
-                  <p className="font-extrabold">{batchLabel(session?.batch)}</p>
-                </div>
-                <div className="rounded-2xl bg-paper p-3 text-left">
-                  <p className="text-xs text-muted">Ahead of you</p>
-                  <p className="font-extrabold">{status === 'waiting' ? `${aheadOf(att, session?.batch)} people` : '—'}</p>
-                </div>
-              </div>
-              <Link to="/tag" className="mt-1 text-sm font-bold text-green">
-                Open my tag →
-              </Link>
-            </>
-          )}
-        </motion.div>
+              </motion.p>
+            </motion.div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <motion.div initial={{ y: 16, opacity: 0 }} animate={{ y: 0, opacity: 1 }} transition={{ delay: 0.08 }} className="rounded-3xl bg-green-light p-4">
+                <span className="grid h-9 w-9 place-items-center rounded-xl bg-card text-green shadow-card">
+                  <Icon name="megaphone" size={18} />
+                </span>
+                <p className="mt-3 text-xs font-semibold text-green">Now calling</p>
+                <motion.p key={batchLabel(session?.batch)} initial={{ rotateX: 90 }} animate={{ rotateX: 0 }} className="font-display text-2xl font-extrabold text-green">
+                  {batchLabel(session?.batch)}
+                </motion.p>
+              </motion.div>
+              <motion.div initial={{ y: 16, opacity: 0 }} animate={{ y: 0, opacity: 1 }} transition={{ delay: 0.16 }} className="rounded-3xl bg-gold-bg p-4">
+                <span className="grid h-9 w-9 place-items-center rounded-xl bg-card text-gold-text shadow-card">
+                  <Icon name="users" size={18} />
+                </span>
+                <p className="mt-3 text-xs font-semibold text-gold-text">Ahead of you</p>
+                <p className="font-display text-2xl font-extrabold text-gold-text">
+                  {status === 'waiting' ? `${aheadOf(att, session?.batch)} people` : '—'}
+                </p>
+              </motion.div>
+            </div>
+
+            <Link to="/tag" className="card flex items-center justify-between !py-4">
+              <span className="font-display font-bold">Open my tag</span>
+              <span className="grid h-10 w-10 place-items-center rounded-xl bg-green text-white">→</span>
+            </Link>
+          </>
+        )}
 
         {status === 'turn' && (
           <motion.div
             initial={{ y: 20, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
-            className="flex items-center gap-3 rounded-3xl bg-green p-4 text-white shadow-lift"
+            className="flex items-center gap-3 rounded-3xl border-2 border-gold bg-gold-bg p-4 text-gold-text"
           >
             <Icon name="finger" size={30} />
             <div>
               <p className="font-extrabold">Go to the thumbprint table now</p>
-              <p className="text-sm text-green-mid">Show your tag and your NYSC ID card.</p>
+              <p className="text-sm opacity-80">Show your tag and your NYSC ID card.</p>
             </div>
           </motion.div>
         )}
 
         <div className="card space-y-3">
-          <p className="font-bold">How it works</p>
+          <h3 className="font-bold">How it works</h3>
           {[
             ['scan', 'Scan the code at the door to get your number.'],
             ['bell', 'Sit down. Your phone buzzes when your batch is called.'],
             ['finger', 'Show your tag at the table, then thumbprint.'],
-          ].map(([icon, text]) => (
+          ].map(([icon, text], i) => (
             <div key={text} className="flex items-center gap-3 text-sm">
-              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-green-light text-green">
+              <span className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl ${i === 2 ? 'bg-gold-bg text-gold-text' : 'bg-green-light text-green'}`}>
                 <Icon name={icon} size={20} />
               </span>
               {text}
@@ -8809,6 +11382,8 @@ export default function ScanIn() {
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  /** Set when the server refuses because dues are not paid: shows the red "pay first" screen. */
+  const [unpaid, setUnpaid] = useState('');
 
   async function send(c: string, gid?: string) {
     if (busy) return;
@@ -8836,6 +11411,9 @@ export default function ScanIn() {
         savePending({ ...payload, scannedAt });
         toast('Scan saved', 'info', "We'll send it when your connection is back.");
         nav('/home');
+      } else if (/^Dues not paid/i.test(msg)) {
+        navigator.vibrate?.([200, 100, 200]);
+        setUnpaid(msg.replace(/^Dues not paid:\s*/i, ''));
       } else {
         setError(msg);
       }
@@ -8848,6 +11426,38 @@ export default function ScanIn() {
     const q = parseQR(text);
     if (q?.type === 'door') void send(q.code, q.gid);
     else setError('That is not a CDS Pass door code. Scan the code on the exco’s screen.');
+  }
+
+  if (unpaid) {
+    return (
+      <>
+        <TopBar title="Scan in" back="/home" />
+        <Page className="space-y-4">
+          <motion.div
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="rounded-[30px] bg-bad p-6 text-center text-white shadow-lift"
+          >
+            <span className="mx-auto grid h-16 w-16 place-items-center rounded-2xl bg-white/15">
+              <Icon name="card" size={32} />
+            </span>
+            <p className="mt-4 font-display text-2xl font-extrabold">Please pay your dues</p>
+            <p className="mt-2 text-sm text-white/90">{unpaid}</p>
+            <p className="mt-3 text-xs font-semibold text-white/80">No number has been given yet.</p>
+          </motion.div>
+          <Button variant="gold" onClick={() => nav('/dues')}>
+            <Icon name="card" /> Pay online now
+          </Button>
+          <div className="card text-sm">
+            <p className="font-bold">Paying cash?</p>
+            <p className="text-muted">Give the cash to an exco. Once they tap “Paid (cash)” on your name, scan the door code again.</p>
+          </div>
+          <Button variant="outline" onClick={() => setUnpaid('')}>
+            I've paid, scan again
+          </Button>
+        </Page>
+      </>
+    );
   }
 
   if (att) {
@@ -8953,11 +11563,14 @@ export default {
         muted: v('muted'),
         line: v('line'),
         khaki: '#C9B783',
+        // Soft gold accent: small touches only (badges, one tile, avatar ring).
+        gold: { DEFAULT: '#D9C58A', bg: v('gold-bg'), text: v('gold-text') },
         warn: { DEFAULT: v('warn'), bg: v('warn-bg') },
         bad: { DEFAULT: '#B42318', bg: v('bad-bg') },
       },
       fontFamily: {
         sans: ['"Plus Jakarta Sans"', 'system-ui', 'sans-serif'],
+        display: ['Poppins', '"Plus Jakarta Sans"', 'system-ui', 'sans-serif'],
       },
       boxShadow: {
         card: '0 10px 30px rgb(var(--shadow) / 0.12)',
@@ -9013,10 +11626,11 @@ export default defineConfig({
     chunkSizeWarningLimit: 1200,
     rollupOptions: {
       output: {
-        // 3D libraries load only on screens that use them.
-        manualChunks: {
-          three: ['three', '@react-three/fiber', '@react-three/drei'],
-          firebase: ['firebase/app', 'firebase/auth', 'firebase/firestore', 'firebase/storage'],
+        // Keep Firebase in its own cached file. Do NOT list the 3D libraries here: naming them as a
+        // manual chunk made every phone download ~960 KB of 3D code before the app could start.
+        // Left alone, they stay inside the lazily loaded Hero3D file and only load on the welcome screen.
+        manualChunks(id) {
+          if (id.includes('/node_modules/firebase/') || id.includes('/node_modules/@firebase/')) return 'firebase';
         },
       },
     },
