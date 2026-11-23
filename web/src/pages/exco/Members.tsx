@@ -6,6 +6,8 @@ import { ExcoHeader } from '../../components/ExcoHeader';
 import { MemberCard } from '../../components/MemberCard';
 import { QRScan } from '../../components/QRScan';
 import { Button, ErrorBox, Icon, Page, Pill, Select } from '../../components/ui';
+import { dateTime, downloadSheet } from '../../lib/exportSheet';
+import { whatsappLink } from '../../lib/whatsapp';
 import { useMe } from '../../hooks/useAuth';
 import { useGroup, useGroupMembers } from '../../hooks/useLive';
 import { api } from '../../lib/api';
@@ -198,6 +200,30 @@ export default function Members() {
                 <button onClick={() => setScanning(true)} aria-label="Scan member code" className="grid h-14 w-14 place-items-center rounded-2xl bg-green text-white">
                   <Icon name="scan" />
                 </button>
+                <button
+                  aria-label="Download this list for Excel"
+                  disabled={!list.length}
+                  onClick={() => {
+                    downloadSheet(
+                      `members-${filter}-${new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Lagos' })}`,
+                      ['Full name', 'State code', 'Batch', 'Phone', 'Role', 'Status', 'Has photo', 'Joined'],
+                      list.map((m) => [
+                        m.fullName,
+                        m.stateCode,
+                        m.stateCode.split('/')[1] ?? '',
+                        m.phone,
+                        m.role === 'exco' ? 'Exco' : 'Member',
+                        m.status,
+                        m.photoURL ? 'Yes' : 'No',
+                        dateTime((m as unknown as { createdAt?: { toDate: () => Date } }).createdAt),
+                      ]),
+                    );
+                    toast(`${list.length} ${list.length === 1 ? 'person' : 'people'} downloaded`, 'success', 'Open it in Excel or Google Sheets.');
+                  }}
+                  className="grid h-14 w-14 place-items-center rounded-2xl bg-green-light text-lg font-extrabold text-green disabled:opacity-40"
+                >
+                  ⬇
+                </button>
               </div>
 
               {/* Batch chips (26A, 26B, 26C …), no-photo filter and sort */}
@@ -261,8 +287,8 @@ export default function Members() {
               ) : (
                 <ul className="card divide-y divide-line !p-0">
                   {list.map((m) => (
-                    <li key={m.uid}>
-                      <button onClick={() => setSelected(m)} className="flex w-full items-center gap-3 px-4 py-3 text-left">
+                    <li key={m.uid} className="flex items-center">
+                      <button onClick={() => setSelected(m)} className="flex min-w-0 flex-1 items-center gap-3 px-4 py-3 text-left">
                         <Avatar src={m.photoURL} name={m.fullName} size={44} />
                         <div className="min-w-0 flex-1">
                           <p className="truncate font-bold">{m.fullName}</p>
@@ -274,6 +300,28 @@ export default function Members() {
                         {m.role === 'exco' && <Pill>Exco</Pill>}
                         {m.status === 'pending' && <Pill tone="warn">Pending</Pill>}
                       </button>
+                      {(() => {
+                        const wa = m.uid === me.uid ? null : whatsappLink(
+                          m.phone,
+                          `Hello ${m.fullName.split(' ')[0]}, this is ${me.fullName.split(' ')[0]} from ${group?.name ?? 'our CDS'} (CDS Pass). I would like to ask you a few questions.`,
+                        );
+                        return wa ? (
+                          <a
+                            href={wa}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            aria-label={`Message ${m.fullName} on WhatsApp`}
+                            title="Message on WhatsApp"
+                            className="mr-3 grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-[#25D366]/15 text-[#128C4A] transition active:scale-90 dark:text-[#25D366]"
+                          >
+                            {/* chat bubble with phone */}
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                              <path d="M3 21l1.65-4.95A8.5 8.5 0 1 1 8 19.6L3 21z" />
+                              <path d="M9.5 9.2c.3 1.6 1.7 3.2 3.3 3.9l.9-.9a.6.6 0 0 1 .7-.1l1.3.6a.6.6 0 0 1 .3.7c-.3 1-1.2 1.5-2.2 1.3-2.6-.5-4.8-2.7-5.2-5.3-.2-1 .4-1.9 1.3-2.2a.6.6 0 0 1 .7.3l.6 1.3a.6.6 0 0 1-.1.7l-.9.9z" fill="currentColor" stroke="none" />
+                            </svg>
+                          </a>
+                        ) : null;
+                      })()}
                     </li>
                   ))}
                 </ul>

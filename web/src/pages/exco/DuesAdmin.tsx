@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Avatar } from '../../components/Avatar';
 import { ExcoHeader } from '../../components/ExcoHeader';
 import { Button, Checkbox, ErrorBox, Field, Icon, Page, Pill, Select, Stat } from '../../components/ui';
+import { dateTime, downloadSheet, slug } from '../../lib/exportSheet';
 import { useMe } from '../../hooks/useAuth';
 import { useActiveDues, useDuesStatuses, useGroup, useGroupMembers } from '../../hooks/useLive';
 import { api } from '../../lib/api';
@@ -226,12 +227,35 @@ function DuesDetail({ dues }: { dues: Dues }) {
           </p>
           {dues.requiredForCheckIn && <Pill tone="gold">Pay before getting a number</Pill>}
         </div>
-        <button
-          onClick={() => confirm(`Close "${dues.title}"? Members won't be able to pay it any more.`) && run('close', () => api.closeDues({ duesId: dues.id }), 'Dues closed')}
-          className="rounded-xl px-3 py-2 text-sm font-bold text-muted"
-        >
-          Close
-        </button>
+        <div className="flex shrink-0 gap-1">
+          <button
+            onClick={() => {
+              downloadSheet(
+                `dues-${slug(dues.title)}`,
+                ['Full name', 'State code', 'Status', 'How', 'Amount', 'Recorded by', 'When'],
+                rows.map(({ m, s }) => [
+                  m.fullName,
+                  m.stateCode,
+                  s?.status === 'paid' ? 'Paid' : s?.status === 'disputed' ? 'Disputed' : s?.status === 'cash_pending' ? 'Awaiting member' : 'Not paid',
+                  s ? (s.method === 'cash' ? 'Cash' : 'Online') : '',
+                  s ? naira(s.amountKobo) : '',
+                  s?.recordedByName ?? '',
+                  dateTime(s?.paidAt ?? s?.recordedAt),
+                ]),
+              );
+              toast('Dues list downloaded', 'success', 'Open it in Excel or Google Sheets.');
+            }}
+            className="rounded-xl bg-green-light px-3 py-2 text-sm font-bold text-green"
+          >
+            ⬇ Excel
+          </button>
+          <button
+            onClick={() => confirm(`Close "${dues.title}"? Members won't be able to pay it any more.`) && run('close', () => api.closeDues({ duesId: dues.id }), 'Dues closed')}
+            className="rounded-xl px-3 py-2 text-sm font-bold text-muted"
+          >
+            Close
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-3 gap-2">

@@ -1,11 +1,12 @@
-import { doc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { motion } from 'framer-motion';
 import { useState } from 'react';
 import { Avatar } from '../components/Avatar';
 import { PhotoPicker } from '../components/PhotoPicker';
+import { MyGroups } from '../components/MyGroups';
 import { Button, ErrorBox } from '../components/ui';
 import { useAuth } from '../hooks/useAuth';
-import { db, errorText } from '../lib/firebase';
+import { api } from '../lib/api';
+import { errorText } from '../lib/firebase';
 import { toast } from '../lib/toast';
 import { uploadAvatar } from '../lib/upload';
 
@@ -21,7 +22,7 @@ function AddPhoto({ uid }: { uid: string }) {
     setError('');
     try {
       const photoURL = await uploadAvatar(uid, photo);
-      await updateDoc(doc(db, 'users', uid), { photoURL, updatedAt: serverTimestamp() });
+      await api.updateMyProfile({ photoURL });
       toast('Photo saved', 'success', 'The exco can now review your account.');
     } catch (e) {
       setError(errorText(e));
@@ -133,6 +134,10 @@ export default function Pending() {
             </>
           )}
         </motion.div>
+
+        <div className="mt-6 w-full text-left text-ink">
+          <MyGroups onlyIfSeveral />
+        </div>
 
         <div className="mt-auto w-full pt-8">
           <Button variant="light" onClick={logout}>

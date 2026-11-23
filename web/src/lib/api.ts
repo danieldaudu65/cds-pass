@@ -64,7 +64,13 @@ export const api = {
     { title: string; body: string; audience: 'everyone' | 'excos'; gids: string[]; link: string },
     { ok: true; recipients: number; delivered: number }
   >('adminBroadcast'),
+  adminGroupMembers: callable<{ gid: string }, { members: AdminMemberRow[] }>('adminGroupMembers'),
   adminSetTeamMember: callable<{ stateCode: string; role: 'admin' | 'viewer' | null }, { ok: true }>('adminSetTeamMember'),
+  joinAnotherGroup: callable<{ joinCode: string }, { ok: true; gid: string; groupName: string; status: string; role: string }>('joinAnotherGroup'),
+  switchGroup: callable<{ gid: string }, { ok: true; gid: string; groupName: string; role: string; status: string }>('switchGroup'),
+  leaveGroup: callable<{ gid: string }, { ok: true }>('leaveGroup'),
+  updateMyProfile: callable<{ phone?: string; photoURL?: string }, { ok: true }>('updateMyProfile'),
+  groupStats: callable<{ refresh?: boolean }, GroupStats>('groupStats'),
   testNotification: callable<Record<string, never>, { sent: number; registered: number; members: number }>('testNotification'),
   tableCheck: callable<Who, TableCheckResponse>('tableCheck'),
   markDone: callable<Who, { ok: true }>('markDone'),
@@ -96,6 +102,8 @@ export interface AdminGroupRow {
   pending: number;
   excos: number;
   noPhoto: number;
+  alertsOn: number;
+  lastDone: number;
   lastMeeting: string | null;
   lastCheckins: number;
   onlineKobo: number;
@@ -106,8 +114,34 @@ export interface AdminGroupRow {
 
 export interface AdminOverview {
   generatedAt: number;
-  totals: { groups: number; activeGroups: number; members: number; pending: number; onlineKobo: number; cashKobo: number; earnedKobo: number; checkins30: number };
-  series: { days: string[]; signups: number[]; checkins: number[]; paidKobo: number[]; earnedKobo: number[] };
+  totals: {
+    groups: number;
+    activeGroups: number;
+    members: number;
+    pending: number;
+    onlineKobo: number;
+    cashKobo: number;
+    earnedKobo: number;
+    checkins30: number;
+    alertsOn: number;
+    noPhoto: number;
+    abandonedPayments: number;
+  };
+  series: {
+    days: string[];
+    signups: number[];
+    approvals: number[];
+    checkins: number[];
+    paidKobo: number[];
+    earnedKobo: number[];
+    pushPeople: number[];
+    pushDelivered: number[];
+    pushFailed: number[];
+  };
+  pushKinds: Record<string, number>;
+  arrivalHours: number[];
+  batchSplit: Record<string, number>;
+  openDues: { group: string; title: string; paid: number; members: number }[];
   groups: AdminGroupRow[];
 }
 
@@ -119,4 +153,31 @@ export interface AdminConfig {
   banner: string | null;
   team: { stateCode: string; role: 'admin' | 'viewer' }[];
   owner: string | null;
+}
+
+export interface GroupStats {
+  generatedAt: number;
+  totals: { members: number; pending: number; excos: number; alertsOn: number; noPhoto: number; onlineKobo: number; cashKobo: number };
+  days: string[];
+  joins: number[];
+  approvals: number[];
+  paidKobo: number[];
+  meetings: { date: string; checkedIn: number; done: number }[];
+  arrivalHours: number[];
+  batchSplit: Record<string, number>;
+  openDues: { title: string; paid: number; members: number; dueDate: string | null }[];
+}
+
+export interface AdminMemberRow {
+  uid: string;
+  fullName: string;
+  stateCode: string;
+  phone: string;
+  photoURL: string | null;
+  role: string;
+  status: string;
+  alertsOn: boolean;
+  otherGroups: number;
+  joinedAt: number | null;
+  approvedAt: number | null;
 }

@@ -29,6 +29,8 @@ Some later sections were written before these changes; where they disagree, **th
 | Dues gate (20 Nov) | Dues have `dueDate` (collection date) and `requiredForCheckIn`. `assertDuesPaid` inside `admit()` blocks check-in from that date until paid; error text starts "Dues not paid" (ScanIn shows a red pay screen). `recordCash` now counts immediately (status paid); member can dispute via `respondCash({confirm:false})` → status `disputed`, main exco notified. Automatic reminders: `GET /cron/reminders?key=CRON_SECRET` (cron-job.org 07:00 + 18:00 Lagos) → `runDuesReminders()`, once per dues per slot (`remindersSent`). |
 | Main exco tools (20 Nov) | `giveNextNumber` (search member, give next number; increments `session.doorEpoch`, door screen refetches; door code HMAC includes epoch). Typed state code at the door = main exco only; printed card = any exco. `sendGroupMessage` / `listGroupMessages`: custom push to all / unpaid / pending / excos, max 5 per day per group, history in `groups/{gid}/messages`. Pages: `exco/GiveNumber.tsx`, `exco/Messages.tsx`. |
 | Admin mode (20 Nov) | Owner = `PLATFORM_ADMIN_STATE_CODE`; team in server-only doc `platform/config.team` {stateCode: 'admin'|'viewer'}. Flags in `platform/config`: signupsPaused, paymentsPaused, maintenance (main.ts `maintenanceGate` returns 503 for non-team), banner. Group pause = `groups.paused` (blocks check-in, meetings, payments). APIs: appStatus (public), adminWhoAmI, adminOverview (5-min cache; users + payments + count() of attendees for last 30 days), adminGetConfig, adminSetConfig, adminSetGroupPaused, adminBroadcast, adminSetTeamMember (owner). Web: `pages/admin/Admin.tsx` (lazy, route /admin), `pages/admin/Charts.tsx` (SVG charts, no library), `components/PlatformChrome.tsx` (gold mode switch User/Exco/Admin, banner, maintenance screen), `hooks/usePlatform.ts`. |
+| Several CDS per member (22 Nov) | `memberships/{gid}_{uid}` is the source of truth (rules: own or exco of that gid). `users/{uid}` = profile + ACTIVE group (groupId/role/status); claims match the active group. Server helpers: `getMembership` (auto-creates for old accounts), `groupMembers`, `updateMembership` (updates users+claims only if that group is active), `migrateMemberships` (runs once at boot, flag `platform/migrations.membershipsV1`). New APIs: joinAnotherGroup, switchGroup, leaveGroup, updateMyProfile (phone/photo to profile + all memberships; the app no longer writes users docs directly). Web: `components/MyGroups.tsx` (Profile + Under review), `useGroupMembers`/`usePendingMembers`/`useMyMemberships` read memberships. |
+| Exports & stats (22 Nov) | `lib/exportSheet.ts` CSV (BOM) downloads: Dashboard register, Members, Dues detail. Attendees now store `doneByName`. notify() writes daily push counters to `platformStats/{date}`; adminOverview adds alerts-on, pushes per day/kind, arrival hours, approvals per day, batch split, open dues % paid, abandoned payments, thumbprinted at last meeting. |
 | Deploy rules | `firebase deploy --only firestore:rules` (firebase.json has no hosting/storage any more). |
 
 ---
@@ -381,6 +383,7 @@ Files in this section:
 - `web/src/components/Hero3D.tsx`
 - `web/src/components/InstallGate.tsx`
 - `web/src/components/MemberCard.tsx`
+- `web/src/components/MyGroups.tsx`
 - `web/src/components/PhotoPicker.tsx`
 - `web/src/components/PlatformChrome.tsx`
 - `web/src/components/QRScan.tsx`
@@ -398,6 +401,7 @@ Files in this section:
 - `web/src/lib/api.ts`
 - `web/src/lib/appConfig.ts`
 - `web/src/lib/device.ts`
+- `web/src/lib/exportSheet.ts`
 - `web/src/lib/firebase.ts`
 - `web/src/lib/image.ts`
 - `web/src/lib/install.ts`
@@ -544,7 +548,7 @@ rules_version = '2';
 
 // CDS Pass security rules.
 // Everything that matters (numbers, turns, approvals, check-ins) is written
-// ONLY by Cloud Functions. Phones can read what they are allowed to see,
+// ONLY by the API server (Render). Phones can read what they are allowed to see,
 // and can only change their own phone number, photo and notification tokens.
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -575,6 +579,23 @@ service cloud.firestore {
              .hasOnly(['phone', 'photoURL', 'fcmTokens', 'updatedAt']);
 
       allow create, delete: if false;
+    }
+
+    // Who is in which CDS group (people can be in several, e.g. their CDS + General CDS).
+    // You can see your own memberships; excos can see the members of their current group.
+    // Only the API server writes.
+    match /memberships/{id} {
+      allow read: if signedIn()
+        && (resource.data.uid == request.auth.uid || isExco(resource.data.gid));
+      allow write: if false;
+    }
+
+    // Platform settings and stats: server only.
+    match /platform/{doc=**} {
+      allow read, write: if false;
+    }
+    match /platformStats/{doc} {
+      allow read, write: if false;
     }
 
     // Main-exco state-code reservations are written and consumed only by the API server.
@@ -1010,6 +1031,87 @@ function signedIn(req: CallableRequest): { uid: string; claims: Claims } {
   return { uid: req.auth.uid, claims: req.auth.token as Claims };
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * MULTIPLE CDS GROUPS
+ * memberships/{gid}_{uid} is the source of truth for "who is in which CDS, with which role/status".
+ * users/{uid} holds the person's profile plus their ACTIVE group (groupId/role/status), and the login
+ * claims {gid, role, approved} always match the active group. Switching CDS = switchGroup().
+ * Older accounts get their membership created automatically (getMembership / migrateMemberships).
+ * ------------------------------------------------------------------------------------------- */
+
+const membershipRef = (gid: string, uid: string) => db.doc(`memberships/${gid}_${uid}`);
+
+function membershipData(gid: string, uid: string, u: FirebaseFirestore.DocumentData, groupName: string, extra: Record<string, unknown> = {}) {
+  return {
+    gid,
+    uid,
+    groupName,
+    fullName: u.fullName,
+    stateCode: u.stateCode,
+    phone: u.phone ?? null,
+    photoURL: u.photoURL ?? null,
+    role: u.role ?? 'member',
+    status: u.status ?? 'pending',
+    createdAt: u.createdAt ?? FieldValue.serverTimestamp(),
+    ...(u.approvedAt ? { approvedAt: u.approvedAt, approvedBy: u.approvedBy ?? null } : {}),
+    ...extra,
+  };
+}
+
+/** A person's membership in a group (created on the fly for accounts from before multiple CDS). */
+async function getMembership(gid: string, uid: string): Promise<FirebaseFirestore.DocumentData | null> {
+  const m = await membershipRef(gid, uid).get();
+  if (m.exists) return m.data()!;
+  const u = (await userRef(uid).get()).data();
+  if (!u || u.groupId !== gid) return null;
+  const g = (await groupRef(gid).get()).data();
+  const data = membershipData(gid, uid, u, (g?.name as string) ?? '');
+  await membershipRef(gid, uid).set(data);
+  return data;
+}
+
+/** Everyone in a group (any status). */
+async function groupMembers(gid: string) {
+  const snap = await db.collection('memberships').where('gid', '==', gid).get();
+  return snap.docs.map((d) => d.data() as FirebaseFirestore.DocumentData & { uid: string });
+}
+
+/**
+ * Change someone's role/status in one group. If that group is the one they are currently using,
+ * their profile and login permissions are updated too.
+ */
+async function updateMembership(gid: string, uid: string, patch: Record<string, unknown>) {
+  await membershipRef(gid, uid).set(patch, { merge: true });
+  const u = (await userRef(uid).get()).data();
+  if (u?.groupId === gid) {
+    await userRef(uid).update(patch);
+    const m = (await membershipRef(gid, uid).get()).data()!;
+    await auth.setCustomUserClaims(uid, { gid, role: m.role, approved: m.status === 'approved' });
+  }
+}
+
+/** One-time: create memberships for every account made before multiple CDS. Runs at server start. */
+export async function migrateMemberships() {
+  const flag = db.doc('platform/migrations');
+  if ((await flag.get()).data()?.membershipsV1) return;
+  const [users, groups] = await Promise.all([db.collection('users').get(), db.collection('groups').get()]);
+  const names = new Map<string, string>(groups.docs.map((g): [string, string] => [g.id, String(g.data().name ?? '')]));
+  let batch = db.batch();
+  let n = 0;
+  for (const u of users.docs) {
+    const d = u.data();
+    if (!d.groupId) continue;
+    batch.set(membershipRef(d.groupId, u.id), membershipData(d.groupId, u.id, d, names.get(d.groupId) ?? ''), { merge: true });
+    if (++n % 400 === 0) {
+      await batch.commit();
+      batch = db.batch();
+    }
+  }
+  await batch.commit();
+  await flag.set({ membershipsV1: true, membershipsMigratedAt: FieldValue.serverTimestamp(), count: n }, { merge: true });
+  console.log(`[migrate] created/updated ${n} memberships`);
+}
+
 function approvedMember(req: CallableRequest) {
   const { uid, claims } = signedIn(req);
   if (!claims.gid || !claims.approved) {
@@ -1021,12 +1123,11 @@ function approvedMember(req: CallableRequest) {
 /** Exco check reads the live profile too, so a removed exco loses power immediately. */
 async function exco(req: CallableRequest) {
   const { uid, gid } = approvedMember(req);
-  const snap = await userRef(uid).get();
-  const u = snap.data();
-  if (!u || u.role !== 'exco' || u.status !== 'approved' || u.groupId !== gid) {
+  const m = await getMembership(gid, uid);
+  if (!m || m.role !== 'exco' || m.status !== 'approved') {
     throw fail('permission-denied', 'Only excos of this CDS group can do this.');
   }
-  return { uid, gid, name: u.fullName as string };
+  return { uid, gid, name: m.fullName as string };
 }
 
 /** The group creator is the main exco and owns role assignments and dues creation. */
@@ -1125,10 +1226,11 @@ async function findMember(gid: string, data: any) {
     }
   }
   if (!uid) throw fail('invalid-argument', 'Scan a tag or enter a state code.');
-  const snap = await userRef(uid).get();
+  const [m, snap] = await Promise.all([getMembership(gid, uid), userRef(uid).get()]);
   const u = snap.data();
-  if (!u || u.groupId !== gid) throw fail('not-found', 'This person is not in your CDS group.');
-  return { uid, user: u };
+  if (!m || !u) throw fail('not-found', 'This person is not in your CDS group.');
+  // Profile details + this group's role/status.
+  return { uid, user: { ...u, role: m.role, status: m.status } as FirebaseFirestore.DocumentData };
 }
 
 function publicMember(uid: string, u: FirebaseFirestore.DocumentData) {
@@ -1173,7 +1275,7 @@ async function admit(
   by: string,
   atMs: number,
 ) {
-  const u = (await userRef(uid).get()).data();
+  const u = await getMembership(gid, uid);
   if (!u || u.status !== 'approved') throw fail('failed-precondition', 'This member is not approved yet.');
   // Already in today's queue? Then they keep their number, paid or not.
   const existing = await attendeeRef(gid, sid, uid).get();
@@ -1252,13 +1354,28 @@ async function notify(uids: string[], title: string, body: string, link = '/tag'
     // Notifications must never break check-in or batch calling.
     console.error('notify failed', err);
   }
+  // Daily push statistics for Admin mode (1 small write per send; never blocks the caller).
+  try {
+    const withAlerts = new Set(owner.values()).size;
+    await db.doc(`platformStats/${lagosDate()}`).set(
+      {
+        pushPeople: FieldValue.increment(uids.length),
+        pushReachable: FieldValue.increment(withAlerts),
+        pushDelivered: FieldValue.increment(sent),
+        pushFailed: FieldValue.increment(Math.max(0, tokens.length - sent)),
+        kinds: { [kind]: FieldValue.increment(1) },
+      },
+      { merge: true },
+    );
+  } catch (err) {
+    console.error('push stats failed', err);
+  }
   return sent;
 }
 
 /** Broadcast an event to every approved member of a CDS group. */
 async function notifyApprovedGroup(gid: string, title: string, body: string, link = '/home') {
-  const users = await db.collection('users').where('groupId', '==', gid).get();
-  const recipients = users.docs.filter((d) => d.data().status === 'approved').map((d) => d.id);
+  const recipients = (await groupMembers(gid)).filter((m) => m.status === 'approved').map((m) => m.uid);
   const sent = await notify(recipients, title, body, link, 'group-event');
   return { sent, members: recipients.length };
 }
@@ -1301,7 +1418,7 @@ export const registerMember = onCall(async (req: CallableRequest) => {
     }
     const role: Role = isMainExco ? 'exco' : 'member';
     const status = isMainExco ? 'approved' : 'pending';
-    tx.set(userRef(uid), {
+    const userDoc = {
       ...p,
       groupId: gid,
       role,
@@ -1309,16 +1426,18 @@ export const registerMember = onCall(async (req: CallableRequest) => {
       fcmTokens: [],
       createdAt: FieldValue.serverTimestamp(),
       ...(isMainExco ? { approvedAt: FieldValue.serverTimestamp(), approvedBy: groupData.createdBy } : {}),
-    });
+    };
+    tx.set(userRef(uid), userDoc);
+    tx.set(membershipRef(gid, uid), membershipData(gid, uid, userDoc, groupName));
   });
   const role: Role = isMainExco ? 'exco' : 'member';
   const status = isMainExco ? 'approved' : 'pending';
   await auth.setCustomUserClaims(uid, { gid, role, approved: isMainExco });
   await log(gid, uid, 'member_registered', { target: uid, stateCode: p.stateCode });
   if (!isMainExco) {
-    const excos = await db.collection('users').where('groupId', '==', gid).get();
+    const excos = (await groupMembers(gid)).filter((m) => m.status === 'approved' && m.role === 'exco');
     await notify(
-      excos.docs.filter((d) => d.data().status === 'approved' && d.data().role === 'exco').map((d) => d.id),
+      excos.map((m) => m.uid),
       'New member needs approval',
       `${p.fullName} (${p.stateCode}) has requested to join your CDS group.`,
       '/exco/members',
@@ -1428,7 +1547,7 @@ export const registerPlatformAdmin = onCall(async (req: CallableRequest) => {
       createdAt: FieldValue.serverTimestamp(),
     });
     tx.create(keysRef(gRef.id), { doorSecret: randomBytes(32).toString('hex') });
-    tx.create(userRef(uid), {
+    const userDoc = {
       ...p,
       groupId: gRef.id,
       role: 'exco',
@@ -1437,7 +1556,9 @@ export const registerPlatformAdmin = onCall(async (req: CallableRequest) => {
       createdAt: FieldValue.serverTimestamp(),
       approvedAt: FieldValue.serverTimestamp(),
       approvedBy: uid,
-    });
+    };
+    tx.create(userRef(uid), userDoc);
+    tx.create(membershipRef(gRef.id, uid), membershipData(gRef.id, uid, userDoc, name));
   });
   await auth.setCustomUserClaims(uid, { gid: gRef.id, role: 'exco', approved: true });
   await log(gRef.id, uid, 'group_created', { name });
@@ -1445,17 +1566,118 @@ export const registerPlatformAdmin = onCall(async (req: CallableRequest) => {
 });
 
 
+/**
+ * An existing CDS Pass member joins ANOTHER CDS group (e.g. General CDS) with its code.
+ * Starts as "pending" for that group's excos to approve (or auto-approved if appointed its main exco).
+ * Their current group doesn't change; they switch between groups with switchGroup.
+ */
+export const joinAnotherGroup = onCall(async (req: CallableRequest) => {
+  const { uid } = signedIn(req);
+  const joinCode = String(req.data?.joinCode ?? '').trim().toUpperCase();
+  if (joinCode.length !== 6) throw fail('invalid-argument', 'Enter the 6-character CDS group code.');
+  const u = (await userRef(uid).get()).data();
+  if (!u) throw fail('failed-precondition', 'Finish signing up first.');
+  const g = await db.collection('groups').where('joinCode', '==', joinCode).limit(1).get();
+  if (g.empty) throw fail('not-found', 'No CDS group with that code. Ask its exco for it.');
+  const gid = g.docs[0].id;
+  const gd = g.docs[0].data();
+  if (await getMembership(gid, uid)) throw fail('already-exists', `You are already in ${gd.name}.`);
+  if ((await db.collection('memberships').where('uid', '==', uid).get()).size >= 5) {
+    throw fail('resource-exhausted', 'You can be in at most 5 CDS groups.');
+  }
+
+  let isMainExco = false;
+  await db.runTransaction(async (tx) => {
+    isMainExco = gd.mainExcoStateCode === u.stateCode && !gd.mainExcoUid;
+    if (isMainExco) {
+      const resRef = mainExcoReservationRef(u.stateCode);
+      const r = await tx.get(resRef);
+      if (!r.exists || r.data()!.groupId !== gid || (r.data()!.claimedUid && r.data()!.claimedUid !== uid)) isMainExco = false;
+      else {
+        tx.update(groupRef(gid), { mainExcoUid: uid, mainExcoClaimedAt: FieldValue.serverTimestamp() });
+        tx.update(resRef, { claimedUid: uid, claimedAt: FieldValue.serverTimestamp() });
+      }
+    }
+    tx.set(
+      membershipRef(gid, uid),
+      membershipData(gid, uid, { ...u, role: isMainExco ? 'exco' : 'member', status: isMainExco ? 'approved' : 'pending', createdAt: null, approvedAt: null }, gd.name, {
+        createdAt: FieldValue.serverTimestamp(),
+        ...(isMainExco ? { approvedAt: FieldValue.serverTimestamp(), approvedBy: gd.createdBy ?? null } : {}),
+      }),
+    );
+  });
+  await log(gid, uid, 'member_registered', { target: uid, stateCode: u.stateCode, label: 'joined as an extra CDS' });
+  if (!isMainExco) {
+    const excos = (await groupMembers(gid)).filter((m) => m.status === 'approved' && m.role === 'exco');
+    await notify(
+      excos.map((m) => m.uid),
+      'New member needs approval',
+      `${u.fullName} (${u.stateCode}) has asked to join ${gd.name}.`,
+      '/exco/members',
+      'member-request',
+    );
+  }
+  return { ok: true, gid, groupName: gd.name as string, status: isMainExco ? 'approved' : 'pending', role: isMainExco ? 'exco' : 'member' };
+});
+
+/** Switch which CDS group the app is showing (and which one your exco powers apply to). */
+export const switchGroup = onCall(async (req: CallableRequest) => {
+  const { uid } = signedIn(req);
+  const gid = String(req.data?.gid ?? '');
+  const m = await getMembership(gid, uid);
+  if (!m) throw fail('not-found', 'You are not in that CDS group.');
+  if (m.status === 'rejected') throw fail('permission-denied', 'That CDS group did not approve your request.');
+  await userRef(uid).update({ groupId: gid, role: m.role, status: m.status, switchedAt: FieldValue.serverTimestamp() });
+  await auth.setCustomUserClaims(uid, { gid, role: m.role, approved: m.status === 'approved' });
+  return { ok: true, gid, groupName: m.groupName as string, role: m.role as Role, status: m.status as string };
+});
+
+/** Leave an extra CDS group (not the one you are using right now). */
+export const leaveGroup = onCall(async (req: CallableRequest) => {
+  const { uid } = signedIn(req);
+  const gid = String(req.data?.gid ?? '');
+  const u = (await userRef(uid).get()).data();
+  if (u?.groupId === gid) throw fail('failed-precondition', 'Switch to another CDS group first, then leave this one.');
+  const g = (await groupRef(gid).get()).data();
+  if ((g?.mainExcoUid ?? g?.createdBy) === uid) throw fail('failed-precondition', 'The main exco cannot leave their own CDS group.');
+  await membershipRef(gid, uid).delete();
+  await log(gid, uid, 'member_left', { target: uid, stateCode: u?.stateCode });
+  return { ok: true };
+});
+
+/** Update your own phone / photo everywhere (profile + every CDS group you're in). */
+export const updateMyProfile = onCall(async (req: CallableRequest) => {
+  const { uid } = signedIn(req);
+  const patch: Record<string, unknown> = {};
+  if (req.data?.phone !== undefined) {
+    const phone = normalizePhone(req.data.phone);
+    if (!phone) throw fail('invalid-argument', 'Enter a valid Nigerian phone number.');
+    patch.phone = phone;
+  }
+  if (req.data?.photoURL !== undefined) {
+    const url = req.data.photoURL;
+    if (typeof url !== 'string' || !/^https:\/\//.test(url) || url.length > 2000) throw fail('invalid-argument', 'That photo link is not valid.');
+    patch.photoURL = url;
+  }
+  if (!Object.keys(patch).length) throw fail('invalid-argument', 'Nothing to change.');
+  const mine = await db.collection('memberships').where('uid', '==', uid).get();
+  const batch = db.batch();
+  batch.update(userRef(uid), { ...patch, updatedAt: FieldValue.serverTimestamp() });
+  mine.docs.forEach((d) => batch.update(d.ref, patch));
+  await batch.commit();
+  return { ok: true };
+});
+
 /** Exco approves (after checking the NYSC ID card) or rejects a pending member. */
 export const approveMember = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const approve = req.data?.approve !== false;
-  await userRef(uid).update({
+  await updateMembership(e.gid, uid, {
     status: approve ? 'approved' : 'rejected',
     approvedBy: e.uid,
     approvedAt: FieldValue.serverTimestamp(),
   });
-  await auth.setCustomUserClaims(uid, { gid: e.gid, role: user.role, approved: approve });
   await log(e.gid, e.uid, approve ? 'member_approved' : 'member_rejected', {
     target: uid,
     stateCode: user.stateCode,
@@ -1480,8 +1702,7 @@ export const setRole = onCall(async (req: CallableRequest) => {
     throw fail('failed-precondition', 'The main exco who created this CDS group cannot be demoted.');
   }
   if (user.status !== 'approved') throw fail('failed-precondition', 'Approve this member first.');
-  await userRef(uid).update({ role });
-  await auth.setCustomUserClaims(uid, { gid: e.gid, role, approved: true });
+  await updateMembership(e.gid, uid, { role });
   await log(e.gid, e.uid, 'role_changed', { target: uid, role });
   await notify(
     [uid],
@@ -1769,11 +1990,10 @@ export const callNext = onCall(async (req: CallableRequest) => {
 /** Main exco only: sends a test push to every approved member of the group who has alerts turned on. */
 export const testNotification = onCall(async (req: CallableRequest) => {
   const e = await mainExco(req);
-  const members = await db.collection('users').where('groupId', '==', e.gid).get();
-  const targets = members.docs
-    .filter((d) => d.data().status === 'approved' && Array.isArray(d.data().fcmTokens) && d.data().fcmTokens.length > 0)
-    .map((d) => d.id);
-  const registered = members.docs.filter((d) => d.data().status === 'approved').length;
+  const approvedUids = (await groupMembers(e.gid)).filter((m) => m.status === 'approved').map((m) => m.uid);
+  const profiles = approvedUids.length ? await db.getAll(...approvedUids.map((u) => userRef(u))) : [];
+  const targets = profiles.filter((d) => Array.isArray(d.data()?.fcmTokens) && d.data()!.fcmTokens.length > 0).map((d) => d.id);
+  const registered = approvedUids.length;
   if (!targets.length) return { sent: 0, registered: 0, members: registered };
   const sent = await notify(
     targets,
@@ -1808,17 +2028,17 @@ export const sendGroupMessage = onCall(async (req: CallableRequest) => {
     throw fail('resource-exhausted', `You can send ${MESSAGES_PER_DAY} messages a day. Try again tomorrow.`);
   }
 
-  const members = await db.collection('users').where('groupId', '==', e.gid).get();
-  let targets = members.docs.filter((d) => (audience === 'pending' ? d.data().status === 'pending' : d.data().status === 'approved'));
-  if (audience === 'excos') targets = targets.filter((d) => d.data().role === 'exco');
+  const all = await groupMembers(e.gid);
+  let targets = all.filter((m) => (audience === 'pending' ? m.status === 'pending' : m.status === 'approved'));
+  if (audience === 'excos') targets = targets.filter((m) => m.role === 'exco');
   if (audience === 'unpaid') {
     const open = await db.collection(`groups/${e.gid}/dues`).where('active', '==', true).get();
     if (open.empty) throw fail('failed-precondition', 'There are no open dues, so nobody is "not paid".');
     const owing = new Set<string>();
     for (const d of open.docs) (await owingMembers(e.gid, d.id)).forEach((u) => owing.add(u));
-    targets = targets.filter((d) => owing.has(d.id));
+    targets = targets.filter((m) => owing.has(m.uid));
   }
-  const uids = targets.map((d) => d.id);
+  const uids = targets.map((m) => m.uid);
   if (!uids.length) throw fail('failed-precondition', 'Nobody matches that choice right now.');
 
   const sent = await notify(uids, title, body, link, 'message');
@@ -1894,7 +2114,7 @@ export const markDone = onCall(async (req: CallableRequest) => {
     if (!isTurn({ number: att.number, priority: att.priority, status: att.status }, s.data()?.batch)) {
       throw fail('failed-precondition', 'It is not this person’s turn yet.');
     }
-    tx.update(aRef, { status: 'done', doneAt: FieldValue.serverTimestamp(), doneBy: e.uid });
+    tx.update(aRef, { status: 'done', doneAt: FieldValue.serverTimestamp(), doneBy: e.uid, doneByName: e.name });
   });
   await log(e.gid, e.uid, 'thumbprinted', { target: uid, stateCode: user.stateCode });
   return { ok: true };
@@ -2259,12 +2479,9 @@ export const respondCash = onCall(async (req: CallableRequest) => {
 
 /** Approved members of a group who haven't paid these dues. */
 async function owingMembers(gid: string, duesId: string) {
-  const [members, statuses] = await Promise.all([
-    db.collection('users').where('groupId', '==', gid).get(),
-    db.collection(`groups/${gid}/dues/${duesId}/status`).get(),
-  ]);
+  const [members, statuses] = await Promise.all([groupMembers(gid), db.collection(`groups/${gid}/dues/${duesId}/status`).get()]);
   const paid = new Set(statuses.docs.filter((s) => s.data().status === 'paid').map((s) => s.id));
-  return members.docs.filter((m) => m.data().status === 'approved' && !paid.has(m.id)).map((m) => m.id);
+  return members.filter((m) => m.status === 'approved' && !paid.has(m.uid)).map((m) => m.uid);
 }
 
 const prettyDate = (ymd: string) =>
@@ -2413,19 +2630,49 @@ export const adminOverview = onCall(async (req: CallableRequest) => {
   const since = days[0];
   const idx = new Map(days.map((d, i) => [d, i]));
   const signups = new Array(DAYS).fill(0);
+  const approvals = new Array(DAYS).fill(0);
   const checkins = new Array(DAYS).fill(0);
   const paidKobo = new Array(DAYS).fill(0);
   const earnedKobo = new Array(DAYS).fill(0);
 
-  const [groupsSnap, usersSnap] = await Promise.all([db.collection('groups').get(), db.collection('users').get()]);
-  const users = usersSnap.docs.map((d) => ({ id: d.id, ...(d.data() as Record<string, any>) }));
+  const [groupsSnap, usersSnap, membershipsSnap] = await Promise.all([
+    db.collection('groups').get(),
+    db.collection('users').get(),
+    db.collection('memberships').get(),
+  ]);
+  const memberships = membershipsSnap.docs.map((d) => d.data() as Record<string, any>);
+  // Typed loosely on purpose: user docs are plain data here.
+  const users: Array<Record<string, any> & { id: string }> = usersSnap.docs.map((d: any) => Object.assign({ id: d.id as string }, d.data()));
+  const batchSplit: Record<string, number> = {};
   for (const u of users) {
     const t = u.createdAt?.toMillis?.();
     if (t) {
       const i = idx.get(lagosDate(t));
       if (i !== undefined) signups[i]++;
     }
+    const a = u.approvedAt?.toMillis?.();
+    if (a) {
+      const i = idx.get(lagosDate(a));
+      if (i !== undefined) approvals[i]++;
+    }
+    if (u.status === 'approved') {
+      const b = String(u.stateCode ?? '').split('/')[1] ?? '?';
+      batchSplit[b] = (batchSplit[b] ?? 0) + 1;
+    }
   }
+  const hasAlerts = (u: Record<string, any>) => Array.isArray(u.fcmTokens) && u.fcmTokens.length > 0;
+
+  // Push statistics per day (written by notify)
+  const statDocs = await db.getAll(...days.map((d) => db.doc(`platformStats/${d}`)));
+  const pushPeople = statDocs.map((d) => Number(d.data()?.pushPeople ?? 0));
+  const pushDelivered = statDocs.map((d) => Number(d.data()?.pushDelivered ?? 0));
+  const pushFailed = statDocs.map((d) => Number(d.data()?.pushFailed ?? 0));
+  const pushKinds: Record<string, number> = {};
+  for (const d of statDocs) for (const [k, v] of Object.entries((d.data()?.kinds ?? {}) as Record<string, number>)) pushKinds[k] = (pushKinds[k] ?? 0) + Number(v);
+
+  const arrivalHours = new Array(24).fill(0);
+  let abandonedPayments = 0;
+  const openDues: { group: string; title: string; paid: number; members: number }[] = [];
 
   const groups: Array<Record<string, any> & { members: number; lastMeeting: string | null }> = [];
   let totalOnlineKobo = 0;
@@ -2433,7 +2680,9 @@ export const adminOverview = onCall(async (req: CallableRequest) => {
   let totalEarnedKobo = 0;
   for (const g of groupsSnap.docs) {
     const gd = g.data();
-    const mine = users.filter((u) => u.groupId === g.id);
+    // Group membership comes from memberships (people can be in several groups); photos/alerts from profiles.
+    const byUid = new Map(users.map((u) => [u.id, u]));
+    const mine: Array<Record<string, any>> = memberships.filter((m) => m.gid === g.id).map((m) => Object.assign({}, byUid.get(m.uid) ?? {}, m));
     const approved = mine.filter((u) => u.status === 'approved');
 
     // Payments (all time, paid)
@@ -2474,6 +2723,25 @@ export const adminOverview = onCall(async (req: CallableRequest) => {
         lastCheckins = c;
       }
     }
+    // Last meeting in detail: who got thumbprinted, and when people arrived.
+    let lastDone = 0;
+    if (lastMeeting) {
+      const att = await db.collection(`groups/${g.id}/sessions/${lastMeeting}/attendees`).get();
+      for (const a of att.docs) {
+        if (a.data().status === 'done') lastDone++;
+        const t = a.data().checkedInAt?.toMillis?.();
+        if (t) arrivalHours[Number(new Date(t).toLocaleString('en-GB', { hour: '2-digit', hour12: false, timeZone: 'Africa/Lagos' })) % 24]++;
+      }
+    }
+    // Online payments started but never finished (older than an hour)
+    const pending = await db.collection(`groups/${g.id}/payments`).where('status', '==', 'pending').get();
+    abandonedPayments += pending.docs.filter((p) => (p.data().createdAt?.toMillis?.() ?? Date.now()) < Date.now() - 3600_000).length;
+    // Open dues: how many have paid
+    const dues = await db.collection(`groups/${g.id}/dues`).where('active', '==', true).get();
+    for (const d of dues.docs) {
+      const paid = (await d.ref.collection('status').where('status', '==', 'paid').count().get()).data().count;
+      openDues.push({ group: gd.name, title: d.data().title, paid, members: approved.length });
+    }
 
     groups.push({
       id: g.id,
@@ -2487,6 +2755,8 @@ export const adminOverview = onCall(async (req: CallableRequest) => {
       pending: mine.filter((u) => u.status === 'pending').length,
       excos: approved.filter((u) => u.role === 'exco').length,
       noPhoto: approved.filter((u) => !u.photoURL).length,
+      alertsOn: approved.filter(hasAlerts).length,
+      lastDone,
       lastMeeting,
       lastCheckins,
       onlineKobo: online,
@@ -2502,14 +2772,26 @@ export const adminOverview = onCall(async (req: CallableRequest) => {
     totals: {
       groups: groups.length,
       activeGroups: groups.filter((g) => g.lastMeeting).length,
-      members: users.filter((u) => u.status === 'approved').length,
-      pending: users.filter((u) => u.status === 'pending').length,
+      members: new Set(memberships.filter((m) => m.status === 'approved').map((m) => m.uid)).size,
+      inSeveralGroups: (() => {
+        const c = new Map<string, number>();
+        memberships.forEach((m) => c.set(m.uid, (c.get(m.uid) ?? 0) + 1));
+        return [...c.values()].filter((n) => n > 1).length;
+      })(),
+      pending: memberships.filter((m) => m.status === 'pending').length,
       onlineKobo: totalOnlineKobo,
       cashKobo: totalCashKobo,
       earnedKobo: totalEarnedKobo,
       checkins30: checkins.reduce((a, b) => a + b, 0),
+      alertsOn: users.filter((u) => u.status === 'approved' && hasAlerts(u)).length,
+      noPhoto: users.filter((u) => u.status === 'approved' && !u.photoURL).length,
+      abandonedPayments,
     },
-    series: { days, signups, checkins, paidKobo, earnedKobo },
+    series: { days, signups, approvals, checkins, paidKobo, earnedKobo, pushPeople, pushDelivered, pushFailed },
+    pushKinds,
+    arrivalHours,
+    batchSplit,
+    openDues,
     groups,
   };
   overviewCache = { at: Date.now(), value };
@@ -2570,11 +2852,11 @@ export const adminBroadcast = onCall(async (req: CallableRequest) => {
   const gids: string[] = Array.isArray(req.data?.gids) ? req.data.gids.map(String).slice(0, 200) : [];
   const link = MESSAGE_LINKS.has(req.data?.link) ? (req.data.link as string) : '/home';
 
-  const users = await db.collection('users').where('status', '==', 'approved').get();
-  const uids = users.docs
-    .filter((u) => !gids.length || gids.includes(u.data().groupId))
-    .filter((u) => audience === 'everyone' || u.data().role === 'exco')
-    .map((u) => u.id);
+  // Memberships decide who is in which group; anyone in several groups gets the message once.
+  const ms = (await db.collection('memberships').where('status', '==', 'approved').get()).docs.map((d) => d.data());
+  const uids: string[] = [
+    ...new Set<string>(ms.filter((m) => (!gids.length || gids.includes(m.gid)) && (audience === 'everyone' || m.role === 'exco')).map((m) => m.uid as string)),
+  ];
   if (!uids.length) throw fail('failed-precondition', 'Nobody matches that choice.');
   const sent = await notify(uids, title, body, link, 'broadcast');
   await db.collection('platform/config/broadcasts').add({
@@ -2744,6 +3026,8 @@ app.post('/api/:name', async (req: Request, res: Response) => {
 const port = Number(process.env.PORT ?? 8787);
 app.listen(port, () => {
   console.log(`CDS Pass API listening on :${port}`);
+  // One-time move to "multiple CDS per member" (does nothing after the first successful run).
+  handlers.migrateMemberships().catch((e) => console.error('[migrate] memberships failed', e));
   console.log(`Allowed websites: ${origins.join(', ')}`);
 });
 ```
@@ -4225,6 +4509,171 @@ export function MemberCard({
 
 ---
 
+### `web/src/components/MyGroups.tsx`
+
+```tsx
+import { AnimatePresence, motion } from 'framer-motion';
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../hooks/useAuth';
+import { useMyMemberships } from '../hooks/useLive';
+import { api } from '../lib/api';
+import { errorText } from '../lib/firebase';
+import { toast } from '../lib/toast';
+import { Button, ErrorBox, Pill } from './ui';
+
+/**
+ * "My CDS groups": see every CDS you're in (e.g. Horticulture + General CDS), switch between them,
+ * or add another one with its 6-character code.
+ */
+export function MyGroups({ compact = false, onlyIfSeveral = false }: { compact?: boolean; onlyIfSeveral?: boolean }) {
+  const { user, profile, refreshClaims } = useAuth();
+  const nav = useNavigate();
+  const groups = useMyMemberships(user?.uid);
+  const [adding, setAdding] = useState(false);
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+
+  async function switchTo(gid: string, name: string) {
+    setError('');
+    setBusy(gid);
+    try {
+      const r = await api.switchGroup({ gid });
+      await refreshClaims();
+      toast(`Now using ${name}`, 'success');
+      nav(r.status === 'approved' ? (r.role === 'exco' ? '/exco' : '/home') : '/pending', { replace: true });
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function join() {
+    setError('');
+    if (code.trim().length !== 6) return setError('Enter the 6-character group code.');
+    setBusy('join');
+    try {
+      const r = await api.joinAnotherGroup({ joinCode: code.trim().toUpperCase() });
+      toast(
+        r.status === 'approved' ? `You joined ${r.groupName}` : `Request sent to ${r.groupName}`,
+        'success',
+        r.status === 'approved' ? 'Switch to it below.' : 'An exco of that group will approve you.',
+      );
+      setCode('');
+      setAdding(false);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function leave(gid: string, name: string) {
+    if (!confirm(`Leave ${name}?`)) return;
+    setBusy(`leave:${gid}`);
+    try {
+      await api.leaveGroup({ gid });
+      toast(`You left ${name}`, 'info');
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy('');
+    }
+  }
+
+  // On "Under review": only useful if you're in another group you can switch back to.
+  if (onlyIfSeveral && (groups?.length ?? 0) < 2) return null;
+
+  const sorted = (groups ?? []).slice().sort((a, b) => Number(b.gid === profile?.groupId) - Number(a.gid === profile?.groupId));
+
+  return (
+    <div className={compact ? 'space-y-3' : 'card space-y-3'}>
+      <div>
+        <p className="font-bold">My CDS groups</p>
+        {!compact && <p className="text-sm text-muted">Joined General CDS or another group too? Add it here and switch between them.</p>}
+      </div>
+
+      {groups === undefined ? (
+        <div className="h-14 animate-pulse rounded-2xl bg-line" />
+      ) : (
+        <ul className="space-y-2">
+          {sorted.map((m) => {
+            const current = m.gid === profile?.groupId;
+            return (
+              <li
+                key={m.gid}
+                className={`flex items-center gap-3 rounded-2xl p-3 ${current ? 'bg-green-light' : 'bg-paper'}`}
+              >
+                <span className={`grid h-10 w-10 shrink-0 place-items-center rounded-xl font-display text-sm font-extrabold ${current ? 'bg-green text-white' : 'bg-card text-green shadow-card'}`}>
+                  {(m.groupName || 'CDS').slice(0, 2).toUpperCase()}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-bold">{m.groupName || 'CDS group'}</span>
+                  <span className="block text-xs text-muted">
+                    {m.role === 'exco' ? 'Exco' : 'Member'} ·{' '}
+                    {m.status === 'approved' ? 'Approved' : m.status === 'pending' ? 'Waiting for approval' : 'Not approved'}
+                  </span>
+                </span>
+                {current ? (
+                  <Pill>Using now</Pill>
+                ) : m.status === 'rejected' ? (
+                  <button disabled={busy === `leave:${m.gid}`} onClick={() => leave(m.gid, m.groupName)} className="text-xs font-bold text-bad">
+                    Remove
+                  </button>
+                ) : (
+                  <button
+                    disabled={!!busy}
+                    onClick={() => switchTo(m.gid, m.groupName)}
+                    className="h-9 shrink-0 rounded-xl bg-green px-3 text-xs font-bold text-white disabled:opacity-50"
+                  >
+                    {busy === m.gid ? '…' : 'Switch'}
+                  </button>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      <AnimatePresence initial={false}>
+        {adding ? (
+          <motion.div key="add" initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="space-y-2 overflow-hidden">
+            <input
+              className="input text-center text-xl font-extrabold tracking-[0.35em]"
+              placeholder="GROUP CODE"
+              maxLength={6}
+              autoCapitalize="characters"
+              value={code}
+              onChange={(e) => setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))}
+              aria-label="Group code"
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <Button variant="outline" onClick={() => setAdding(false)}>
+                Cancel
+              </Button>
+              <Button loading={busy === 'join'} onClick={join}>
+                Join
+              </Button>
+            </div>
+          </motion.div>
+        ) : (
+          <motion.div key="btn" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+            <Button variant="ghost" onClick={() => setAdding(true)}>
+              + Add another CDS
+            </Button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      <ErrorBox>{error}</ErrorBox>
+    </div>
+  );
+}
+```
+
+---
+
 ### `web/src/components/PhotoPicker.tsx`
 
 ```tsx
@@ -5549,7 +5998,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { db } from '../lib/firebase';
 import { api } from '../lib/api';
 import { lagosDate } from '../lib/rules';
-import type { Attendee, Dues, DuesStatus, Group, LogEntry, Payment, Profile, Session } from '../lib/types';
+import type { Attendee, Dues, DuesStatus, Group, LogEntry, Membership, Payment, Profile, Session } from '../lib/types';
 
 /** Live document. undefined = loading, null = does not exist. */
 export function useDoc<T>(path: string | null): T | null | undefined {
@@ -5628,19 +6077,39 @@ export function useAttendees(gid: string | undefined) {
   );
 }
 
+/**
+ * Everyone in a CDS group. Comes from `memberships` (people can be in several groups), shaped like a
+ * Profile so the screens don't care: role/status are THIS group's, groupId is this group.
+ */
 export function useGroupMembers(gid: string | undefined) {
-  const q = useMemo(() => (gid ? query(collection(db, 'users'), where('groupId', '==', gid)) : null), [gid]);
-  const list = useList<Profile>(q, `members:${gid}`);
-  return useMemo(() => list?.slice().sort((a, b) => a.fullName.localeCompare(b.fullName)), [list]);
+  const q = useMemo(() => (gid ? query(collection(db, 'memberships'), where('gid', '==', gid)) : null), [gid]);
+  const list = useList<Membership>(q, `members:${gid}`);
+  return useMemo(() => list?.map(toProfile).sort((a, b) => a.fullName.localeCompare(b.fullName)), [list]);
+}
+
+const toProfile = (m: Membership): Profile =>
+  ({
+    ...m,
+    uid: m.uid,
+    groupId: m.gid,
+    phone: m.phone ?? '',
+    photoURL: m.photoURL ?? null,
+    fcmTokens: [],
+  }) as unknown as Profile;
+
+/** All the CDS groups I'm in (for the switcher). */
+export function useMyMemberships(uid: string | undefined) {
+  const q = useMemo(() => (uid ? query(collection(db, 'memberships'), where('uid', '==', uid)) : null), [uid]);
+  return useList<Membership>(q, `my-memberships:${uid}`);
 }
 
 /** Only the members waiting for approval: far fewer reads than loading the whole group. */
 export function usePendingMembers(gid: string | undefined) {
   const q = useMemo(
-    () => (gid ? query(collection(db, 'users'), where('groupId', '==', gid), where('status', '==', 'pending')) : null),
+    () => (gid ? query(collection(db, 'memberships'), where('gid', '==', gid), where('status', '==', 'pending')) : null),
     [gid],
   );
-  return useList<Profile>(q, `pending:${gid}`);
+  return useList<Membership>(q, `pending:${gid}`);
 }
 
 export function useLogs(gid: string | undefined, max = 50) {
@@ -6042,6 +6511,10 @@ export const api = {
     { ok: true; recipients: number; delivered: number }
   >('adminBroadcast'),
   adminSetTeamMember: callable<{ stateCode: string; role: 'admin' | 'viewer' | null }, { ok: true }>('adminSetTeamMember'),
+  joinAnotherGroup: callable<{ joinCode: string }, { ok: true; gid: string; groupName: string; status: string; role: string }>('joinAnotherGroup'),
+  switchGroup: callable<{ gid: string }, { ok: true; gid: string; groupName: string; role: string; status: string }>('switchGroup'),
+  leaveGroup: callable<{ gid: string }, { ok: true }>('leaveGroup'),
+  updateMyProfile: callable<{ phone?: string; photoURL?: string }, { ok: true }>('updateMyProfile'),
   testNotification: callable<Record<string, never>, { sent: number; registered: number; members: number }>('testNotification'),
   tableCheck: callable<Who, TableCheckResponse>('tableCheck'),
   markDone: callable<Who, { ok: true }>('markDone'),
@@ -6073,6 +6546,8 @@ export interface AdminGroupRow {
   pending: number;
   excos: number;
   noPhoto: number;
+  alertsOn: number;
+  lastDone: number;
   lastMeeting: string | null;
   lastCheckins: number;
   onlineKobo: number;
@@ -6083,8 +6558,34 @@ export interface AdminGroupRow {
 
 export interface AdminOverview {
   generatedAt: number;
-  totals: { groups: number; activeGroups: number; members: number; pending: number; onlineKobo: number; cashKobo: number; earnedKobo: number; checkins30: number };
-  series: { days: string[]; signups: number[]; checkins: number[]; paidKobo: number[]; earnedKobo: number[] };
+  totals: {
+    groups: number;
+    activeGroups: number;
+    members: number;
+    pending: number;
+    onlineKobo: number;
+    cashKobo: number;
+    earnedKobo: number;
+    checkins30: number;
+    alertsOn: number;
+    noPhoto: number;
+    abandonedPayments: number;
+  };
+  series: {
+    days: string[];
+    signups: number[];
+    approvals: number[];
+    checkins: number[];
+    paidKobo: number[];
+    earnedKobo: number[];
+    pushPeople: number[];
+    pushDelivered: number[];
+    pushFailed: number[];
+  };
+  pushKinds: Record<string, number>;
+  arrivalHours: number[];
+  batchSplit: Record<string, number>;
+  openDues: { group: string; title: string; paid: number; members: number }[];
   groups: AdminGroupRow[];
 }
 
@@ -6159,6 +6660,55 @@ export function getPosition(timeoutMs = 8000): Promise<{ lat: number; lng: numbe
     );
   });
 }
+```
+
+---
+
+### `web/src/lib/exportSheet.ts`
+
+```ts
+/**
+ * Download a table as a .csv file that opens straight in Excel, Google Sheets or WPS.
+ * Built from data already on the phone, so it costs no extra database reads.
+ */
+export type Cell = string | number | boolean | null | undefined | Date;
+
+function cell(v: Cell): string {
+  if (v === null || v === undefined) return '';
+  if (v instanceof Date) return v.toLocaleString('en-NG');
+  const s = String(v);
+  // Stop Excel treating things like "=SUM()" or "+234…" as formulas, and quote when needed.
+  const safe = /^[=+\-@]/.test(s) ? `'${s}` : s;
+  return /[",\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
+}
+
+export function downloadSheet(fileName: string, headers: string[], rows: Cell[][]) {
+  const lines = [headers.map(cell).join(','), ...rows.map((r) => r.map(cell).join(','))];
+  // The BOM makes Excel read ₦ and accented names correctly.
+  const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName.endsWith('.csv') ? fileName : `${fileName}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+/** "NDLEA CDS" → "ndlea-cds" for file names. */
+export const slug = (s: string) =>
+  s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 40) || 'cds';
+
+export const time = (t?: { toDate?: () => Date } | null) =>
+  t?.toDate ? t.toDate().toLocaleTimeString('en-NG', { hour: 'numeric', minute: '2-digit' }) : '';
+
+export const dateTime = (t?: { toDate?: () => Date } | null) =>
+  t?.toDate ? t.toDate().toLocaleString('en-NG', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
 ```
 
 ---
@@ -7220,6 +7770,8 @@ export interface Attendee {
   method: 'self' | 'offline' | 'card' | 'manual';
   checkedInAt?: Timestamp;
   doneAt?: Timestamp;
+  doneBy?: string;
+  doneByName?: string;
   fullName: string;
   stateCode: string;
   photoURL: string | null;
@@ -7255,6 +7807,22 @@ export interface LogEntry {
   target?: string;
   stateCode?: string;
   [k: string]: unknown;
+}
+
+/** One person's place in one CDS group (people can be in several, e.g. their CDS + General CDS). */
+export interface Membership {
+  id?: string;
+  gid: string;
+  uid: string;
+  groupName: string;
+  fullName: string;
+  stateCode: string;
+  phone: string | null;
+  photoURL: string | null;
+  role: Role;
+  status: MemberStatus;
+  createdAt?: Timestamp;
+  approvedAt?: Timestamp;
 }
 ```
 
@@ -7449,14 +8017,15 @@ export default function Login() {
 ### `web/src/pages/Pending.tsx`
 
 ```tsx
-import { doc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { motion } from 'framer-motion';
 import { useState } from 'react';
 import { Avatar } from '../components/Avatar';
 import { PhotoPicker } from '../components/PhotoPicker';
+import { MyGroups } from '../components/MyGroups';
 import { Button, ErrorBox } from '../components/ui';
 import { useAuth } from '../hooks/useAuth';
-import { db, errorText } from '../lib/firebase';
+import { api } from '../lib/api';
+import { errorText } from '../lib/firebase';
 import { toast } from '../lib/toast';
 import { uploadAvatar } from '../lib/upload';
 
@@ -7472,7 +8041,7 @@ function AddPhoto({ uid }: { uid: string }) {
     setError('');
     try {
       const photoURL = await uploadAvatar(uid, photo);
-      await updateDoc(doc(db, 'users', uid), { photoURL, updatedAt: serverTimestamp() });
+      await api.updateMyProfile({ photoURL });
       toast('Photo saved', 'success', 'The exco can now review your account.');
     } catch (e) {
       setError(errorText(e));
@@ -7584,6 +8153,10 @@ export default function Pending() {
             </>
           )}
         </motion.div>
+
+        <div className="mt-6 w-full text-left text-ink">
+          <MyGroups onlyIfSeveral />
+        </div>
 
         <div className="mt-auto w-full pt-8">
           <Button variant="light" onClick={logout}>
@@ -8110,9 +8683,29 @@ import { api, type AdminConfig, type AdminGroupRow, type AdminOverview } from '.
 import { errorText } from '../../lib/firebase';
 import { naira } from '../../lib/money';
 import { toast } from '../../lib/toast';
-import { TrendChart } from './Charts';
+import { BarList, TrendChart } from './Charts';
 
 type Tab = 'overview' | 'groups' | 'controls' | 'message' | 'team';
+
+const HOURS = [6, 7, 8, 9, 10, 11, 12, 13, 14];
+const KIND_LABEL: Record<string, string> = {
+  checkin: 'Check-in numbers',
+  'batch-call': 'Batch calls',
+  'group-event': 'Meeting & dues news',
+  'member-approved': 'Approvals',
+  'pin-reset': 'PIN resets',
+  batch: 'Batch calls',
+  turn: 'Your turn',
+  'dues-reminder': 'Dues reminders',
+  dues: 'Dues news',
+  cash: 'Cash recorded',
+  message: 'Exco messages',
+  broadcast: 'Admin broadcasts',
+  approval: 'Approvals',
+  alert: 'Other alerts',
+  dispute: 'Cash disputes',
+  session: 'Meeting open/closed',
+};
 
 const sum = (a: number[]) => a.reduce((x, y) => x + y, 0);
 const nairaShort = (kobo: number) => {
@@ -8152,10 +8745,58 @@ function Overview({ data }: { data: AdminOverview }) {
           total={naira(sum(s.earnedKobo))}
         />
       </div>
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Stat tone="light" value={naira(data.totals.onlineKobo)} label="Dues paid online (all time)" />
         <Stat tone="light" value={naira(data.totals.cashKobo)} label="Cash recorded (all time)" />
+        <Stat tone="light" value={`${data.totals.alertsOn}/${data.totals.members}`} label="Members with alerts on" />
+        <Stat tone="light" value={data.totals.abandonedPayments} label="Online payments started, not finished" />
       </div>
+
+      <h2 className="pt-2 text-lg font-extrabold">Notifications</h2>
+      <div className="grid gap-3 lg:grid-cols-2">
+        <TrendChart
+          title="Pushes that reached a phone, per day"
+          days={s.days}
+          values={s.pushDelivered}
+          kind="bar"
+          total={`${sum(s.pushDelivered)} in 30 days`}
+          note={`${sum(s.pushFailed)} failed (old or blocked phones). ${data.totals.members - data.totals.alertsOn} members haven't turned alerts on.`}
+        />
+        <BarList
+          title="What was sent (30 days)"
+          rows={Object.entries(data.pushKinds)
+            .sort((a, b) => b[1] - a[1])
+            .map(([k, v]) => ({ label: KIND_LABEL[k] ?? k, value: v }))}
+        />
+      </div>
+
+      <h2 className="pt-2 text-lg font-extrabold">Attendance & members</h2>
+      <div className="grid gap-3 lg:grid-cols-2">
+        <TrendChart
+          title="When people arrive (last meeting of each group)"
+          days={HOURS.map(String)}
+          values={HOURS.map((h) => data.arrivalHours[h] ?? 0)}
+          kind="bar"
+          label={(h) => `${Number(h) % 12 || 12}${Number(h) < 12 ? 'am' : 'pm'}`}
+        />
+        <TrendChart title="Approvals per day" days={s.days} values={s.approvals} kind="line" total={`${sum(s.approvals)} in 30 days`} />
+        <BarList
+          title="Members by batch"
+          rows={Object.entries(data.batchSplit)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([b, n]) => ({ label: `Batch ${b}`, value: n }))}
+        />
+        <BarList
+          title="Thumbprinted at the last meeting"
+          rows={data.groups.filter((g) => g.lastMeeting).map((g) => ({ label: g.name, value: g.lastDone, max: g.lastCheckins, hint: g.lastMeeting ?? '' }))}
+        />
+      </div>
+
+      <h2 className="pt-2 text-lg font-extrabold">Dues</h2>
+      <BarList
+        title="Open dues: members who have paid"
+        rows={data.openDues.map((d) => ({ label: `${d.group} · ${d.title}`, value: d.paid, max: d.members }))}
+      />
       <p className="text-center text-xs text-muted">
         Updated {new Date(data.generatedAt).toLocaleTimeString('en-NG', { hour: 'numeric', minute: '2-digit' })}. Figures refresh every 5 minutes.
       </p>
@@ -8217,6 +8858,8 @@ function Groups({ data, canEdit, onChanged }: { data: AdminOverview; canEdit: bo
                     <Info k="Excos" v={String(g.excos)} />
                     <Info k="Last meeting" v={g.lastMeeting ? `${g.lastMeeting} · ${g.lastCheckins} in` : '—'} />
                     <Info k="Missing photos" v={String(g.noPhoto)} />
+                    <Info k="Alerts on" v={`${g.alertsOn}/${g.members}`} />
+                    <Info k="Thumbprinted (last)" v={g.lastMeeting ? `${g.lastDone}/${g.lastCheckins}` : '—'} />
                     <Info k="Paid online" v={naira(g.onlineKobo)} />
                     <Info k="Cash recorded" v={naira(g.cashKobo)} />
                     <Info k="Your earnings" v={naira(g.earnedKobo)} />
@@ -8572,6 +9215,8 @@ export function TrendChart({
   kind = 'line',
   format = (n) => n.toLocaleString('en-NG'),
   total,
+  label = shortDay,
+  note,
 }: {
   title: string;
   days: string[];
@@ -8579,6 +9224,9 @@ export function TrendChart({
   kind?: 'line' | 'bar';
   format?: (n: number) => string;
   total?: string;
+  /** How to show an x position (default: "21 Nov"). */
+  label?: (key: string) => string;
+  note?: string;
 }) {
   const [hover, setHover] = useState<number | null>(null);
   const max = useMemo(() => niceMax(Math.max(0, ...values)), [values]);
@@ -8631,7 +9279,7 @@ export function TrendChart({
           {/* x labels: first, middle, last */}
           {[0, Math.floor((n - 1) / 2), n - 1].map((i) => (
             <text key={i} x={kind === 'bar' ? barX(i) + barW / 2 : x(i)} y={H - 6} textAnchor="middle" fontSize={9} fill="rgb(var(--muted))">
-              {shortDay(days[i])}
+              {label(days[i])}
             </text>
           ))}
 
@@ -8670,11 +9318,38 @@ export function TrendChart({
             className="pointer-events-none absolute top-0 -translate-x-1/2 rounded-xl bg-ink px-2.5 py-1.5 text-xs font-semibold text-paper shadow-lift"
             style={{ left: `${Math.min(88, Math.max(12, (hx / W) * 100))}%` }}
           >
-            {shortDay(days[hover])}: <b>{format(values[hover])}</b>
+            {label(days[hover])}: <b>{format(values[hover])}</b>
           </div>
         )}
       </div>
+      {note && <p className="mt-1 text-xs text-muted">{note}</p>}
     </figure>
+  );
+}
+
+/** Horizontal bars with labels: for small lists like batches or dues progress. */
+export function BarList({ title, rows, format = (n) => String(n) }: { title: string; rows: { label: string; value: number; max?: number; hint?: string }[]; format?: (n: number) => string }) {
+  const top = Math.max(1, ...rows.map((r) => r.max ?? r.value));
+  return (
+    <div className="card space-y-3 !p-4">
+      <p className="text-sm font-bold">{title}</p>
+      {rows.length === 0 && <p className="text-sm text-muted">Nothing yet.</p>}
+      {rows.map((r) => {
+        const of = r.max ?? top;
+        return (
+          <div key={r.label}>
+            <div className="flex items-baseline justify-between gap-2 text-sm">
+              <span className="truncate font-semibold">{r.label}</span>
+              <span className="shrink-0 font-bold">{format(r.value)}{r.max !== undefined ? ` / ${format(r.max)}` : ''}</span>
+            </div>
+            <div className="mt-1 h-2.5 overflow-hidden rounded-full bg-line">
+              <div className="h-full rounded-full" style={{ width: `${Math.min(100, (r.value / Math.max(1, of)) * 100)}%`, background: 'rgb(var(--green-text))' }} />
+            </div>
+            {r.hint && <p className="mt-0.5 text-xs text-muted">{r.hint}</p>}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 ```
@@ -8808,6 +9483,7 @@ import { api } from '../../lib/api';
 import { errorText } from '../../lib/firebase';
 import { batchLabel, tagLabel } from '../../lib/rules';
 import { toast } from '../../lib/toast';
+import { downloadSheet, slug, time } from '../../lib/exportSheet';
 
 export default function Dashboard() {
   const { me, group, session, attendees, stats, open } = useExcoDay();
@@ -8932,10 +9608,36 @@ export default function Dashboard() {
         {attendees && attendees.length > 0 && (
           <div className="card !p-0">
             <div className="flex items-center justify-between px-5 pb-2 pt-4">
-              <p className="font-bold">Register</p>
-              <p className="text-xs text-muted">
-                {stats.priority} priority · {stats.manual} manual
-              </p>
+              <div>
+                <p className="font-bold">Register</p>
+                <p className="text-xs text-muted">
+                  {stats.priority} priority · {stats.manual} manual · {attendees.filter((a) => a.status === 'done').length} thumbprinted
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  const sorted = [...attendees].sort((a, b) => Number(b.priority) - Number(a.priority) || a.number - b.number);
+                  downloadSheet(
+                    `register-${slug(group?.name ?? 'cds')}-${new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Lagos' })}`,
+                    ['No.', 'Full name', 'State code', 'Time in', 'How', 'Priority', 'Thumbprinted', 'Time done', 'Marked done by'],
+                    sorted.map((a) => [
+                      tagLabel(a),
+                      a.fullName,
+                      a.stateCode,
+                      time(a.checkedInAt),
+                      a.method === 'manual' ? 'Given by main exco' : a.method === 'card' ? 'Printed card' : a.method === 'offline' ? 'Scan (offline)' : 'Scan',
+                      a.priority ? 'Yes' : '',
+                      a.status === 'done' ? 'Yes' : 'No',
+                      time(a.doneAt),
+                      a.doneByName ?? '',
+                    ]),
+                  );
+                  toast('Register downloaded', 'success', 'Open it in Excel or Google Sheets.');
+                }}
+                className="flex h-10 items-center gap-1.5 rounded-xl bg-green-light px-3 text-sm font-bold text-green"
+              >
+                ⬇ Excel
+              </button>
             </div>
             <ul className="divide-y divide-line">
               {attendees.map((a) => (
@@ -9217,6 +9919,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Avatar } from '../../components/Avatar';
 import { ExcoHeader } from '../../components/ExcoHeader';
 import { Button, Checkbox, ErrorBox, Field, Icon, Page, Pill, Select, Stat } from '../../components/ui';
+import { dateTime, downloadSheet, slug } from '../../lib/exportSheet';
 import { useMe } from '../../hooks/useAuth';
 import { useActiveDues, useDuesStatuses, useGroup, useGroupMembers } from '../../hooks/useLive';
 import { api } from '../../lib/api';
@@ -9440,12 +10143,35 @@ function DuesDetail({ dues }: { dues: Dues }) {
           </p>
           {dues.requiredForCheckIn && <Pill tone="gold">Pay before getting a number</Pill>}
         </div>
-        <button
-          onClick={() => confirm(`Close "${dues.title}"? Members won't be able to pay it any more.`) && run('close', () => api.closeDues({ duesId: dues.id }), 'Dues closed')}
-          className="rounded-xl px-3 py-2 text-sm font-bold text-muted"
-        >
-          Close
-        </button>
+        <div className="flex shrink-0 gap-1">
+          <button
+            onClick={() => {
+              downloadSheet(
+                `dues-${slug(dues.title)}`,
+                ['Full name', 'State code', 'Status', 'How', 'Amount', 'Recorded by', 'When'],
+                rows.map(({ m, s }) => [
+                  m.fullName,
+                  m.stateCode,
+                  s?.status === 'paid' ? 'Paid' : s?.status === 'disputed' ? 'Disputed' : s?.status === 'cash_pending' ? 'Awaiting member' : 'Not paid',
+                  s ? (s.method === 'cash' ? 'Cash' : 'Online') : '',
+                  s ? naira(s.amountKobo) : '',
+                  s?.recordedByName ?? '',
+                  dateTime(s?.paidAt ?? s?.recordedAt),
+                ]),
+              );
+              toast('Dues list downloaded', 'success', 'Open it in Excel or Google Sheets.');
+            }}
+            className="rounded-xl bg-green-light px-3 py-2 text-sm font-bold text-green"
+          >
+            ⬇ Excel
+          </button>
+          <button
+            onClick={() => confirm(`Close "${dues.title}"? Members won't be able to pay it any more.`) && run('close', () => api.closeDues({ duesId: dues.id }), 'Dues closed')}
+            className="rounded-xl px-3 py-2 text-sm font-bold text-muted"
+          >
+            Close
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-3 gap-2">
@@ -9737,6 +10463,7 @@ import { ExcoHeader } from '../../components/ExcoHeader';
 import { MemberCard } from '../../components/MemberCard';
 import { QRScan } from '../../components/QRScan';
 import { Button, ErrorBox, Icon, Page, Pill, Select } from '../../components/ui';
+import { dateTime, downloadSheet } from '../../lib/exportSheet';
 import { useMe } from '../../hooks/useAuth';
 import { useGroup, useGroupMembers } from '../../hooks/useLive';
 import { api } from '../../lib/api';
@@ -9928,6 +10655,30 @@ export default function Members() {
                 <input className="input flex-1" placeholder="Search name, state code or phone" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search members" />
                 <button onClick={() => setScanning(true)} aria-label="Scan member code" className="grid h-14 w-14 place-items-center rounded-2xl bg-green text-white">
                   <Icon name="scan" />
+                </button>
+                <button
+                  aria-label="Download this list for Excel"
+                  disabled={!list.length}
+                  onClick={() => {
+                    downloadSheet(
+                      `members-${filter}-${new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Lagos' })}`,
+                      ['Full name', 'State code', 'Batch', 'Phone', 'Role', 'Status', 'Has photo', 'Joined'],
+                      list.map((m) => [
+                        m.fullName,
+                        m.stateCode,
+                        m.stateCode.split('/')[1] ?? '',
+                        m.phone,
+                        m.role === 'exco' ? 'Exco' : 'Member',
+                        m.status,
+                        m.photoURL ? 'Yes' : 'No',
+                        dateTime((m as unknown as { createdAt?: { toDate: () => Date } }).createdAt),
+                      ]),
+                    );
+                    toast(`${list.length} ${list.length === 1 ? 'person' : 'people'} downloaded`, 'success', 'Open it in Excel or Google Sheets.');
+                  }}
+                  className="grid h-14 w-14 place-items-center rounded-2xl bg-green-light text-lg font-extrabold text-green disabled:opacity-40"
+                >
+                  ⬇
                 </button>
               </div>
 
@@ -11229,14 +11980,15 @@ export default function MyTag() {
 ### `web/src/pages/member/Profile.tsx`
 
 ```tsx
-import { doc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { useEffect, useState } from 'react';
 import { PhotoPicker } from '../../components/PhotoPicker';
 import { ThemeToggle } from '../../components/ThemeToggle';
 import { Button, ErrorBox, Field, Icon, Page, Pill, TopBar } from '../../components/ui';
 import { useAuth, useMe } from '../../hooks/useAuth';
 import { useGroup } from '../../hooks/useLive';
-import { db, errorText } from '../../lib/firebase';
+import { api } from '../../lib/api';
+import { errorText } from '../../lib/firebase';
+import { MyGroups } from '../../components/MyGroups';
 import { enableNotifications, pushState, type PushState } from '../../lib/messaging';
 import { normalizePhone } from '../../lib/rules';
 import { toast } from '../../lib/toast';
@@ -11276,9 +12028,10 @@ export default function Profile() {
     if (!p) return setError('Enter a valid Nigerian phone number.');
     setBusy('save');
     try {
-      const patch: Record<string, unknown> = { phone: p, updatedAt: serverTimestamp() };
+      // Saved through the server so every CDS group you're in shows the new phone/photo.
+      const patch: { phone: string; photoURL?: string } = { phone: p };
       if (photo) patch.photoURL = await uploadAvatar(me.uid, photo);
-      await updateDoc(doc(db, 'users', me.uid), patch);
+      await api.updateMyProfile(patch);
       setPhoto(null);
       toast('Profile saved', 'success');
     } catch (e) {
@@ -11340,6 +12093,8 @@ export default function Profile() {
             </Button>
           )}
         </div>
+
+        <MyGroups />
 
         <div className="card">
           <ThemeToggle />

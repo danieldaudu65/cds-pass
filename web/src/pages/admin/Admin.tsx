@@ -3,13 +3,35 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Navigate } from 'react-router-dom';
 import { Button, Checkbox, ErrorBox, Field, Icon, Page, Pill, Select, Stat } from '../../components/ui';
 import { usePlatformRole } from '../../hooks/usePlatform';
-import { api, type AdminConfig, type AdminGroupRow, type AdminOverview } from '../../lib/api';
+import { api, type AdminConfig, type AdminGroupRow, type AdminMemberRow, type AdminOverview } from '../../lib/api';
+import { Avatar } from '../../components/Avatar';
+import { downloadSheet, slug } from '../../lib/exportSheet';
 import { errorText } from '../../lib/firebase';
 import { naira } from '../../lib/money';
 import { toast } from '../../lib/toast';
-import { TrendChart } from './Charts';
+import { BarList, TrendChart } from './Charts';
 
 type Tab = 'overview' | 'groups' | 'controls' | 'message' | 'team';
+
+const HOURS = [6, 7, 8, 9, 10, 11, 12, 13, 14];
+const KIND_LABEL: Record<string, string> = {
+  checkin: 'Check-in numbers',
+  'batch-call': 'Batch calls',
+  'group-event': 'Meeting & dues news',
+  'member-approved': 'Approvals',
+  'pin-reset': 'PIN resets',
+  batch: 'Batch calls',
+  turn: 'Your turn',
+  'dues-reminder': 'Dues reminders',
+  dues: 'Dues news',
+  cash: 'Cash recorded',
+  message: 'Exco messages',
+  broadcast: 'Admin broadcasts',
+  approval: 'Approvals',
+  alert: 'Other alerts',
+  dispute: 'Cash disputes',
+  session: 'Meeting open/closed',
+};
 
 const sum = (a: number[]) => a.reduce((x, y) => x + y, 0);
 const nairaShort = (kobo: number) => {
@@ -49,10 +71,58 @@ function Overview({ data }: { data: AdminOverview }) {
           total={naira(sum(s.earnedKobo))}
         />
       </div>
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Stat tone="light" value={naira(data.totals.onlineKobo)} label="Dues paid online (all time)" />
         <Stat tone="light" value={naira(data.totals.cashKobo)} label="Cash recorded (all time)" />
+        <Stat tone="light" value={`${data.totals.alertsOn}/${data.totals.members}`} label="Members with alerts on" />
+        <Stat tone="light" value={data.totals.abandonedPayments} label="Online payments started, not finished" />
       </div>
+
+      <h2 className="pt-2 text-lg font-extrabold">Notifications</h2>
+      <div className="grid gap-3 lg:grid-cols-2">
+        <TrendChart
+          title="Pushes that reached a phone, per day"
+          days={s.days}
+          values={s.pushDelivered}
+          kind="bar"
+          total={`${sum(s.pushDelivered)} in 30 days`}
+          note={`${sum(s.pushFailed)} failed (old or blocked phones). ${data.totals.members - data.totals.alertsOn} members haven't turned alerts on.`}
+        />
+        <BarList
+          title="What was sent (30 days)"
+          rows={Object.entries(data.pushKinds)
+            .sort((a, b) => b[1] - a[1])
+            .map(([k, v]) => ({ label: KIND_LABEL[k] ?? k, value: v }))}
+        />
+      </div>
+
+      <h2 className="pt-2 text-lg font-extrabold">Attendance & members</h2>
+      <div className="grid gap-3 lg:grid-cols-2">
+        <TrendChart
+          title="When people arrive (last meeting of each group)"
+          days={HOURS.map(String)}
+          values={HOURS.map((h) => data.arrivalHours[h] ?? 0)}
+          kind="bar"
+          label={(h) => `${Number(h) % 12 || 12}${Number(h) < 12 ? 'am' : 'pm'}`}
+        />
+        <TrendChart title="Approvals per day" days={s.days} values={s.approvals} kind="line" total={`${sum(s.approvals)} in 30 days`} />
+        <BarList
+          title="Members by batch"
+          rows={Object.entries(data.batchSplit)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([b, n]) => ({ label: `Batch ${b}`, value: n }))}
+        />
+        <BarList
+          title="Thumbprinted at the last meeting"
+          rows={data.groups.filter((g) => g.lastMeeting).map((g) => ({ label: g.name, value: g.lastDone, max: g.lastCheckins, hint: g.lastMeeting ?? '' }))}
+        />
+      </div>
+
+      <h2 className="pt-2 text-lg font-extrabold">Dues</h2>
+      <BarList
+        title="Open dues: members who have paid"
+        rows={data.openDues.map((d) => ({ label: `${d.group} · ${d.title}`, value: d.paid, max: d.members }))}
+      />
       <p className="text-center text-xs text-muted">
         Updated {new Date(data.generatedAt).toLocaleTimeString('en-NG', { hour: 'numeric', minute: '2-digit' })}. Figures refresh every 5 minutes.
       </p>
@@ -65,6 +135,7 @@ function Overview({ data }: { data: AdminOverview }) {
 function Groups({ data, canEdit, onChanged }: { data: AdminOverview; canEdit: boolean; onChanged: () => void }) {
   const [q, setQ] = useState('');
   const [open, setOpen] = useState<string | null>(null);
+  const [showMembers, setShowMembers] = useState<string | null>(null);
   const [busy, setBusy] = useState('');
   const list = useMemo(() => {
     const t = q.trim().toLowerCase();
@@ -114,10 +185,19 @@ function Groups({ data, canEdit, onChanged }: { data: AdminOverview; canEdit: bo
                     <Info k="Excos" v={String(g.excos)} />
                     <Info k="Last meeting" v={g.lastMeeting ? `${g.lastMeeting} · ${g.lastCheckins} in` : '—'} />
                     <Info k="Missing photos" v={String(g.noPhoto)} />
+                    <Info k="Alerts on" v={`${g.alertsOn}/${g.members}`} />
+                    <Info k="Thumbprinted (last)" v={g.lastMeeting ? `${g.lastDone}/${g.lastCheckins}` : '—'} />
                     <Info k="Paid online" v={naira(g.onlineKobo)} />
                     <Info k="Cash recorded" v={naira(g.cashKobo)} />
                     <Info k="Your earnings" v={naira(g.earnedKobo)} />
                   </div>
+                  {showMembers === g.id ? (
+                    <GroupMembers group={g} />
+                  ) : (
+                    <Button variant="light" onClick={() => setShowMembers(g.id)}>
+                      <Icon name="users" /> View members ({g.members + g.pending})
+                    </Button>
+                  )}
                   {canEdit && (
                     <Button variant={g.paused ? 'primary' : 'outline'} loading={busy === g.id} onClick={() => pause(g)}>
                       {g.paused ? 'Resume this group' : 'Pause this group'}
@@ -129,6 +209,116 @@ function Groups({ data, canEdit, onChanged }: { data: AdminOverview; canEdit: bo
           </AnimatePresence>
         </div>
       ))}
+    </div>
+  );
+}
+
+/** Everyone in one group, with search, filters and an Excel download. */
+function GroupMembers({ group }: { group: AdminGroupRow }) {
+  const [rows, setRows] = useState<AdminMemberRow[] | null>(null);
+  const [error, setError] = useState('');
+  const [q, setQ] = useState('');
+  const [show, setShow] = useState<'all' | 'approved' | 'pending' | 'excos' | 'noAlerts'>('all');
+
+  useEffect(() => {
+    let live = true;
+    api
+      .adminGroupMembers({ gid: group.id })
+      .then((r) => live && setRows(r.members))
+      .catch((e) => live && setError(errorText(e)));
+    return () => {
+      live = false;
+    };
+  }, [group.id]);
+
+  const list = useMemo(() => {
+    const t = q.trim().toLowerCase().replace(/[\s/-]/g, '');
+    return (rows ?? [])
+      .filter((m) =>
+        show === 'all'
+          ? true
+          : show === 'approved'
+            ? m.status === 'approved'
+            : show === 'pending'
+              ? m.status === 'pending'
+              : show === 'excos'
+                ? m.role === 'exco'
+                : m.status === 'approved' && !m.alertsOn,
+      )
+      .filter((m) => !t || m.fullName.toLowerCase().replace(/\s/g, '').includes(t) || m.stateCode.toLowerCase().replace(/[\s/-]/g, '').includes(t));
+  }, [rows, q, show]);
+
+  if (error) return <p className="text-sm text-bad">{error}</p>;
+  if (!rows) return <div className="h-24 animate-pulse rounded-2xl bg-line" />;
+
+  const chips: { id: typeof show; label: string }[] = [
+    { id: 'all', label: `All ${rows.length}` },
+    { id: 'approved', label: 'Approved' },
+    { id: 'pending', label: 'Waiting' },
+    { id: 'excos', label: 'Excos' },
+    { id: 'noAlerts', label: 'Alerts off' },
+  ];
+
+  return (
+    <div className="space-y-3">
+      <div className="flex gap-2">
+        <input className="input flex-1" placeholder="Search name or state code" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search members" />
+        <button
+          aria-label="Download for Excel"
+          onClick={() =>
+            downloadSheet(
+              `members-${slug(group.name)}`,
+              ['Full name', 'State code', 'Batch', 'Phone', 'Role', 'Status', 'Alerts on', 'Photo', 'Other CDS groups', 'Joined'],
+              list.map((m) => [
+                m.fullName,
+                m.stateCode,
+                m.stateCode.split('/')[1] ?? '',
+                m.phone,
+                m.role === 'exco' ? 'Exco' : 'Member',
+                m.status,
+                m.alertsOn ? 'Yes' : 'No',
+                m.photoURL ? 'Yes' : 'No',
+                m.otherGroups,
+                m.joinedAt ? new Date(m.joinedAt).toLocaleDateString('en-NG') : '',
+              ]),
+            )
+          }
+          className="grid h-14 w-14 place-items-center rounded-2xl bg-green-light text-lg font-extrabold text-green"
+        >
+          ⬇
+        </button>
+      </div>
+      <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
+        {chips.map((c) => (
+          <button
+            key={c.id}
+            onClick={() => setShow(c.id)}
+            className={`h-9 shrink-0 rounded-full px-3 text-xs font-bold ${show === c.id ? 'bg-green text-white' : 'bg-paper text-ink'}`}
+          >
+            {c.label}
+          </button>
+        ))}
+      </div>
+      <p className="text-xs text-muted">{list.length} shown</p>
+      <ul className="max-h-[28rem] divide-y divide-line overflow-y-auto rounded-2xl bg-paper">
+        {list.map((m) => (
+          <li key={m.uid} className="flex items-center gap-3 px-3 py-2.5">
+            <Avatar src={m.photoURL} name={m.fullName} size={40} />
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-bold">{m.fullName}</p>
+              <p className="truncate text-xs text-muted">
+                {m.stateCode} · {m.phone || 'no phone'}
+                {m.otherGroups ? ` · +${m.otherGroups} other CDS` : ''}
+              </p>
+            </div>
+            <div className="flex shrink-0 flex-col items-end gap-1">
+              {m.role === 'exco' ? <Pill tone="gold">Exco</Pill> : m.status === 'pending' ? <Pill tone="warn">Waiting</Pill> : m.status === 'rejected' ? <Pill tone="bad">Rejected</Pill> : null}
+              <span className={`text-[11px] font-bold ${m.alertsOn ? 'text-green' : 'text-muted'}`}>{m.alertsOn ? '🔔 Alerts on' : '🔕 Alerts off'}</span>
+            </div>
+          </li>
+        ))}
+        {list.length === 0 && <li className="px-3 py-4 text-center text-sm text-muted">Nobody matches.</li>}
+      </ul>
     </div>
   );
 }

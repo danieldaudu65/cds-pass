@@ -98,6 +98,8 @@ export interface Attendee {
   method: 'self' | 'offline' | 'card' | 'manual';
   checkedInAt?: Timestamp;
   doneAt?: Timestamp;
+  doneBy?: string;
+  doneByName?: string;
   fullName: string;
   stateCode: string;
   photoURL: string | null;
@@ -133,4 +135,20 @@ export interface LogEntry {
   target?: string;
   stateCode?: string;
   [k: string]: unknown;
+}
+
+/** One person's place in one CDS group (people can be in several, e.g. their CDS + General CDS). */
+export interface Membership {
+  id?: string;
+  gid: string;
+  uid: string;
+  groupName: string;
+  fullName: string;
+  stateCode: string;
+  phone: string | null;
+  photoURL: string | null;
+  role: Role;
+  status: MemberStatus;
+  createdAt?: Timestamp;
+  approvedAt?: Timestamp;
 }

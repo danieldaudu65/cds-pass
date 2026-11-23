@@ -2,7 +2,7 @@ rules_version = '2';
 
 // CDS Pass security rules.
 // Everything that matters (numbers, turns, approvals, check-ins) is written
-// ONLY by Cloud Functions. Phones can read what they are allowed to see,
+// ONLY by the API server (Render). Phones can read what they are allowed to see,
 // and can only change their own phone number, photo and notification tokens.
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -33,6 +33,23 @@ service cloud.firestore {
              .hasOnly(['phone', 'photoURL', 'fcmTokens', 'updatedAt']);
 
       allow create, delete: if false;
+    }
+
+    // Who is in which CDS group (people can be in several, e.g. their CDS + General CDS).
+    // You can see your own memberships; excos can see the members of their current group.
+    // Only the API server writes.
+    match /memberships/{id} {
+      allow read: if signedIn()
+        && (resource.data.uid == request.auth.uid || isExco(resource.data.gid));
+      allow write: if false;
+    }
+
+    // Platform settings and stats: server only.
+    match /platform/{doc=**} {
+      allow read, write: if false;
+    }
+    match /platformStats/{doc} {
+      allow read, write: if false;
     }
 
     // Main-exco state-code reservations are written and consumed only by the API server.

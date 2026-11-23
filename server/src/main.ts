@@ -131,5 +131,7 @@ app.post('/api/:name', async (req: Request, res: Response) => {
 const port = Number(process.env.PORT ?? 8787);
 app.listen(port, () => {
   console.log(`CDS Pass API listening on :${port}`);
+  // One-time move to "multiple CDS per member" (does nothing after the first successful run).
+  handlers.migrateMemberships().catch((e) => console.error('[migrate] memberships failed', e));
   console.log(`Allowed websites: ${origins.join(', ')}`);
 });

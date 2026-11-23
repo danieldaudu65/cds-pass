@@ -10,6 +10,8 @@ import { api } from '../../lib/api';
 import { errorText } from '../../lib/firebase';
 import { batchLabel, tagLabel } from '../../lib/rules';
 import { toast } from '../../lib/toast';
+import { downloadSheet, slug, time } from '../../lib/exportSheet';
+import { CdsStats } from './CdsStats';
 
 export default function Dashboard() {
   const { me, group, session, attendees, stats, open } = useExcoDay();
@@ -124,6 +126,8 @@ export default function Dashboard() {
           <span className="text-green">→</span>
         </Link>
 
+        <CdsStats />
+
         {!open && pendingCount > 0 && (
           <Link to="/exco/members" className="card flex items-center justify-between !p-4">
             <span className="font-bold">{pendingCount} new members waiting for approval</span>
@@ -134,10 +138,36 @@ export default function Dashboard() {
         {attendees && attendees.length > 0 && (
           <div className="card !p-0">
             <div className="flex items-center justify-between px-5 pb-2 pt-4">
-              <p className="font-bold">Register</p>
-              <p className="text-xs text-muted">
-                {stats.priority} priority · {stats.manual} manual
-              </p>
+              <div>
+                <p className="font-bold">Register</p>
+                <p className="text-xs text-muted">
+                  {stats.priority} priority · {stats.manual} manual · {attendees.filter((a) => a.status === 'done').length} thumbprinted
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  const sorted = [...attendees].sort((a, b) => Number(b.priority) - Number(a.priority) || a.number - b.number);
+                  downloadSheet(
+                    `register-${slug(group?.name ?? 'cds')}-${new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Lagos' })}`,
+                    ['No.', 'Full name', 'State code', 'Time in', 'How', 'Priority', 'Thumbprinted', 'Time done', 'Marked done by'],
+                    sorted.map((a) => [
+                      tagLabel(a),
+                      a.fullName,
+                      a.stateCode,
+                      time(a.checkedInAt),
+                      a.method === 'manual' ? 'Given by main exco' : a.method === 'card' ? 'Printed card' : a.method === 'offline' ? 'Scan (offline)' : 'Scan',
+                      a.priority ? 'Yes' : '',
+                      a.status === 'done' ? 'Yes' : 'No',
+                      time(a.doneAt),
+                      a.doneByName ?? '',
+                    ]),
+                  );
+                  toast('Register downloaded', 'success', 'Open it in Excel or Google Sheets.');
+                }}
+                className="flex h-10 items-center gap-1.5 rounded-xl bg-green-light px-3 text-sm font-bold text-green"
+              >
+                ⬇ Excel
+              </button>
             </div>
             <ul className="divide-y divide-line">
               {attendees.map((a) => (

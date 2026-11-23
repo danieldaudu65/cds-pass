@@ -26,6 +26,8 @@ export function TrendChart({
   kind = 'line',
   format = (n) => n.toLocaleString('en-NG'),
   total,
+  label = shortDay,
+  note,
 }: {
   title: string;
   days: string[];
@@ -33,6 +35,9 @@ export function TrendChart({
   kind?: 'line' | 'bar';
   format?: (n: number) => string;
   total?: string;
+  /** How to show an x position (default: "21 Nov"). */
+  label?: (key: string) => string;
+  note?: string;
 }) {
   const [hover, setHover] = useState<number | null>(null);
   const max = useMemo(() => niceMax(Math.max(0, ...values)), [values]);
@@ -85,7 +90,7 @@ export function TrendChart({
           {/* x labels: first, middle, last */}
           {[0, Math.floor((n - 1) / 2), n - 1].map((i) => (
             <text key={i} x={kind === 'bar' ? barX(i) + barW / 2 : x(i)} y={H - 6} textAnchor="middle" fontSize={9} fill="rgb(var(--muted))">
-              {shortDay(days[i])}
+              {label(days[i])}
             </text>
           ))}
 
@@ -124,10 +129,37 @@ export function TrendChart({
             className="pointer-events-none absolute top-0 -translate-x-1/2 rounded-xl bg-ink px-2.5 py-1.5 text-xs font-semibold text-paper shadow-lift"
             style={{ left: `${Math.min(88, Math.max(12, (hx / W) * 100))}%` }}
           >
-            {shortDay(days[hover])}: <b>{format(values[hover])}</b>
+            {label(days[hover])}: <b>{format(values[hover])}</b>
           </div>
         )}
       </div>
+      {note && <p className="mt-1 text-xs text-muted">{note}</p>}
     </figure>
+  );
+}
+
+/** Horizontal bars with labels: for small lists like batches or dues progress. */
+export function BarList({ title, rows, format = (n) => String(n) }: { title: string; rows: { label: string; value: number; max?: number; hint?: string }[]; format?: (n: number) => string }) {
+  const top = Math.max(1, ...rows.map((r) => r.max ?? r.value));
+  return (
+    <div className="card space-y-3 !p-4">
+      <p className="text-sm font-bold">{title}</p>
+      {rows.length === 0 && <p className="text-sm text-muted">Nothing yet.</p>}
+      {rows.map((r) => {
+        const of = r.max ?? top;
+        return (
+          <div key={r.label}>
+            <div className="flex items-baseline justify-between gap-2 text-sm">
+              <span className="truncate font-semibold">{r.label}</span>
+              <span className="shrink-0 font-bold">{format(r.value)}{r.max !== undefined ? ` / ${format(r.max)}` : ''}</span>
+            </div>
+            <div className="mt-1 h-2.5 overflow-hidden rounded-full bg-line">
+              <div className="h-full rounded-full" style={{ width: `${Math.min(100, (r.value / Math.max(1, of)) * 100)}%`, background: 'rgb(var(--green-text))' }} />
+            </div>
+            {r.hint && <p className="mt-0.5 text-xs text-muted">{r.hint}</p>}
+          </div>
+        );
+      })}
+    </div>
   );
 }

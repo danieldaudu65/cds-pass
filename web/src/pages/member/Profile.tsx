@@ -1,11 +1,12 @@
-import { doc, serverTimestamp, updateDoc } from 'firebase/firestore';
 import { useEffect, useState } from 'react';
 import { PhotoPicker } from '../../components/PhotoPicker';
 import { ThemeToggle } from '../../components/ThemeToggle';
 import { Button, ErrorBox, Field, Icon, Page, Pill, TopBar } from '../../components/ui';
 import { useAuth, useMe } from '../../hooks/useAuth';
 import { useGroup } from '../../hooks/useLive';
-import { db, errorText } from '../../lib/firebase';
+import { api } from '../../lib/api';
+import { errorText } from '../../lib/firebase';
+import { MyGroups } from '../../components/MyGroups';
 import { enableNotifications, pushState, type PushState } from '../../lib/messaging';
 import { normalizePhone } from '../../lib/rules';
 import { toast } from '../../lib/toast';
@@ -45,9 +46,10 @@ export default function Profile() {
     if (!p) return setError('Enter a valid Nigerian phone number.');
     setBusy('save');
     try {
-      const patch: Record<string, unknown> = { phone: p, updatedAt: serverTimestamp() };
+      // Saved through the server so every CDS group you're in shows the new phone/photo.
+      const patch: { phone: string; photoURL?: string } = { phone: p };
       if (photo) patch.photoURL = await uploadAvatar(me.uid, photo);
-      await updateDoc(doc(db, 'users', me.uid), patch);
+      await api.updateMyProfile(patch);
       setPhoto(null);
       toast('Profile saved', 'success');
     } catch (e) {
@@ -109,6 +111,8 @@ export default function Profile() {
             </Button>
           )}
         </div>
+
+        <MyGroups />
 
         <div className="card">
           <ThemeToggle />

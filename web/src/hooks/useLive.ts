@@ -11,7 +11,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { db } from '../lib/firebase';
 import { api } from '../lib/api';
 import { lagosDate } from '../lib/rules';
-import type { Attendee, Dues, DuesStatus, Group, LogEntry, Payment, Profile, Session } from '../lib/types';
+import type { Attendee, Dues, DuesStatus, Group, LogEntry, Membership, Payment, Profile, Session } from '../lib/types';
 
 /** Live document. undefined = loading, null = does not exist. */
 export function useDoc<T>(path: string | null): T | null | undefined {
@@ -90,19 +90,39 @@ export function useAttendees(gid: string | undefined) {
   );
 }
 
+/**
+ * Everyone in a CDS group. Comes from `memberships` (people can be in several groups), shaped like a
+ * Profile so the screens don't care: role/status are THIS group's, groupId is this group.
+ */
 export function useGroupMembers(gid: string | undefined) {
-  const q = useMemo(() => (gid ? query(collection(db, 'users'), where('groupId', '==', gid)) : null), [gid]);
-  const list = useList<Profile>(q, `members:${gid}`);
-  return useMemo(() => list?.slice().sort((a, b) => a.fullName.localeCompare(b.fullName)), [list]);
+  const q = useMemo(() => (gid ? query(collection(db, 'memberships'), where('gid', '==', gid)) : null), [gid]);
+  const list = useList<Membership>(q, `members:${gid}`);
+  return useMemo(() => list?.map(toProfile).sort((a, b) => a.fullName.localeCompare(b.fullName)), [list]);
+}
+
+const toProfile = (m: Membership): Profile =>
+  ({
+    ...m,
+    uid: m.uid,
+    groupId: m.gid,
+    phone: m.phone ?? '',
+    photoURL: m.photoURL ?? null,
+    fcmTokens: [],
+  }) as unknown as Profile;
+
+/** All the CDS groups I'm in (for the switcher). */
+export function useMyMemberships(uid: string | undefined) {
+  const q = useMemo(() => (uid ? query(collection(db, 'memberships'), where('uid', '==', uid)) : null), [uid]);
+  return useList<Membership>(q, `my-memberships:${uid}`);
 }
 
 /** Only the members waiting for approval: far fewer reads than loading the whole group. */
 export function usePendingMembers(gid: string | undefined) {
   const q = useMemo(
-    () => (gid ? query(collection(db, 'users'), where('groupId', '==', gid), where('status', '==', 'pending')) : null),
+    () => (gid ? query(collection(db, 'memberships'), where('gid', '==', gid), where('status', '==', 'pending')) : null),
     [gid],
   );
-  return useList<Profile>(q, `pending:${gid}`);
+  return useList<Membership>(q, `pending:${gid}`);
 }
 
 export function useLogs(gid: string | undefined, max = 50) {

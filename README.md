@@ -132,6 +132,19 @@ Upload the contents of `web/dist` to the site's document root. Keep SPA rewrites
   `https://<render-app>.onrender.com/cron/reminders?key=<CRON_SECRET>` at **07:00** and **18:00** (Africa/Lagos).
   Each reminder is sent once, so extra calls are harmless.
 
+## Several CDS groups per member (e.g. General CDS)
+- A member can be in up to 5 CDS groups. In **Profile → My CDS groups** they tap **+ Add another CDS**, enter that
+  group's 6-character code, and that group's excos approve them. They **Switch** between groups; the app (door,
+  dues, tag, exco powers) always follows the group they're using. Pushes from every group still arrive.
+- Data: `memberships/{gid}_{uid}` (gid, uid, groupName, role, status, name, state code, phone, photo) is the source of
+  truth. `users/{uid}` keeps the profile and the *active* group; login claims match the active group.
+- Existing accounts are moved over automatically the first time the new server starts (`migrateMemberships`).
+- **Deploy the new rules** (`firebase deploy --only firestore:rules --project cds-pass`), or exco member lists stay empty.
+
+## Exports
+Excel/Sheets downloads (CSV) for excos: today's register (with who was thumbprinted and when), members list (current
+tab and filters) and each dues list. Built from data already on the phone.
+
 ## Main exco tools
 - **Send a message** (Exco → Settings or Dashboard): custom push to everyone, people who haven't paid, people waiting
   for approval, or excos only. Templates included. Max 5 a day per CDS group.

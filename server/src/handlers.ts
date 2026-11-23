@@ -132,6 +132,87 @@ function signedIn(req: CallableRequest): { uid: string; claims: Claims } {
   return { uid: req.auth.uid, claims: req.auth.token as Claims };
 }
 
+/* ---------------------------------------------------------------------------------------------
+ * MULTIPLE CDS GROUPS
+ * memberships/{gid}_{uid} is the source of truth for "who is in which CDS, with which role/status".
+ * users/{uid} holds the person's profile plus their ACTIVE group (groupId/role/status), and the login
+ * claims {gid, role, approved} always match the active group. Switching CDS = switchGroup().
+ * Older accounts get their membership created automatically (getMembership / migrateMemberships).
+ * ------------------------------------------------------------------------------------------- */
+
+const membershipRef = (gid: string, uid: string) => db.doc(`memberships/${gid}_${uid}`);
+
+function membershipData(gid: string, uid: string, u: FirebaseFirestore.DocumentData, groupName: string, extra: Record<string, unknown> = {}) {
+  return {
+    gid,
+    uid,
+    groupName,
+    fullName: u.fullName,
+    stateCode: u.stateCode,
+    phone: u.phone ?? null,
+    photoURL: u.photoURL ?? null,
+    role: u.role ?? 'member',
+    status: u.status ?? 'pending',
+    createdAt: u.createdAt ?? FieldValue.serverTimestamp(),
+    ...(u.approvedAt ? { approvedAt: u.approvedAt, approvedBy: u.approvedBy ?? null } : {}),
+    ...extra,
+  };
+}
+
+/** A person's membership in a group (created on the fly for accounts from before multiple CDS). */
+async function getMembership(gid: string, uid: string): Promise<FirebaseFirestore.DocumentData | null> {
+  const m = await membershipRef(gid, uid).get();
+  if (m.exists) return m.data()!;
+  const u = (await userRef(uid).get()).data();
+  if (!u || u.groupId !== gid) return null;
+  const g = (await groupRef(gid).get()).data();
+  const data = membershipData(gid, uid, u, (g?.name as string) ?? '');
+  await membershipRef(gid, uid).set(data);
+  return data;
+}
+
+/** Everyone in a group (any status). */
+async function groupMembers(gid: string) {
+  const snap = await db.collection('memberships').where('gid', '==', gid).get();
+  return snap.docs.map((d) => d.data() as FirebaseFirestore.DocumentData & { uid: string });
+}
+
+/**
+ * Change someone's role/status in one group. If that group is the one they are currently using,
+ * their profile and login permissions are updated too.
+ */
+async function updateMembership(gid: string, uid: string, patch: Record<string, unknown>) {
+  await membershipRef(gid, uid).set(patch, { merge: true });
+  const u = (await userRef(uid).get()).data();
+  if (u?.groupId === gid) {
+    await userRef(uid).update(patch);
+    const m = (await membershipRef(gid, uid).get()).data()!;
+    await auth.setCustomUserClaims(uid, { gid, role: m.role, approved: m.status === 'approved' });
+  }
+}
+
+/** One-time: create memberships for every account made before multiple CDS. Runs at server start. */
+export async function migrateMemberships() {
+  const flag = db.doc('platform/migrations');
+  if ((await flag.get()).data()?.membershipsV1) return;
+  const [users, groups] = await Promise.all([db.collection('users').get(), db.collection('groups').get()]);
+  const names = new Map<string, string>(groups.docs.map((g): [string, string] => [g.id, String(g.data().name ?? '')]));
+  let batch = db.batch();
+  let n = 0;
+  for (const u of users.docs) {
+    const d = u.data();
+    if (!d.groupId) continue;
+    batch.set(membershipRef(d.groupId, u.id), membershipData(d.groupId, u.id, d, names.get(d.groupId) ?? ''), { merge: true });
+    if (++n % 400 === 0) {
+      await batch.commit();
+      batch = db.batch();
+    }
+  }
+  await batch.commit();
+  await flag.set({ membershipsV1: true, membershipsMigratedAt: FieldValue.serverTimestamp(), count: n }, { merge: true });
+  console.log(`[migrate] created/updated ${n} memberships`);
+}
+
 function approvedMember(req: CallableRequest) {
   const { uid, claims } = signedIn(req);
   if (!claims.gid || !claims.approved) {
@@ -143,12 +224,11 @@ function approvedMember(req: CallableRequest) {
 /** Exco check reads the live profile too, so a removed exco loses power immediately. */
 async function exco(req: CallableRequest) {
   const { uid, gid } = approvedMember(req);
-  const snap = await userRef(uid).get();
-  const u = snap.data();
-  if (!u || u.role !== 'exco' || u.status !== 'approved' || u.groupId !== gid) {
+  const m = await getMembership(gid, uid);
+  if (!m || m.role !== 'exco' || m.status !== 'approved') {
     throw fail('permission-denied', 'Only excos of this CDS group can do this.');
   }
-  return { uid, gid, name: u.fullName as string };
+  return { uid, gid, name: m.fullName as string };
 }
 
 /** The group creator is the main exco and owns role assignments and dues creation. */
@@ -247,10 +327,11 @@ async function findMember(gid: string, data: any) {
     }
   }
   if (!uid) throw fail('invalid-argument', 'Scan a tag or enter a state code.');
-  const snap = await userRef(uid).get();
+  const [m, snap] = await Promise.all([getMembership(gid, uid), userRef(uid).get()]);
   const u = snap.data();
-  if (!u || u.groupId !== gid) throw fail('not-found', 'This person is not in your CDS group.');
-  return { uid, user: u };
+  if (!m || !u) throw fail('not-found', 'This person is not in your CDS group.');
+  // Profile details + this group's role/status.
+  return { uid, user: { ...u, role: m.role, status: m.status } as FirebaseFirestore.DocumentData };
 }
 
 function publicMember(uid: string, u: FirebaseFirestore.DocumentData) {
@@ -295,7 +376,7 @@ async function admit(
   by: string,
   atMs: number,
 ) {
-  const u = (await userRef(uid).get()).data();
+  const u = await getMembership(gid, uid);
   if (!u || u.status !== 'approved') throw fail('failed-precondition', 'This member is not approved yet.');
   // Already in today's queue? Then they keep their number, paid or not.
   const existing = await attendeeRef(gid, sid, uid).get();
@@ -374,13 +455,28 @@ async function notify(uids: string[], title: string, body: string, link = '/tag'
     // Notifications must never break check-in or batch calling.
     console.error('notify failed', err);
   }
+  // Daily push statistics for Admin mode (1 small write per send; never blocks the caller).
+  try {
+    const withAlerts = new Set(owner.values()).size;
+    await db.doc(`platformStats/${lagosDate()}`).set(
+      {
+        pushPeople: FieldValue.increment(uids.length),
+        pushReachable: FieldValue.increment(withAlerts),
+        pushDelivered: FieldValue.increment(sent),
+        pushFailed: FieldValue.increment(Math.max(0, tokens.length - sent)),
+        kinds: { [kind]: FieldValue.increment(1) },
+      },
+      { merge: true },
+    );
+  } catch (err) {
+    console.error('push stats failed', err);
+  }
   return sent;
 }
 
 /** Broadcast an event to every approved member of a CDS group. */
 async function notifyApprovedGroup(gid: string, title: string, body: string, link = '/home') {
-  const users = await db.collection('users').where('groupId', '==', gid).get();
-  const recipients = users.docs.filter((d) => d.data().status === 'approved').map((d) => d.id);
+  const recipients = (await groupMembers(gid)).filter((m) => m.status === 'approved').map((m) => m.uid);
   const sent = await notify(recipients, title, body, link, 'group-event');
   return { sent, members: recipients.length };
 }
@@ -423,7 +519,7 @@ export const registerMember = onCall(async (req: CallableRequest) => {
     }
     const role: Role = isMainExco ? 'exco' : 'member';
     const status = isMainExco ? 'approved' : 'pending';
-    tx.set(userRef(uid), {
+    const userDoc = {
       ...p,
       groupId: gid,
       role,
@@ -431,16 +527,18 @@ export const registerMember = onCall(async (req: CallableRequest) => {
       fcmTokens: [],
       createdAt: FieldValue.serverTimestamp(),
       ...(isMainExco ? { approvedAt: FieldValue.serverTimestamp(), approvedBy: groupData.createdBy } : {}),
-    });
+    };
+    tx.set(userRef(uid), userDoc);
+    tx.set(membershipRef(gid, uid), membershipData(gid, uid, userDoc, groupName));
   });
   const role: Role = isMainExco ? 'exco' : 'member';
   const status = isMainExco ? 'approved' : 'pending';
   await auth.setCustomUserClaims(uid, { gid, role, approved: isMainExco });
   await log(gid, uid, 'member_registered', { target: uid, stateCode: p.stateCode });
   if (!isMainExco) {
-    const excos = await db.collection('users').where('groupId', '==', gid).get();
+    const excos = (await groupMembers(gid)).filter((m) => m.status === 'approved' && m.role === 'exco');
     await notify(
-      excos.docs.filter((d) => d.data().status === 'approved' && d.data().role === 'exco').map((d) => d.id),
+      excos.map((m) => m.uid),
       'New member needs approval',
       `${p.fullName} (${p.stateCode}) has requested to join your CDS group.`,
       '/exco/members',
@@ -550,7 +648,7 @@ export const registerPlatformAdmin = onCall(async (req: CallableRequest) => {
       createdAt: FieldValue.serverTimestamp(),
     });
     tx.create(keysRef(gRef.id), { doorSecret: randomBytes(32).toString('hex') });
-    tx.create(userRef(uid), {
+    const userDoc = {
       ...p,
       groupId: gRef.id,
       role: 'exco',
@@ -559,7 +657,9 @@ export const registerPlatformAdmin = onCall(async (req: CallableRequest) => {
       createdAt: FieldValue.serverTimestamp(),
       approvedAt: FieldValue.serverTimestamp(),
       approvedBy: uid,
-    });
+    };
+    tx.create(userRef(uid), userDoc);
+    tx.create(membershipRef(gRef.id, uid), membershipData(gRef.id, uid, userDoc, name));
   });
   await auth.setCustomUserClaims(uid, { gid: gRef.id, role: 'exco', approved: true });
   await log(gRef.id, uid, 'group_created', { name });
@@ -567,17 +667,118 @@ export const registerPlatformAdmin = onCall(async (req: CallableRequest) => {
 });
 
 
+/**
+ * An existing CDS Pass member joins ANOTHER CDS group (e.g. General CDS) with its code.
+ * Starts as "pending" for that group's excos to approve (or auto-approved if appointed its main exco).
+ * Their current group doesn't change; they switch between groups with switchGroup.
+ */
+export const joinAnotherGroup = onCall(async (req: CallableRequest) => {
+  const { uid } = signedIn(req);
+  const joinCode = String(req.data?.joinCode ?? '').trim().toUpperCase();
+  if (joinCode.length !== 6) throw fail('invalid-argument', 'Enter the 6-character CDS group code.');
+  const u = (await userRef(uid).get()).data();
+  if (!u) throw fail('failed-precondition', 'Finish signing up first.');
+  const g = await db.collection('groups').where('joinCode', '==', joinCode).limit(1).get();
+  if (g.empty) throw fail('not-found', 'No CDS group with that code. Ask its exco for it.');
+  const gid = g.docs[0].id;
+  const gd = g.docs[0].data();
+  if (await getMembership(gid, uid)) throw fail('already-exists', `You are already in ${gd.name}.`);
+  if ((await db.collection('memberships').where('uid', '==', uid).get()).size >= 5) {
+    throw fail('resource-exhausted', 'You can be in at most 5 CDS groups.');
+  }
+
+  let isMainExco = false;
+  await db.runTransaction(async (tx) => {
+    isMainExco = gd.mainExcoStateCode === u.stateCode && !gd.mainExcoUid;
+    if (isMainExco) {
+      const resRef = mainExcoReservationRef(u.stateCode);
+      const r = await tx.get(resRef);
+      if (!r.exists || r.data()!.groupId !== gid || (r.data()!.claimedUid && r.data()!.claimedUid !== uid)) isMainExco = false;
+      else {
+        tx.update(groupRef(gid), { mainExcoUid: uid, mainExcoClaimedAt: FieldValue.serverTimestamp() });
+        tx.update(resRef, { claimedUid: uid, claimedAt: FieldValue.serverTimestamp() });
+      }
+    }
+    tx.set(
+      membershipRef(gid, uid),
+      membershipData(gid, uid, { ...u, role: isMainExco ? 'exco' : 'member', status: isMainExco ? 'approved' : 'pending', createdAt: null, approvedAt: null }, gd.name, {
+        createdAt: FieldValue.serverTimestamp(),
+        ...(isMainExco ? { approvedAt: FieldValue.serverTimestamp(), approvedBy: gd.createdBy ?? null } : {}),
+      }),
+    );
+  });
+  await log(gid, uid, 'member_registered', { target: uid, stateCode: u.stateCode, label: 'joined as an extra CDS' });
+  if (!isMainExco) {
+    const excos = (await groupMembers(gid)).filter((m) => m.status === 'approved' && m.role === 'exco');
+    await notify(
+      excos.map((m) => m.uid),
+      'New member needs approval',
+      `${u.fullName} (${u.stateCode}) has asked to join ${gd.name}.`,
+      '/exco/members',
+      'member-request',
+    );
+  }
+  return { ok: true, gid, groupName: gd.name as string, status: isMainExco ? 'approved' : 'pending', role: isMainExco ? 'exco' : 'member' };
+});
+
+/** Switch which CDS group the app is showing (and which one your exco powers apply to). */
+export const switchGroup = onCall(async (req: CallableRequest) => {
+  const { uid } = signedIn(req);
+  const gid = String(req.data?.gid ?? '');
+  const m = await getMembership(gid, uid);
+  if (!m) throw fail('not-found', 'You are not in that CDS group.');
+  if (m.status === 'rejected') throw fail('permission-denied', 'That CDS group did not approve your request.');
+  await userRef(uid).update({ groupId: gid, role: m.role, status: m.status, switchedAt: FieldValue.serverTimestamp() });
+  await auth.setCustomUserClaims(uid, { gid, role: m.role, approved: m.status === 'approved' });
+  return { ok: true, gid, groupName: m.groupName as string, role: m.role as Role, status: m.status as string };
+});
+
+/** Leave an extra CDS group (not the one you are using right now). */
+export const leaveGroup = onCall(async (req: CallableRequest) => {
+  const { uid } = signedIn(req);
+  const gid = String(req.data?.gid ?? '');
+  const u = (await userRef(uid).get()).data();
+  if (u?.groupId === gid) throw fail('failed-precondition', 'Switch to another CDS group first, then leave this one.');
+  const g = (await groupRef(gid).get()).data();
+  if ((g?.mainExcoUid ?? g?.createdBy) === uid) throw fail('failed-precondition', 'The main exco cannot leave their own CDS group.');
+  await membershipRef(gid, uid).delete();
+  await log(gid, uid, 'member_left', { target: uid, stateCode: u?.stateCode });
+  return { ok: true };
+});
+
+/** Update your own phone / photo everywhere (profile + every CDS group you're in). */
+export const updateMyProfile = onCall(async (req: CallableRequest) => {
+  const { uid } = signedIn(req);
+  const patch: Record<string, unknown> = {};
+  if (req.data?.phone !== undefined) {
+    const phone = normalizePhone(req.data.phone);
+    if (!phone) throw fail('invalid-argument', 'Enter a valid Nigerian phone number.');
+    patch.phone = phone;
+  }
+  if (req.data?.photoURL !== undefined) {
+    const url = req.data.photoURL;
+    if (typeof url !== 'string' || !/^https:\/\//.test(url) || url.length > 2000) throw fail('invalid-argument', 'That photo link is not valid.');
+    patch.photoURL = url;
+  }
+  if (!Object.keys(patch).length) throw fail('invalid-argument', 'Nothing to change.');
+  const mine = await db.collection('memberships').where('uid', '==', uid).get();
+  const batch = db.batch();
+  batch.update(userRef(uid), { ...patch, updatedAt: FieldValue.serverTimestamp() });
+  mine.docs.forEach((d) => batch.update(d.ref, patch));
+  await batch.commit();
+  return { ok: true };
+});
+
 /** Exco approves (after checking the NYSC ID card) or rejects a pending member. */
 export const approveMember = onCall(async (req: CallableRequest) => {
   const e = await exco(req);
   const { uid, user } = await findMember(e.gid, req.data);
   const approve = req.data?.approve !== false;
-  await userRef(uid).update({
+  await updateMembership(e.gid, uid, {
     status: approve ? 'approved' : 'rejected',
     approvedBy: e.uid,
     approvedAt: FieldValue.serverTimestamp(),
   });
-  await auth.setCustomUserClaims(uid, { gid: e.gid, role: user.role, approved: approve });
   await log(e.gid, e.uid, approve ? 'member_approved' : 'member_rejected', {
     target: uid,
     stateCode: user.stateCode,
@@ -602,8 +803,7 @@ export const setRole = onCall(async (req: CallableRequest) => {
     throw fail('failed-precondition', 'The main exco who created this CDS group cannot be demoted.');
   }
   if (user.status !== 'approved') throw fail('failed-precondition', 'Approve this member first.');
-  await userRef(uid).update({ role });
-  await auth.setCustomUserClaims(uid, { gid: e.gid, role, approved: true });
+  await updateMembership(e.gid, uid, { role });
   await log(e.gid, e.uid, 'role_changed', { target: uid, role });
   await notify(
     [uid],
@@ -891,11 +1091,10 @@ export const callNext = onCall(async (req: CallableRequest) => {
 /** Main exco only: sends a test push to every approved member of the group who has alerts turned on. */
 export const testNotification = onCall(async (req: CallableRequest) => {
   const e = await mainExco(req);
-  const members = await db.collection('users').where('groupId', '==', e.gid).get();
-  const targets = members.docs
-    .filter((d) => d.data().status === 'approved' && Array.isArray(d.data().fcmTokens) && d.data().fcmTokens.length > 0)
-    .map((d) => d.id);
-  const registered = members.docs.filter((d) => d.data().status === 'approved').length;
+  const approvedUids = (await groupMembers(e.gid)).filter((m) => m.status === 'approved').map((m) => m.uid);
+  const profiles = approvedUids.length ? await db.getAll(...approvedUids.map((u) => userRef(u))) : [];
+  const targets = profiles.filter((d) => Array.isArray(d.data()?.fcmTokens) && d.data()!.fcmTokens.length > 0).map((d) => d.id);
+  const registered = approvedUids.length;
   if (!targets.length) return { sent: 0, registered: 0, members: registered };
   const sent = await notify(
     targets,
@@ -930,17 +1129,17 @@ export const sendGroupMessage = onCall(async (req: CallableRequest) => {
     throw fail('resource-exhausted', `You can send ${MESSAGES_PER_DAY} messages a day. Try again tomorrow.`);
   }
 
-  const members = await db.collection('users').where('groupId', '==', e.gid).get();
-  let targets = members.docs.filter((d) => (audience === 'pending' ? d.data().status === 'pending' : d.data().status === 'approved'));
-  if (audience === 'excos') targets = targets.filter((d) => d.data().role === 'exco');
+  const all = await groupMembers(e.gid);
+  let targets = all.filter((m) => (audience === 'pending' ? m.status === 'pending' : m.status === 'approved'));
+  if (audience === 'excos') targets = targets.filter((m) => m.role === 'exco');
   if (audience === 'unpaid') {
     const open = await db.collection(`groups/${e.gid}/dues`).where('active', '==', true).get();
     if (open.empty) throw fail('failed-precondition', 'There are no open dues, so nobody is "not paid".');
     const owing = new Set<string>();
     for (const d of open.docs) (await owingMembers(e.gid, d.id)).forEach((u) => owing.add(u));
-    targets = targets.filter((d) => owing.has(d.id));
+    targets = targets.filter((m) => owing.has(m.uid));
   }
-  const uids = targets.map((d) => d.id);
+  const uids = targets.map((m) => m.uid);
   if (!uids.length) throw fail('failed-precondition', 'Nobody matches that choice right now.');
 
   const sent = await notify(uids, title, body, link, 'message');
@@ -1016,7 +1215,7 @@ export const markDone = onCall(async (req: CallableRequest) => {
     if (!isTurn({ number: att.number, priority: att.priority, status: att.status }, s.data()?.batch)) {
       throw fail('failed-precondition', 'It is not this person’s turn yet.');
     }
-    tx.update(aRef, { status: 'done', doneAt: FieldValue.serverTimestamp(), doneBy: e.uid });
+    tx.update(aRef, { status: 'done', doneAt: FieldValue.serverTimestamp(), doneBy: e.uid, doneByName: e.name });
   });
   await log(e.gid, e.uid, 'thumbprinted', { target: uid, stateCode: user.stateCode });
   return { ok: true };
@@ -1381,12 +1580,9 @@ export const respondCash = onCall(async (req: CallableRequest) => {
 
 /** Approved members of a group who haven't paid these dues. */
 async function owingMembers(gid: string, duesId: string) {
-  const [members, statuses] = await Promise.all([
-    db.collection('users').where('groupId', '==', gid).get(),
-    db.collection(`groups/${gid}/dues/${duesId}/status`).get(),
-  ]);
+  const [members, statuses] = await Promise.all([groupMembers(gid), db.collection(`groups/${gid}/dues/${duesId}/status`).get()]);
   const paid = new Set(statuses.docs.filter((s) => s.data().status === 'paid').map((s) => s.id));
-  return members.docs.filter((m) => m.data().status === 'approved' && !paid.has(m.id)).map((m) => m.id);
+  return members.filter((m) => m.status === 'approved' && !paid.has(m.uid)).map((m) => m.uid);
 }
 
 const prettyDate = (ymd: string) =>
@@ -1535,20 +1731,49 @@ export const adminOverview = onCall(async (req: CallableRequest) => {
   const since = days[0];
   const idx = new Map(days.map((d, i) => [d, i]));
   const signups = new Array(DAYS).fill(0);
+  const approvals = new Array(DAYS).fill(0);
   const checkins = new Array(DAYS).fill(0);
   const paidKobo = new Array(DAYS).fill(0);
   const earnedKobo = new Array(DAYS).fill(0);
 
-  const [groupsSnap, usersSnap] = await Promise.all([db.collection('groups').get(), db.collection('users').get()]);
+  const [groupsSnap, usersSnap, membershipsSnap] = await Promise.all([
+    db.collection('groups').get(),
+    db.collection('users').get(),
+    db.collection('memberships').get(),
+  ]);
+  const memberships = membershipsSnap.docs.map((d) => d.data() as Record<string, any>);
   // Typed loosely on purpose: user docs are plain data here.
   const users: Array<Record<string, any> & { id: string }> = usersSnap.docs.map((d: any) => Object.assign({ id: d.id as string }, d.data()));
+  const batchSplit: Record<string, number> = {};
   for (const u of users) {
     const t = u.createdAt?.toMillis?.();
     if (t) {
       const i = idx.get(lagosDate(t));
       if (i !== undefined) signups[i]++;
     }
+    const a = u.approvedAt?.toMillis?.();
+    if (a) {
+      const i = idx.get(lagosDate(a));
+      if (i !== undefined) approvals[i]++;
+    }
+    if (u.status === 'approved') {
+      const b = String(u.stateCode ?? '').split('/')[1] ?? '?';
+      batchSplit[b] = (batchSplit[b] ?? 0) + 1;
+    }
   }
+  const hasAlerts = (u: Record<string, any>) => Array.isArray(u.fcmTokens) && u.fcmTokens.length > 0;
+
+  // Push statistics per day (written by notify)
+  const statDocs = await db.getAll(...days.map((d) => db.doc(`platformStats/${d}`)));
+  const pushPeople = statDocs.map((d) => Number(d.data()?.pushPeople ?? 0));
+  const pushDelivered = statDocs.map((d) => Number(d.data()?.pushDelivered ?? 0));
+  const pushFailed = statDocs.map((d) => Number(d.data()?.pushFailed ?? 0));
+  const pushKinds: Record<string, number> = {};
+  for (const d of statDocs) for (const [k, v] of Object.entries((d.data()?.kinds ?? {}) as Record<string, number>)) pushKinds[k] = (pushKinds[k] ?? 0) + Number(v);
+
+  const arrivalHours = new Array(24).fill(0);
+  let abandonedPayments = 0;
+  const openDues: { group: string; title: string; paid: number; members: number }[] = [];
 
   const groups: Array<Record<string, any> & { members: number; lastMeeting: string | null }> = [];
   let totalOnlineKobo = 0;
@@ -1556,7 +1781,9 @@ export const adminOverview = onCall(async (req: CallableRequest) => {
   let totalEarnedKobo = 0;
   for (const g of groupsSnap.docs) {
     const gd = g.data();
-    const mine = users.filter((u) => u.groupId === g.id);
+    // Group membership comes from memberships (people can be in several groups); photos/alerts from profiles.
+    const byUid = new Map(users.map((u) => [u.id, u]));
+    const mine: Array<Record<string, any>> = memberships.filter((m) => m.gid === g.id).map((m) => Object.assign({}, byUid.get(m.uid) ?? {}, m));
     const approved = mine.filter((u) => u.status === 'approved');
 
     // Payments (all time, paid)
@@ -1597,6 +1824,25 @@ export const adminOverview = onCall(async (req: CallableRequest) => {
         lastCheckins = c;
       }
     }
+    // Last meeting in detail: who got thumbprinted, and when people arrived.
+    let lastDone = 0;
+    if (lastMeeting) {
+      const att = await db.collection(`groups/${g.id}/sessions/${lastMeeting}/attendees`).get();
+      for (const a of att.docs) {
+        if (a.data().status === 'done') lastDone++;
+        const t = a.data().checkedInAt?.toMillis?.();
+        if (t) arrivalHours[Number(new Date(t).toLocaleString('en-GB', { hour: '2-digit', hour12: false, timeZone: 'Africa/Lagos' })) % 24]++;
+      }
+    }
+    // Online payments started but never finished (older than an hour)
+    const pending = await db.collection(`groups/${g.id}/payments`).where('status', '==', 'pending').get();
+    abandonedPayments += pending.docs.filter((p) => (p.data().createdAt?.toMillis?.() ?? Date.now()) < Date.now() - 3600_000).length;
+    // Open dues: how many have paid
+    const dues = await db.collection(`groups/${g.id}/dues`).where('active', '==', true).get();
+    for (const d of dues.docs) {
+      const paid = (await d.ref.collection('status').where('status', '==', 'paid').count().get()).data().count;
+      openDues.push({ group: gd.name, title: d.data().title, paid, members: approved.length });
+    }
 
     groups.push({
       id: g.id,
@@ -1610,6 +1856,8 @@ export const adminOverview = onCall(async (req: CallableRequest) => {
       pending: mine.filter((u) => u.status === 'pending').length,
       excos: approved.filter((u) => u.role === 'exco').length,
       noPhoto: approved.filter((u) => !u.photoURL).length,
+      alertsOn: approved.filter(hasAlerts).length,
+      lastDone,
       lastMeeting,
       lastCheckins,
       onlineKobo: online,
@@ -1625,14 +1873,26 @@ export const adminOverview = onCall(async (req: CallableRequest) => {
     totals: {
       groups: groups.length,
       activeGroups: groups.filter((g) => g.lastMeeting).length,
-      members: users.filter((u) => u.status === 'approved').length,
-      pending: users.filter((u) => u.status === 'pending').length,
+      members: new Set(memberships.filter((m) => m.status === 'approved').map((m) => m.uid)).size,
+      inSeveralGroups: (() => {
+        const c = new Map<string, number>();
+        memberships.forEach((m) => c.set(m.uid, (c.get(m.uid) ?? 0) + 1));
+        return [...c.values()].filter((n) => n > 1).length;
+      })(),
+      pending: memberships.filter((m) => m.status === 'pending').length,
       onlineKobo: totalOnlineKobo,
       cashKobo: totalCashKobo,
       earnedKobo: totalEarnedKobo,
       checkins30: checkins.reduce((a, b) => a + b, 0),
+      alertsOn: users.filter((u) => u.status === 'approved' && hasAlerts(u)).length,
+      noPhoto: users.filter((u) => u.status === 'approved' && !u.photoURL).length,
+      abandonedPayments,
     },
-    series: { days, signups, checkins, paidKobo, earnedKobo },
+    series: { days, signups, approvals, checkins, paidKobo, earnedKobo, pushPeople, pushDelivered, pushFailed },
+    pushKinds,
+    arrivalHours,
+    batchSplit,
+    openDues,
     groups,
   };
   overviewCache = { at: Date.now(), value };
@@ -1693,11 +1953,11 @@ export const adminBroadcast = onCall(async (req: CallableRequest) => {
   const gids: string[] = Array.isArray(req.data?.gids) ? req.data.gids.map(String).slice(0, 200) : [];
   const link = MESSAGE_LINKS.has(req.data?.link) ? (req.data.link as string) : '/home';
 
-  const users = await db.collection('users').where('status', '==', 'approved').get();
-  const uids = users.docs
-    .filter((u) => !gids.length || gids.includes(u.data().groupId))
-    .filter((u) => audience === 'everyone' || u.data().role === 'exco')
-    .map((u) => u.id);
+  // Memberships decide who is in which group; anyone in several groups gets the message once.
+  const ms = (await db.collection('memberships').where('status', '==', 'approved').get()).docs.map((d) => d.data());
+  const uids: string[] = [
+    ...new Set<string>(ms.filter((m) => (!gids.length || gids.includes(m.gid)) && (audience === 'everyone' || m.role === 'exco')).map((m) => m.uid as string)),
+  ];
   if (!uids.length) throw fail('failed-precondition', 'Nobody matches that choice.');
   const sent = await notify(uids, title, body, link, 'broadcast');
   await db.collection('platform/config/broadcasts').add({
@@ -1726,4 +1986,150 @@ export const adminSetTeamMember = onCall(async (req: CallableRequest) => {
   configCache = null;
   console.log(`[platform] ${me.stateCode} set team ${sc} = ${role}`);
   return { ok: true };
+});
+
+/* ======================================================================================
+ * CDS STATS for excos (Dashboard): the Admin-style charts, but only for their own group.
+ * Cached 5 minutes per group so opening the dashboard doesn't use many database reads.
+ * ====================================================================================== */
+
+const groupStatsCache = new Map<string, { at: number; value: unknown }>();
+
+export const groupStats = onCall(async (req: CallableRequest) => {
+  const e = await exco(req);
+  const hit = groupStatsCache.get(e.gid);
+  if (!req.data?.refresh && hit && Date.now() - hit.at < 5 * 60_000) return hit.value;
+
+  const DAYS = 30;
+  const days: string[] = [];
+  for (let i = DAYS - 1; i >= 0; i--) days.push(lagosDate(Date.now() - i * 86_400_000));
+  const idx = new Map(days.map((d, i) => [d, i]));
+  const joins = new Array(DAYS).fill(0);
+  const approvals = new Array(DAYS).fill(0);
+
+  // Members
+  const members = await groupMembers(e.gid);
+  const approved = members.filter((m) => m.status === 'approved');
+  const batchSplit: Record<string, number> = {};
+  for (const m of members) {
+    const c = m.createdAt?.toMillis?.();
+    if (c) {
+      const i = idx.get(lagosDate(c));
+      if (i !== undefined) joins[i]++;
+    }
+    const a = m.approvedAt?.toMillis?.();
+    if (a) {
+      const i = idx.get(lagosDate(a));
+      if (i !== undefined) approvals[i]++;
+    }
+    if (m.status === 'approved') {
+      const b = String(m.stateCode ?? '').split('/')[1] ?? '?';
+      batchSplit[b] = (batchSplit[b] ?? 0) + 1;
+    }
+  }
+  const profiles = approved.length ? await db.getAll(...approved.map((m) => userRef(m.uid))) : [];
+  const alertsOn = profiles.filter((p) => Array.isArray(p.data()?.fcmTokens) && p.data()!.fcmTokens.length > 0).length;
+
+  // Last 8 meetings: checked in vs thumbprinted (count() = 1 read per 1000 people)
+  const sessions = await db.collection(`groups/${e.gid}/sessions`).orderBy(FieldPath.documentId(), 'desc').limit(8).get();
+  const meetings: { date: string; checkedIn: number; done: number }[] = [];
+  for (const s of sessions.docs) {
+    const col = s.ref.collection('attendees');
+    const [all, done] = await Promise.all([col.count().get(), col.where('status', '==', 'done').count().get()]);
+    meetings.push({ date: s.id, checkedIn: all.data().count, done: done.data().count });
+  }
+  meetings.reverse();
+
+  // Arrival times at the last meeting
+  const arrivalHours = new Array(24).fill(0);
+  if (sessions.docs[0]) {
+    const att = await sessions.docs[0].ref.collection('attendees').get();
+    for (const a of att.docs) {
+      const t = a.data().checkedInAt?.toMillis?.();
+      if (t) arrivalHours[Number(new Date(t).toLocaleString('en-GB', { hour: '2-digit', hour12: false, timeZone: 'Africa/Lagos' })) % 24]++;
+    }
+  }
+
+  // Dues: open dues progress + money collected
+  const openDues: { title: string; paid: number; members: number; dueDate: string | null }[] = [];
+  const dues = await db.collection(`groups/${e.gid}/dues`).where('active', '==', true).get();
+  for (const d of dues.docs) {
+    const paid = (await d.ref.collection('status').where('status', '==', 'paid').count().get()).data().count;
+    openDues.push({ title: d.data().title, paid, members: approved.length, dueDate: d.data().dueDate ?? null });
+  }
+  const pays = await db.collection(`groups/${e.gid}/payments`).where('status', '==', 'paid').get();
+  let onlineKobo = 0;
+  let cashKobo = 0;
+  const paidKobo = new Array(DAYS).fill(0);
+  for (const p of pays.docs) {
+    const d = p.data();
+    if (d.method === 'cash') cashKobo += d.amountKobo ?? 0;
+    else onlineKobo += d.amountKobo ?? 0;
+    const t = d.paidAt?.toMillis?.();
+    if (t) {
+      const i = idx.get(lagosDate(t));
+      if (i !== undefined) paidKobo[i] += d.amountKobo ?? 0;
+    }
+  }
+
+  const value = {
+    generatedAt: Date.now(),
+    totals: {
+      members: approved.length,
+      pending: members.filter((m) => m.status === 'pending').length,
+      excos: approved.filter((m) => m.role === 'exco').length,
+      alertsOn,
+      noPhoto: approved.filter((m) => !m.photoURL).length,
+      onlineKobo,
+      cashKobo,
+    },
+    days,
+    joins,
+    approvals,
+    paidKobo,
+    meetings,
+    arrivalHours,
+    batchSplit,
+    openDues,
+  };
+  groupStatsCache.set(e.gid, { at: Date.now(), value });
+  return value;
+});
+
+/**
+ * Admin mode: everyone in one CDS group, with details. Phone numbers are shown to the owner and
+ * admins only; viewers (e.g. a partner) see them masked.
+ */
+export const adminGroupMembers = onCall(async (req: CallableRequest) => {
+  const me = await platformMember(req, 'viewer');
+  const gid = String(req.data?.gid ?? '');
+  if (!(await groupRef(gid).get()).exists) throw fail('not-found', 'Group not found.');
+  const members = await groupMembers(gid);
+  const profiles = members.length ? await db.getAll(...members.map((m) => userRef(m.uid))) : [];
+  const alerts = new Map(profiles.map((p) => [p.id, Array.isArray(p.data()?.fcmTokens) && p.data()!.fcmTokens.length > 0]));
+  const counts = new Map<string, number>();
+  // How many groups each person is in ("in" queries take up to 30 ids at a time).
+  for (let i = 0; i < members.length; i += 30) {
+    const ids = members.slice(i, i + 30).map((m) => m.uid);
+    const all = await db.collection('memberships').where('uid', 'in', ids).get();
+    all.docs.forEach((d) => counts.set(d.data().uid, (counts.get(d.data().uid) ?? 0) + 1));
+  }
+  const canSeePhone = me.role !== 'viewer';
+  return {
+    members: members
+      .map((m) => ({
+        uid: m.uid,
+        fullName: m.fullName as string,
+        stateCode: m.stateCode as string,
+        phone: canSeePhone ? ((m.phone as string) ?? '') : String(m.phone ?? '').replace(/\d(?=\d{3})/g, '•'),
+        photoURL: (m.photoURL as string) ?? null,
+        role: m.role as string,
+        status: m.status as string,
+        alertsOn: alerts.get(m.uid) ?? false,
+        otherGroups: Math.max(0, (counts.get(m.uid) ?? 1) - 1),
+        joinedAt: m.createdAt?.toMillis?.() ?? null,
+        approvedAt: m.approvedAt?.toMillis?.() ?? null,
+      }))
+      .sort((a, b) => a.fullName.localeCompare(b.fullName)),
+  };
 });
