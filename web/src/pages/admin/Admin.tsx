@@ -378,7 +378,7 @@ function Controls({ config, canEdit, onSaved }: { config: AdminConfig; canEdit: 
       <div className="card space-y-3">
         <p className="font-bold">Announcement banner</p>
         <p className="text-sm text-muted">A gold bar at the top of everyone's app. Leave empty to remove it.</p>
-        <Field label="Banner text" maxLength={200} placeholder="New: pay your dues online in CDS Pass" value={banner} onChange={(e) => setBanner(e.target.value)} />
+        <Field label="Banner text" maxLength={200} placeholder="e.g. New: pay your dues online in CDS Pass" value={banner} onChange={(e) => setBanner(e.target.value)} />
         <Button variant="gold" disabled={!canEdit} loading={busy === 'banner'} onClick={() => save('banner', { banner: banner.trim() || null }, banner.trim() ? 'Banner is live' : 'Banner removed')}>
           {banner.trim() ? 'Show banner' : 'Remove banner'}
         </Button>
@@ -409,11 +409,22 @@ function Controls({ config, canEdit, onSaved }: { config: AdminConfig; canEdit: 
 
 /* ---------------------------------------------------------------- broadcast */
 
+const BROADCAST_TEMPLATES: { emoji: string; label: string; title: string; body: string; audience?: 'everyone' | 'excos'; link: string }[] = [
+  { emoji: '🎉', label: 'New feature', title: 'New on CDS Pass 🎉', body: 'Good news! We just added something new: . Open CDS Pass to try it.', link: '/home' },
+  { emoji: '☀️', label: 'Good morning', title: 'Good morning corpers ☀️', body: 'Have a great day. CDS Pass is ready for your next meeting.', link: '/home' },
+  { emoji: '🔔', label: 'Turn on alerts', title: 'Turn on your alerts 🔔', body: 'So your phone buzzes when your batch is called: open CDS Pass → Profile → Turn on alerts.', link: '/home' },
+  { emoji: '💳', label: 'Pay dues online', title: 'Pay your dues online 💳', body: 'You can now pay CDS dues in the app with card, transfer or USSD. Open Dues in CDS Pass.', link: '/dues' },
+  { emoji: '⬆️', label: 'App updated', title: 'CDS Pass has been updated ⬆️', body: 'We fixed some issues and made the app faster. If anything looks odd, close and reopen the app.', link: '/home' },
+  { emoji: '🛠️', label: 'Maintenance', title: 'Short maintenance tonight 🛠️', body: 'CDS Pass will be updating for a few minutes tonight. Thank you for your patience.', link: '/home' },
+  { emoji: '🧑‍💼', label: 'Excos: tip', title: 'Tip for excos', body: 'You can now download the register, members and dues lists for Excel from the app.', audience: 'excos', link: '/home' },
+];
+
 function Broadcast({ data, canEdit }: { data: AdminOverview; canEdit: boolean }) {
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
   const [audience, setAudience] = useState<'everyone' | 'excos'>('everyone');
   const [target, setTarget] = useState('all');
+  const [link, setLink] = useState('/home');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -423,7 +434,7 @@ function Broadcast({ data, canEdit }: { data: AdminOverview; canEdit: boolean })
     if (!confirm(`Send "${title}" to ${audience === 'excos' ? 'excos' : 'everyone'} in ${where}?`)) return;
     setBusy(true);
     try {
-      const r = await api.adminBroadcast({ title, body, audience, gids: target === 'all' ? [] : [target], link: '/home' });
+      const r = await api.adminBroadcast({ title, body, audience, gids: target === 'all' ? [] : [target], link });
       toast(`Sent to ${r.recipients} people`, 'success');
       setTitle('');
       setBody('');
@@ -436,6 +447,26 @@ function Broadcast({ data, canEdit }: { data: AdminOverview; canEdit: boolean })
 
   return (
     <div className="card space-y-4">
+      <div>
+        <p className="mb-2 text-sm font-bold">Templates</p>
+        <div className="-mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
+          {BROADCAST_TEMPLATES.map((t) => (
+            <button
+              key={t.label}
+              onClick={() => {
+                setTitle(t.title);
+                setBody(t.body);
+                setLink(t.link);
+                if (t.audience) setAudience(t.audience);
+              }}
+              className="h-10 shrink-0 rounded-full bg-green-light px-4 text-sm font-bold text-green active:scale-95"
+            >
+              {t.emoji} {t.label}
+            </button>
+          ))}
+        </div>
+        <p className="mt-1 text-xs text-muted">Tap one, then edit the words before sending.</p>
+      </div>
       <Select
         label="Which CDS groups"
         value={target}
@@ -451,13 +482,24 @@ function Broadcast({ data, canEdit }: { data: AdminOverview; canEdit: boolean })
           { value: 'excos', label: 'Excos only' },
         ]}
       />
-      <Field label="Title" maxLength={60} placeholder="New on CDS Pass" value={title} onChange={(e) => setTitle(e.target.value)} />
+      <Field label="Title" maxLength={60} placeholder="Type a title, or tap a template above" value={title} onChange={(e) => setTitle(e.target.value)} />
       <div>
         <label htmlFor="b-body" className="label">
           Message
         </label>
         <textarea id="b-body" rows={4} maxLength={300} className="input !h-auto resize-none py-3" value={body} onChange={(e) => setBody(e.target.value)} />
       </div>
+      <Select
+        label="When they tap it, open"
+        value={link}
+        onChange={setLink}
+        options={[
+          { value: '/home', label: 'Home' },
+          { value: '/dues', label: 'Dues' },
+          { value: '/tag', label: 'My tag' },
+          { value: '/scan', label: 'Scan in' },
+        ]}
+      />
       <ErrorBox>{error}</ErrorBox>
       <Button disabled={!canEdit || title.trim().length < 3 || body.trim().length < 3} loading={busy} onClick={send}>
         <Icon name="bell" /> Send to {target === 'all' ? 'all groups' : 'this group'}
@@ -580,7 +622,9 @@ export default function Admin() {
     <div className="min-h-[100dvh] bg-paper text-ink">
       <header className="hero-green px-5 pb-6 pt-[max(env(safe-area-inset-top),20px)] text-white">
         <div className="mx-auto max-w-5xl">
-          <p className="text-sm text-green-mid">🛡️ Admin mode{config ? ` · ${config.role}` : ''}</p>
+          <p className="text-sm text-green-mid">
+            🛡️ Admin mode{config ? ` · you are ${config.role === 'owner' ? 'the owner' : config.role === 'admin' ? 'a team admin' : 'a viewer (see only)'}` : ''}
+          </p>
           <div className="flex items-center justify-between gap-3">
             <h1 className="text-2xl font-extrabold">CDS Pass control room</h1>
             <button
