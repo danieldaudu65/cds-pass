@@ -2031,7 +2031,11 @@ export const groupStats = onCall(async (req: CallableRequest) => {
   const alertsOn = profiles.filter((p) => Array.isArray(p.data()?.fcmTokens) && p.data()!.fcmTokens.length > 0).length;
 
   // Last 8 meetings: checked in vs thumbprinted (count() = 1 read per 1000 people)
-  const sessions = await db.collection(`groups/${e.gid}/sessions`).orderBy(FieldPath.documentId(), 'desc').limit(8).get();
+  // Meetings from the last ~6 months, oldest first (no special database index needed), keep the last 8.
+  const since = lagosDate(Date.now() - 180 * 86_400_000);
+  const recent = await db.collection(`groups/${e.gid}/sessions`).where(FieldPath.documentId(), '>=', since).get();
+  const lastEight = recent.docs.slice(-8);
+  const sessions = { docs: lastEight.slice().reverse() }; // newest first, like before
   const meetings: { date: string; checkedIn: number; done: number }[] = [];
   for (const s of sessions.docs) {
     const col = s.ref.collection('attendees');
